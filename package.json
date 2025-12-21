@@ -1,0 +1,20 @@
+{
+  "name": "ice-shop-line-bot",
+  "version": "2.0.0",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "node src/app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^118.0.0",
+    "@google/generative-ai": "^0.1.3",
+    "assemblyai": "^4.0.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
