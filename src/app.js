@@ -12,6 +12,7 @@ const { parseOrder } = require('./order_parser');
 const { createOrder, updateOrderPaymentStatus, updateOrderDeliveryStatus, updateStock } = require('./orderService');
 const { processVoiceMessage, fetchAudioFromLine } = require('./voiceService');
 const { REQUIRED_SHEETS } = require('./constants');
+const { AccessControl, PERMISSIONS } = require('./accessControl');
 
 const app = express();
 app.use(express.json());
@@ -65,10 +66,112 @@ async function initializeSheets() {
 // MESSAGE HANDLERS
 // ============================================================================
 
+async function notifyAdmin(message) {
+  if (!CONFIG.ADMIN_LINE_ID) {
+    Logger.warn('ADMIN_LINE_ID not configured');
+    return;
+  }
+
+  try {
+    await pushToLine(CONFIG.ADMIN_LINE_ID, message);
+  } catch (error) {
+    Logger.error('Failed to notify admin', error);
+  }
+}
+
+async function notifyAdminNewOrder(orderData) {
+  const message = `🆕 คำสั่งซื้อใหม่ #${orderData.orderNo}\n` +
+    `${'='.repeat(30)}\n\n` +
+    `👤 ลูกค้า: ${orderData.customer}\n` +
+    `📦 สินค้า: ${orderData.item}\n` +
+    `🔢 จำนวน: ${orderData.quantity} ${orderData.unit}\n` +
+    `💰 ยอดเงิน: ${orderData.total.toLocaleString()}฿\n` +
+    `${orderData.isCredit ? '📖 การชำระ: เครดิต' : '✅ การชำระ: จ่ายแล้ว'}\n` +
+    `${orderData.deliveryPerson ? `🚚 ผู้ส่ง: ${orderData.deliveryPerson}\n` : ''}` +
+    `📊 สต็อกคงเหลือ: ${orderData.newStock} ${orderData.unit}\n` +
+    `👤 สั่งโดย: ${orderData.userId}`;
+
+  await notifyAdmin(message);
+
+  // Check low stock
+  if (orderData.newStock < CONFIG.LOW_STOCK_THRESHOLD) {
+    await pushLowStockAlert(orderData.item, orderData.newStock, orderData.unit);
+  }
+}
+
+async function notifyAdminWithVoiceOrder(transcribed, original, result, userId) {
+  const message = `🎤 คำสั่งซื้อจากเสียง\n` +
+    `${'='.repeat(30)}\n\n` +
+    `👤 ผู้ส่ง: ${userId}\n` +
+    `🎙️ ข้อความต้นฉบับ: "${original}"\n` +
+    `📝 แปลเป็น: "${transcribed}"\n\n` +
+    `${result}`;
+
+  await notifyAdmin(message);
+}
+
+async function pushToLine(userId, text) {
+  try {
+    await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json', 
+        'Authorization': `Bearer ${CONFIG.LINE_TOKEN}` 
+      },
+      body: JSON.stringify({ 
+        to: userId, 
+        messages: [{ type: 'text', text }] 
+      })
+    });
+  } catch (error) {
+    Logger.error('pushToLine error', error);
+  }
+}
 
 async function handleTextMessage(text, userId) {
   const lower = text.toLowerCase().replace(/\s+/g, '');
   const isAdmin = AccessControl.isAdmin(userId);
+
+  // ============================================================================
+  // USER MANAGEMENT COMMANDS (ADMIN ONLY)
+  // ============================================================================
+  
+  // View user info
+  if (lower === 'ข้อมูลของฉัน' || lower === 'myinfo' || lower === 'whoami') {
+    return AccessControl.getUserInfoText(userId);
+  }
+
+  // List all users (ADMIN ONLY)
+  if (lower === 'ผู้ใช้ทั้งหมด' || lower === 'listusers') {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.MANAGE_USERS)) {
+      AccessControl.logAccess(userId, PERMISSIONS.MANAGE_USERS, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.MANAGE_USERS);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.MANAGE_USERS, true);
+    const users = AccessControl.getAllUsers();
+    
+    let message = `👥 รายชื่อผู้ใช้ (${users.length} คน)\n${'='.repeat(30)}\n\n`;
+    users.forEach(user => {
+      const roleIcon = user.role === 'admin' ? '👑' : '👤';
+      message += `${roleIcon} ${user.name}\n`;
+      message += `   ID: ${user.userId.substring(0, 12)}...\n`;
+      message += `   บทบาท: ${user.role}\n\n`;
+    });
+    
+    return message;
+  }
+
+  // System stats (ADMIN ONLY)
+  if (lower.includes('สถิติ') || lower === 'stats' || lower === 'systemstats') {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_DASHBOARD)) {
+      AccessControl.logAccess(userId, PERMISSIONS.VIEW_DASHBOARD, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_DASHBOARD);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.VIEW_DASHBOARD, true);
+    return AccessControl.getSystemStats();
+  }
 
   // ============================================================================
   // ADMIN-ONLY COMMANDS
@@ -76,28 +179,25 @@ async function handleTextMessage(text, userId) {
   
   // Refresh cache (ADMIN ONLY)
   if (lower === 'รีเฟรช' || lower === 'โหลดใหม่' || lower === 'refresh') {
-    if (!AccessControl.canPerformAction(userId, 'refresh_cache')) {
-      AccessControl.logAccess(userId, 'refresh_cache', false);
-      return AccessControl.getAccessDeniedMessage('refresh_cache');
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.REFRESH_CACHE)) {
+      AccessControl.logAccess(userId, PERMISSIONS.REFRESH_CACHE, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.REFRESH_CACHE);
     }
     
-    AccessControl.logAccess(userId, 'refresh_cache', true);
+    AccessControl.logAccess(userId, PERMISSIONS.REFRESH_CACHE, true);
     await loadStockCache(true);
     await loadCustomerCache(true);
     return '✅ รีเฟรชข้อมูลเรียบร้อย\n\n📊 สถานะระบบพร้อมใช้งาน';
   }
 
-  // REMOVED: List stock command
-  // Stock info now only sent as push notification when low
-
   // View orders (ADMIN ONLY)
   if (lower.includes('ดูคำสั่งซื้อ') || lower.includes('orders') || lower.includes('คำสั่ง')) {
-    if (!AccessControl.canPerformAction(userId, 'view_orders')) {
-      AccessControl.logAccess(userId, 'view_orders', false);
-      return AccessControl.getAccessDeniedMessage('view_orders');
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_ORDERS)) {
+      AccessControl.logAccess(userId, PERMISSIONS.VIEW_ORDERS, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_ORDERS);
     }
     
-    AccessControl.logAccess(userId, 'view_orders', true);
+    AccessControl.logAccess(userId, PERMISSIONS.VIEW_ORDERS, true);
     const orders = await getOrders({ date: getThaiDateString() });
     
     if (orders.length === 0) {
@@ -126,23 +226,23 @@ async function handleTextMessage(text, userId) {
 
   // Dashboard (ADMIN ONLY)
   if (lower.includes('dashboard') || lower.includes('สรุป') || lower.includes('รายงาน')) {
-    if (!AccessControl.canPerformAction(userId, 'view_dashboard')) {
-      AccessControl.logAccess(userId, 'view_dashboard', false);
-      return AccessControl.getAccessDeniedMessage('view_dashboard');
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_DASHBOARD)) {
+      AccessControl.logAccess(userId, PERMISSIONS.VIEW_DASHBOARD, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_DASHBOARD);
     }
     
-    AccessControl.logAccess(userId, 'view_dashboard', true);
+    AccessControl.logAccess(userId, PERMISSIONS.VIEW_DASHBOARD, true);
     return await generateDashboard();
   }
 
   // Update payment status (ADMIN ONLY)
   if (lower.includes('จ่ายแล้ว') && /\d+/.test(text)) {
-    if (!AccessControl.canPerformAction(userId, 'update_payment')) {
-      AccessControl.logAccess(userId, 'update_payment', false);
-      return AccessControl.getAccessDeniedMessage('update_payment');
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
     }
     
-    AccessControl.logAccess(userId, 'update_payment', true);
+    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
     const orderNo = text.match(/\d+/)[0];
     const result = await updateOrderPaymentStatus(orderNo);
     
@@ -164,12 +264,12 @@ async function handleTextMessage(text, userId) {
   }
 
   // ============================================================================
-  // ORDER PLACEMENT (ALL USERS)
+  // ORDER PLACEMENT (ALL USERS - with permission check)
   // ============================================================================
 
-  if (!AccessControl.canPerformAction(userId, 'place_order')) {
-    AccessControl.logAccess(userId, 'place_order', false);
-    return '🔒 ระบบปิดการรับคำสั่งซื้อชั่วคราว';
+  if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
+    AccessControl.logAccess(userId, PERMISSIONS.PLACE_ORDER, false);
+    return AccessControl.getAccessDeniedMessage(PERMISSIONS.PLACE_ORDER);
   }
 
   // Default = Order parsing
@@ -182,12 +282,12 @@ async function handleTextMessage(text, userId) {
 
   // Handle add stock (ADMIN ONLY)
   if (parsed.action === 'add_stock') {
-    if (!AccessControl.canPerformAction(userId, 'add_stock')) {
-      AccessControl.logAccess(userId, 'add_stock', false);
-      return AccessControl.getAccessDeniedMessage('add_stock');
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.ADD_STOCK)) {
+      AccessControl.logAccess(userId, PERMISSIONS.ADD_STOCK, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.ADD_STOCK);
     }
     
-    AccessControl.logAccess(userId, 'add_stock', true);
+    AccessControl.logAccess(userId, PERMISSIONS.ADD_STOCK, true);
     const newStock = parsed.stockItem.stock + parsed.quantity;
     const updated = await updateStock(parsed.stockItem.item, parsed.stockItem.unit, newStock);
     
@@ -218,8 +318,7 @@ async function handleTextMessage(text, userId) {
     
     // Only notify admin if user tried to order
     if (!isAdmin) {
-      errorMsg += `\n\n💡 ระบบได้แจ้งแอดมินให้เติมสต็อกแล้วค่ะ`;
-      await notifyAdmin(`⚠️ สต็อกไม่พียงพอ\nสินค้า: ${parsed.stockItem.item}\nลูกค้าต้องการ: ${parsed.quantity}, มี: ${parsed.stockItem.stock}`);
+      await notifyAdmin(`⚠️ สต็อกไม่เพียงพอ\nสินค้า: ${parsed.stockItem.item}\nลูกค้าต้องการ: ${parsed.quantity}, มี: ${parsed.stockItem.stock}`);
     }
     
     return errorMsg;
@@ -232,7 +331,7 @@ async function handleTextMessage(text, userId) {
 
   // Create order
   try {
-    AccessControl.logAccess(userId, 'place_order', true);
+    AccessControl.logAccess(userId, PERMISSIONS.PLACE_ORDER, true);
     
     const isCredit = lower.includes('เครดิต') || lower.includes('ค้าง') || lower.includes('ไว้ก่อน');
     const totalAmount = parsed.quantity * parsed.stockItem.price;
@@ -274,7 +373,7 @@ async function handleTextMessage(text, userId) {
       `🔢 จำนวน: ${parsed.quantity} ${parsed.stockItem.unit}\n` +
       `💰 ราคา: ${parsed.stockItem.price.toLocaleString()}฿/${parsed.stockItem.unit}\n` +
       `💵 ยอดรวม: ${totalAmount.toLocaleString()}฿\n` +
-      `${isCredit ? '🔖 การชำระ: เครดิต (ค้างชำระ)' : '✅ การชำระ: จ่ายแล้ว'}\n`;
+      `${isCredit ? '📖 การชำระ: เครดิต (ค้างชำระ)' : '✅ การชำระ: จ่ายแล้ว'}\n`;
     
     if (deliveryPerson) {
       response += `🚚 ผู้ส่ง: ${deliveryPerson}\n`;
