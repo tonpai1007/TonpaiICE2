@@ -1,6 +1,6 @@
 // app.js - Main application entry point
 
-const { AccessControl } = require('./accessControl');
+
 const express = require('express');
 const { CONFIG, validateConfig } = require('./config');
 const { Logger } = require('./logger');
