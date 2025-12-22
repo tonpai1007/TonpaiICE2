@@ -1,6 +1,6 @@
 // app.js - Main application entry point
 
-const { AccessControl } = require('./accessControl');
+
 const express = require('express');
 const { CONFIG, validateConfig } = require('./config');
 const { Logger } = require('./logger');
@@ -8,7 +8,7 @@ const { getThaiDateTimeString } = require('./utils');
 const { initializeGoogleServices } = require('./googleServices');
 const { initializeAIServices } = require('./aiServices');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
-const { parseOrder } = require('./order_parser');
+const { parseOrder } = require('./orderParser');
 const { createOrder, updateOrderPaymentStatus, updateOrderDeliveryStatus, updateStock } = require('./orderService');
 const { processVoiceMessage, fetchAudioFromLine } = require('./voiceService');
 const { REQUIRED_SHEETS } = require('./constants');
