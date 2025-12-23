@@ -20,8 +20,19 @@ const CONFIG = {
   PROMPTPAY_ID: process.env.PROMPTPAY_ID || null,
   
   // Admin
-  ADMIN_USER_ID: process.env.ADMIN_USER_ID,
+  ADMIN_USER_IDS: (process.env.ADMIN_USER_IDS || '').split(',').filter(Boolean),
   
+  
+  // Feature flags
+  ALLOW_USER_ORDERS: true,
+  ALLOW_USER_STOCK_VIEW: false, // Only admin can view stock
+  ALLOW_USER_REFRESH: false,
+  LOW_STOCK_THRESHOLD: 10,
+  MAX_ORDER_QUANTITY: 1000,
+  
+  // Voice settings - ADDED
+  VOICE_MIN_CONFIDENCE: 0.55,
+  VOICE_MIN_TEXT_LENGTH: 3,
   // Cache settings
   CACHE_DURATION: 5 * 60 * 1000, // 5 minutes
   
@@ -56,6 +67,13 @@ function validateConfig() {
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
+  const recommended = ['ADMIN_USER_ID', 'VOICE_FOLDER_ID'];
+  const missingRecommended = recommended.filter(key => !process.env[key]);
+  
+  if (missingRecommended.length > 0) {
+    console.warn(`⚠️ Warning: Missing recommended variables: ${missingRecommended.join(', ')}`);
+    console.warn('Some features may not work properly without these.');
+  }
 }
 
 // Load and parse Google credentials
@@ -64,14 +82,27 @@ function loadGoogleCredentials() {
     const base64 = process.env.GOOGLE_APPLICATION_CREDENTIALS_BASE64;
     if (!base64) throw new Error('Missing GOOGLE_APPLICATION_CREDENTIALS_BASE64');
     
-    return JSON.parse(Buffer.from(base64, 'base64').toString('utf-8'));
+    const jsonString = Buffer.from(base64, 'base64').toString('utf-8');
+    return JSON.parse(jsonString);
   } catch (error) {
     throw new Error(`Failed to load Google credentials: ${error.message}`);
   }
 }
-
+function getEnvironmentInfo() {
+  return {
+    nodeEnv: process.env.NODE_ENV || 'development',
+    port: process.env.PORT || 3000,
+    hasAdmin: !!CONFIG.ADMIN_USER_ID,
+    hasVoiceFolder: !!CONFIG.VOICE_FOLDER_ID,
+    hasPromptPay: !!CONFIG.PROMPTPAY_ID,
+    cacheEnabled: CONFIG.CACHE_DURATION > 0,
+    lowStockAlert: CONFIG.LOW_STOCK_THRESHOLD,
+    maxOrderQty: CONFIG.MAX_ORDER_QUANTITY
+  };
+}
 module.exports = {
   CONFIG,
   validateConfig,
-  loadGoogleCredentials
+  loadGoogleCredentials,
+  getEnvironmentInfo
 };

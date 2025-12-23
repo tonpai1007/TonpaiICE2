@@ -8,8 +8,8 @@ const { getThaiDateTimeString } = require('./utils');
 const { initializeGoogleServices } = require('./googleServices');
 const { initializeAIServices } = require('./aiServices');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
-const { parseOrder } = require('./orderParser');
-const { createOrder, updateOrderPaymentStatus,  getOrders, getThaiDateString , updateOrderDeliveryStatus, updateStock } = require('./orderService');
+const { getThaiDateTimeString, getThaiDateString } = require('./utils');
+const { createOrder, updateOrderPaymentStatus, getOrders, updateOrderDeliveryStatus, updateStock } = require('./orderService');
 const { processVoiceMessage, fetchAudioFromLine } = require('./voiceService');
 const { REQUIRED_SHEETS } = require('./constants');
 const { AccessControl, PERMISSIONS } = require('./accessControl');
@@ -67,17 +67,18 @@ async function initializeSheets() {
 // ============================================================================
 
 async function notifyAdmin(message) {
-  if (!CONFIG.ADMIN_LINE_ID) {
-    Logger.warn('ADMIN_LINE_ID not configured');
+  if (!CONFIG.ADMIN_USER_ID) {
+    Logger.warn('ADMIN_USER_ID not configured - cannot send admin notification');
     return;
   }
 
   try {
-    await pushToLine(CONFIG.ADMIN_LINE_ID, message);
+    await pushToLine(CONFIG.ADMIN_USER_ID, message);
   } catch (error) {
     Logger.error('Failed to notify admin', error);
   }
 }
+
 
 async function notifyAdminNewOrder(orderData) {
   const message = `🆕 คำสั่งซื้อใหม่ #${orderData.orderNo}\n` +

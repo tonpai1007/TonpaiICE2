@@ -52,7 +52,7 @@ async function generateWithGemini(prompt, schema = null, temperature = 0.1) {
       generationConfig: {
         temperature,
         topP: 0.9,
-        topK: 40,
+        topK: 400,
         responseMimeType: "application/json",
       }
     };

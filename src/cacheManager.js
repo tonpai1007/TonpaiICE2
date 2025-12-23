@@ -96,6 +96,7 @@ async function loadStockCache(forceReload = false) {
   }
 }
 
+
 function rebuildStockVectorStore() {
   stockVectorStore.rebuild(
     stockCache,
