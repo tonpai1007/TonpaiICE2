@@ -1,4 +1,4 @@
-// orderService.js - Order creation, retrieval, and management
+// orderService.js - FIXED Payment Status Logic
 
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
@@ -7,7 +7,7 @@ const { getSheetData, appendSheetData, updateSheetData } = require('./googleServ
 const { getStockCache } = require('./cacheManager');
 
 // ============================================================================
-// CREATE ORDER
+// CREATE ORDER WITH SMART PAYMENT DETECTION
 // ============================================================================
 
 async function createOrder(orderData) {
@@ -18,7 +18,9 @@ async function createOrder(orderData) {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:A');
     const nextOrderNo = rows.length || 1;
 
-    const paymentStatus = isCredit ? 'ยังไม่จ่าย' : 'จ่ายแล้ว';
+    // FIXED: Payment status should default to "ยังไม่จ่าย" 
+    // Admin must explicitly mark as paid
+    const paymentStatus = isCredit ? 'เครดิต' : 'ยังไม่จ่าย';
 
     const orderRow = [
       nextOrderNo,
@@ -28,18 +30,19 @@ async function createOrder(orderData) {
       quantity,
       '', // Note
       deliveryPerson || '',
-      'รอดำเนินการ',
-      paymentStatus,
+      'รอดำเนินการ', // Delivery status
+      paymentStatus,   // Payment status
       totalAmount
     ];
 
     await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J', [orderRow]);
     
-    Logger.success(`Order created: #${nextOrderNo}`);
+    Logger.success(`Order created: #${nextOrderNo} - Payment: ${paymentStatus}`);
     
     return {
       success: true,
       orderNo: nextOrderNo,
+      paymentStatus,
       ...orderData
     };
   } catch (error) {
@@ -47,54 +50,14 @@ async function createOrder(orderData) {
     throw error;
   }
 }
-async function createOrderWithTransaction(orderData) {
-  const { customer, item, quantity, deliveryPerson, isCredit, totalAmount } = orderData;
-  
-  try {
-    // 1. Validate stock availability
-    const stockItem = getStockCache().find(s => s.item === item);
-    if (!stockItem) {
-      throw new Error(`สินค้า "${item}" ไม่พบในระบบ`);
-    }
-    
-    if (quantity > stockItem.stock) {
-      throw new Error(`สต็อกไม่เพียงพอ: มี ${stockItem.stock} ต้องการ ${quantity}`);
-    }
-    
-    // 2. Create order first
-    const orderResult = await createOrder(orderData);
-    
-    // 3. Update stock
-    const newStock = stockItem.stock - quantity;
-    const stockUpdated = await updateStock(item, stockItem.unit, newStock);
-    
-    if (!stockUpdated) {
-      Logger.error('Stock update failed, but order was created', orderResult.orderNo);
-      // Could implement order cancellation here
-      throw new Error('อัปเดตสต็อกล้มเหลว กรุณาตรวจสอบคำสั่งซื้อ #' + orderResult.orderNo);
-    }
-    
-    // 4. Reload cache
-    await loadStockCache(true);
-    
-    return {
-      ...orderResult,
-      newStock,
-      unit: stockItem.unit
-    };
-    
-  } catch (error) {
-    Logger.error('Transaction failed', error);
-    throw error;
-  }
-}
+
 // ============================================================================
 // GET ORDERS
 // ============================================================================
 
 async function getOrders(filters = {}) {
   try {
-    const { customer, date, orderNo } = filters;
+    const { customer, date, orderNo, paymentStatus } = filters;
     
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
@@ -124,6 +87,12 @@ async function getOrders(filters = {}) {
         if (!orderCustomer.includes(searchCustomer)) return false;
       }
       
+      // Filter by payment status
+      if (paymentStatus) {
+        const status = (row[8] || '').trim();
+        if (status !== paymentStatus) return false;
+      }
+      
       return true;
     }).map(row => {
       const stockItem = stockCache.find(s => s.item === row[3]);
@@ -136,8 +105,8 @@ async function getOrders(filters = {}) {
         unit: stockItem?.unit || '',
         note: row[5] || '',
         delivery: row[6] || '',
-        status: row[7] || '',
-        paid: row[8] || '',
+        deliveryStatus: row[7] || 'รอดำเนินการ',
+        paymentStatus: row[8] || 'ยังไม่จ่าย',
         total: parseFloat(row[9] || 0),
         cost: stockItem ? stockItem.cost * parseInt(row[4] || 0) : 0
       };
@@ -149,10 +118,10 @@ async function getOrders(filters = {}) {
 }
 
 // ============================================================================
-// UPDATE ORDER STATUS
+// UPDATE PAYMENT STATUS (ADMIN ONLY)
 // ============================================================================
 
-async function updateOrderPaymentStatus(orderNo) {
+async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
@@ -171,20 +140,33 @@ async function updateOrderPaymentStatus(orderNo) {
       };
     }
 
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${rowIndex}`, [['จ่ายแล้ว']]);
+    const currentStatus = rows[rowIndex - 1][8] || '';
+    
+    // Validate status change
+    const validStatuses = ['ยังไม่จ่าย', 'จ่ายแล้ว', 'เครดิต', 'ยกเลิก'];
+    if (!validStatuses.includes(newStatus)) {
+      return {
+        success: false,
+        error: `สถานะไม่ถูกต้อง: ${newStatus}`
+      };
+    }
+
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${rowIndex}`, [[newStatus]]);
 
     const customer = rows[rowIndex - 1][2] || 'ลูกค้า';
     const item = rows[rowIndex - 1][3] || '';
     const total = rows[rowIndex - 1][9] || '0';
 
-    Logger.success(`Payment updated for order #${orderNo}`);
+    Logger.success(`Payment updated: Order #${orderNo} - ${currentStatus} → ${newStatus}`);
 
     return {
       success: true,
       orderNo,
       customer,
       item,
-      total
+      total,
+      oldStatus: currentStatus,
+      newStatus
     };
   } catch (error) {
     Logger.error('updateOrderPaymentStatus failed', error);
@@ -192,7 +174,11 @@ async function updateOrderPaymentStatus(orderNo) {
   }
 }
 
-async function updateOrderDeliveryStatus(orderNo) {
+// ============================================================================
+// UPDATE DELIVERY STATUS (ADMIN ONLY)
+// ============================================================================
+
+async function updateOrderDeliveryStatus(orderNo, newStatus = 'ส่งเสร็จแล้ว') {
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
@@ -211,23 +197,57 @@ async function updateOrderDeliveryStatus(orderNo) {
       };
     }
 
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!H${rowIndex}`, [['ส่งเสร็จแล้ว']]);
+    const validStatuses = ['รอดำเนินการ', 'กำลังจัดส่ง', 'ส่งเสร็จแล้ว', 'ยกเลิก'];
+    if (!validStatuses.includes(newStatus)) {
+      return {
+        success: false,
+        error: `สถานะไม่ถูกต้อง: ${newStatus}`
+      };
+    }
+
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!H${rowIndex}`, [[newStatus]]);
 
     const customer = rows[rowIndex - 1][2] || 'ลูกค้า';
     const item = rows[rowIndex - 1][3] || '';
     const delivery = rows[rowIndex - 1][6] || '';
 
-    Logger.success(`Delivery updated for order #${orderNo}`);
+    Logger.success(`Delivery updated: Order #${orderNo} → ${newStatus}`);
 
     return {
       success: true,
       orderNo,
       customer,
       item,
-      delivery
+      delivery,
+      newStatus
     };
   } catch (error) {
     Logger.error('updateOrderDeliveryStatus failed', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// GET PENDING PAYMENTS (ADMIN ONLY)
+// ============================================================================
+
+async function getPendingPayments() {
+  try {
+    const orders = await getOrders({});
+    
+    const pending = orders.filter(order => 
+      order.paymentStatus === 'ยังไม่จ่าย' || order.paymentStatus === 'เครดิต'
+    );
+    
+    const totalPending = pending.reduce((sum, order) => sum + order.total, 0);
+    
+    return {
+      orders: pending,
+      count: pending.length,
+      totalAmount: totalPending
+    };
+  } catch (error) {
+    Logger.error('getPendingPayments failed', error);
     throw error;
   }
 }
@@ -265,5 +285,6 @@ module.exports = {
   getOrders,
   updateOrderPaymentStatus,
   updateOrderDeliveryStatus,
+  getPendingPayments,
   updateStock
 };

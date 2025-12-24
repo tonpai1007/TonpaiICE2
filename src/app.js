@@ -142,6 +142,7 @@ async function pushToLine(userId, text) {
 }
 
 async function handleTextMessage(text, userId) {
+  
   if (!userId) {
     Logger.error('handleTextMessage called without userId');
     return '❌ Error: User identity missing.';
@@ -166,6 +167,36 @@ async function handleTextMessage(text, userId) {
     await loadCustomerCache(true);
     return '✅ รีเฟรชข้อมูลเรียบร้อย\n\n📊 สถานะระบบพร้อมใช้งาน';
   }
+  if (lower.includes('ค้างชำระ') || lower.includes('ยังไม่จ่าย') || lower === 'pending') {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_PAYMENT_HISTORY)) {
+      AccessControl.logAccess(userId, PERMISSIONS.VIEW_PAYMENT_HISTORY, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_PAYMENT_HISTORY);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.VIEW_PAYMENT_HISTORY, true);
+    const { getPendingPayments } = require('./orderService');
+    const pending = await getPendingPayments();
+    
+    if (pending.count === 0) {
+      return '✅ ไม่มีรายการค้างชำระ';
+    }
+    
+    let message = `💰 รายการค้างชำระ (${pending.count} รายการ)\n${'='.repeat(30)}\n\n`;
+    
+    pending.orders.forEach(order => {
+      const statusIcon = order.paymentStatus === 'เครดิต' ? '📖' : '⏳';
+      message += `${statusIcon} #${order.orderNo} - ${order.customer}\n`;
+      message += `   ${order.item} x${order.qty}\n`;
+      message += `   ${order.total.toLocaleString()}฿ | ${order.paymentStatus}\n\n`;
+    });
+    
+    message += `${'='.repeat(30)}\n`;
+    message += `💵 รวมค้างชำระ: ${pending.totalAmount.toLocaleString()}฿\n\n`;
+    message += `💡 พิมพ์ "จ่ายแล้ว [เลขคำสั่ง]" เพื่ออัปเดต`;
+    
+    return message;
+  }
+  
 
   if (lower.includes('คำสั่งซื้อ') || lower.includes('orders')) {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_ORDERS)) {
@@ -198,6 +229,88 @@ async function handleTextMessage(text, userId) {
       return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_DASHBOARD);
     }
     return await generateDashboard();
+  } if (lower.includes('จ่ายแล้ว') && /\d+/.test(text)) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
+    const orderNo = text.match(/\d+/)[0];
+    const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
+    
+    if (!result.success) {
+      return result.error;
+    }
+    
+    return `✅ อัปเดตการชำระเงินสำเร็จ!\n\n` +
+      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+      `👤 ลูกค้า: ${result.customer}\n` +
+      `📦 สินค้า: ${result.item}\n` +
+      `💰 ยอดเงิน: ${result.total}฿\n` +
+      `🔄 ${result.oldStatus} → ${result.newStatus}`;
+  }
+  
+  // Mark as credit: "เครดิต 123"
+  if (lower.includes('เครดิต') && /\d+/.test(text) && !lower.includes('สั่ง')) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
+    const orderNo = text.match(/\d+/)[0];
+    const result = await updateOrderPaymentStatus(orderNo, 'เครดิต');
+    
+    if (!result.success) {
+      return result.error;
+    }
+    
+    return `📖 เปลี่ยนเป็นเครดิตแล้ว!\n\n` +
+      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+      `👤 ลูกค้า: ${result.customer}\n` +
+      `💰 ยอดเงิน: ${result.total}฿\n` +
+      `🔄 ${result.oldStatus} → เครดิต`;
+  }
+  
+  // Mark as unpaid: "ยังไม่จ่าย 123"
+  if (lower.includes('ยังไม่จ่าย') && /\d+/.test(text)) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
+    const orderNo = text.match(/\d+/)[0];
+    const result = await updateOrderPaymentStatus(orderNo, 'ยังไม่จ่าย');
+    
+    if (!result.success) {
+      return result.error;
+    }
+    
+    return `⏳ เปลี่ยนสถานะแล้ว!\n\n` +
+      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+      `👤 ลูกค้า: ${result.customer}\n` +
+      `🔄 ${result.oldStatus} → ยังไม่จ่าย`;
+  } if ((lower.includes('ส่งแล้ว') || lower.includes('ส่งเสร็จ')) && /\d+/.test(text)) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_DELIVERY)) {
+      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_DELIVERY, false);
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_DELIVERY);
+    }
+    
+    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_DELIVERY, true);
+    const orderNo = text.match(/\d+/)[0];
+    const result = await updateOrderDeliveryStatus(orderNo, 'ส่งเสร็จแล้ว');
+    
+    if (!result.success) {
+      return result.error;
+    }
+    
+    return `🚚 อัปเดตการจัดส่งสำเร็จ!\n\n` +
+      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+      `👤 ลูกค้า: ${result.customer}\n` +
+      `📦 สินค้า: ${result.item}\n` +
+      `✅ สถานะ: ${result.newStatus}`;
   }
 
   if (lower === 'help' || lower === 'ช่วยเหลือ' || lower === '?') {
@@ -289,18 +402,26 @@ async function handleTextMessage(text, userId) {
 
     // Build response
     let response = isAdmin 
-      ? `✅ บันทึกคำสั่งซื้อสำเร็จ! (Admin)\n`
+      ? `✅ บันทึกคำสั่งซื้อสำเร็จ!\n`
       : `✅ รับคำสั่งซื้อเรียบร้อยค่ะ!\n`;
-    
+
     response += `${'='.repeat(30)}\n\n` +
       `📋 คำสั่งซื้อ: #${result.orderNo}\n` +
       `👤 ลูกค้า: ${parsed.customer}\n` +
       `📦 สินค้า: ${parsed.stockItem.item}\n` +
       `🔢 จำนวน: ${parsed.quantity} ${parsed.stockItem.unit}\n` +
       `💰 ราคา: ${parsed.stockItem.price.toLocaleString()}฿/${parsed.stockItem.unit}\n` +
-      `💵 ยอดรวม: ${totalAmount.toLocaleString()}฿\n` +
-      `${isCredit ? '📖 การชำระ: เครดิต (ค้างชำระ)' : '✅ การชำระ: จ่ายแล้ว'}\n`;
-    
+      `💵 ยอดรวม: ${totalAmount.toLocaleString()}฿\n`;
+
+    // Show payment status clearly
+    if (isCredit) {
+      response += `📖 สถานะ: เครดิต (ค้างชำระ)\n`;
+    } else {
+      response += `⏳ สถานะ: ยังไม่จ่าย\n`;
+      if (isAdmin) {
+        response += `💡 พิมพ์ "จ่ายแล้ว ${result.orderNo}" เมื่อได้รับเงิน\n`;
+      }
+    }
     if (isAdmin) {
       response += `\n📊 สต็อกคงเหลือ: ${newStock} ${parsed.stockItem.unit}`;
       if (newStock < CONFIG.LOW_STOCK_THRESHOLD) {
@@ -442,25 +563,40 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
   }
 }
 
+
 function getHelpMessage(isAdmin) {
   if (isAdmin) {
     return `🎯 คำสั่งสำหรับแอดมิน\n${'='.repeat(30)}\n\n` +
       `📊 ข้อมูล:\n` +
       `• "คำสั่งซื้อ" - ดูคำสั่งซื้อวันนี้\n` +
+      `• "ค้างชำระ" - ดูรายการค้างชำระ\n` +
       `• "dashboard" - ดูสรุปยอดขาย\n\n` +
+      `💰 การชำระเงิน:\n` +
+      `• "จ่ายแล้ว [เลขคำสั่ง]" - อัปเดตว่าจ่ายแล้ว\n` +
+      `• "เครดิต [เลขคำสั่ง]" - เปลี่ยนเป็นเครดิต\n` +
+      `• "ยังไม่จ่าย [เลขคำสั่ง]" - เปลี่ยนเป็นยังไม่จ่าย\n\n` +
+      `🚚 การจัดส่ง:\n` +
+      `• "ส่งแล้ว [เลขคำสั่ง]" - อัปเดตส่งเสร็จแล้ว\n` +
+      `• "กำลังส่ง [เลขคำสั่ง]" - อัปเดตกำลังจัดส่ง\n\n` +
       `🔧 จัดการ:\n` +
       `• "รีเฟรช" - โหลดข้อมูลใหม่\n` +
       `• "เพิ่มสต็อก [สินค้า] [จำนวน]"\n\n` +
       `📦 สั่งซื้อ:\n` +
-      `• พิมพ์: "คุณสมชาย สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"\n` +
-      `• เสียง: กดไมค์แล้วพูด`;
+      `• พิมพ์: "คุณสมชาย สั่งน้ำแข็ง 2 ถุง"\n` +
+      `• เสียง: กดไมค์แล้วพูด\n` +
+      `• เพิ่ม "เครดิต" สำหรับเครดิต`;
   } else {
     return `🛒 วิธีสั่งซื้อ\n${'='.repeat(30)}\n\n` +
-      `📝 พิมพ์: "[ชื่อลูกค้า] สั่ง [สินค้า] [จำนวน]"\n\n` +
+      `📝 พิมพ์ข้อความ:\n` +
+      `"[ชื่อลูกค้า] สั่ง [สินค้า] [จำนวน]"\n\n` +
       `ตัวอย่าง:\n` +
-      `• "คุณสมชาย สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"\n` +
-      `• "พี่ใหญ่ เอาเบียร์ช้าง 5 กระป๋อง"\n\n` +
-      `🎤 หรือส่งเสียง: กดไมค์แล้วพูด`;
+      `• "คุณสมชาย สั่งน้ำแข็ง 2 ถุง"\n` +
+      `• "พี่ใหญ่ เอาเบียร์ 5 กระป๋อง เครดิต"\n\n` +
+      `🎤 หรือส่งข้อความเสียง:\n` +
+      `กดไมค์แล้วพูดตามตัวอย่าง\n\n` +
+      `💳 การชำระเงิน:\n` +
+      `• ปกติ = ยังไม่จ่าย (จ่ายทีหลัง)\n` +
+      `• เพิ่ม "เครดิต" = เครดิต`;
   }
 }
 
