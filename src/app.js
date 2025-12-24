@@ -1,20 +1,28 @@
-// app.js - Main application entry point
-
 
 const express = require('express');
 const { CONFIG, validateConfig } = require('./config');
 const { Logger } = require('./logger');
+
+// Validate config early
 try {
   validateConfig(); 
 } catch (e) {
   Logger.error('Config Validation Failed', e);
   process.exit(1);
 }
+
 const { initializeGoogleServices } = require('./googleServices');
 const { initializeAIServices } = require('./aiServices');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { getThaiDateTimeString, getThaiDateString } = require('./utils');
-const { createOrder, updateOrderPaymentStatus, getOrders, updateOrderDeliveryStatus, updateStock } = require('./orderService');
+const { parseOrder } = require('./orderParser'); // FIX: Add this import
+const { 
+  createOrder, 
+  getOrders, 
+  updateOrderPaymentStatus, 
+  updateOrderDeliveryStatus, 
+  updateStock 
+} = require('./orderService');
 const { processVoiceMessage, fetchAudioFromLine } = require('./voiceService');
 const { REQUIRED_SHEETS } = require('./constants');
 const { AccessControl, PERMISSIONS } = require('./accessControl');
@@ -84,7 +92,6 @@ async function notifyAdmin(message) {
   }
 }
 
-
 async function notifyAdminNewOrder(orderData) {
   const message = `🆕 คำสั่งซื้อใหม่ #${orderData.orderNo}\n` +
     `${'='.repeat(30)}\n\n` +
@@ -143,81 +150,196 @@ async function handleTextMessage(text, userId) {
   const lower = text.toLowerCase().replace(/\s+/g, '');
   const isAdmin = AccessControl.isAdmin(userId);
 
-  // 1. ADMIN & SYSTEM COMMANDS
-  if (lower === 'ข้อมูลของฉัน' || lower === 'whoami') {
+  // ============================================================================
+  // 1. USER INFO & SYSTEM COMMANDS
+  // ============================================================================
+  
+  if (lower === 'ข้อมูลของฉัน' || lower === 'whoami' || lower === 'myinfo') {
     return AccessControl.getUserInfoText(userId);
   }
 
-  if (lower === 'รีเฟรช' || lower === 'refresh') {
+  if (lower === 'รีเฟรช' || lower === 'refresh' || lower === 'โหลดใหม่') {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.REFRESH_CACHE)) {
       return AccessControl.getAccessDeniedMessage(PERMISSIONS.REFRESH_CACHE);
     }
     await loadStockCache(true);
     await loadCustomerCache(true);
-    return '✅ รีเฟรชข้อมูลเรียบร้อย';
+    return '✅ รีเฟรชข้อมูลเรียบร้อย\n\n📊 สถานะระบบพร้อมใช้งาน';
   }
 
-  // ... [Other Admin Commands: Dashboard, View Orders]
+  if (lower.includes('คำสั่งซื้อ') || lower.includes('orders')) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_ORDERS)) {
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_ORDERS);
+    }
+    
+    const orders = await getOrders({ date: getThaiDateString() });
+    
+    if (orders.length === 0) {
+      return '📋 ไม่มีคำสั่งซื้อวันนี้';
+    }
+    
+    let message = `📋 คำสั่งซื้อวันนี้ (${orders.length} รายการ)\n${'='.repeat(30)}\n\n`;
+    let totalSales = 0;
+    
+    orders.forEach(order => {
+      message += `#${order.orderNo} - ${order.customer}\n`;
+      message += `📦 ${order.item} x${order.qty}\n`;
+      message += `💰 ${order.total.toLocaleString()}฿\n\n`;
+      totalSales += order.total;
+    });
+    
+    message += `${'='.repeat(30)}\n💵 ยอดขายรวม: ${totalSales.toLocaleString()}฿`;
+    
+    return message;
+  }
+
+  if (lower.includes('dashboard') || lower.includes('สรุป')) {
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_DASHBOARD)) {
+      return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_DASHBOARD);
+    }
+    return await generateDashboard();
+  }
 
   if (lower === 'help' || lower === 'ช่วยเหลือ' || lower === '?') {
     return getHelpMessage(isAdmin);
   }
 
+  // ============================================================================
   // 2. ORDER PROCESSING
+  // ============================================================================
+  
   if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
     return AccessControl.getAccessDeniedMessage(PERMISSIONS.PLACE_ORDER);
   }
 
   try {
-    // Explicitly load cache before parsing to ensure RAG has data
-    await loadStockCache(); 
+    // Load cache to ensure RAG has data
+    await loadStockCache();
     
-    // Call the parser - Ensure orderParser.js is exported correctly
+    // Parse order using orderParser
     const parsed = await parseOrder(text);
 
     if (!parsed.success) {
-      return parsed.error;
+      return parsed.error + (parsed.warning ? '\n\n' + parsed.warning : '');
     }
 
-    // 3. ACTION DISPATCHER
+    // Handle add stock action
     if (parsed.action === 'add_stock') {
       if (!AccessControl.canPerformAction(userId, PERMISSIONS.ADD_STOCK)) {
         return AccessControl.getAccessDeniedMessage(PERMISSIONS.ADD_STOCK);
       }
-      // ... stock update logic
+      
+      const newStock = parsed.stockItem.stock + parsed.quantity;
+      const updated = await updateStock(parsed.stockItem.item, parsed.stockItem.unit, newStock);
+      
+      if (!updated) {
+        return '❌ ไม่สามารถเพิ่มสต็อกได้ กรุณาลองใหม่';
+      }
+      
+      await loadStockCache(true);
+      
+      return `✅ เพิ่มสต็อกสำเร็จ!\n` +
+             `📦 สินค้า: ${parsed.stockItem.item}\n` +
+             `➕ เพิ่ม: ${parsed.quantity} ${parsed.stockItem.unit}\n` +
+             `📊 สต็อกใหม่: ${newStock} ${parsed.stockItem.unit}`;
     }
 
-    // Standard Order Logic
+    // Validate stock availability
     if (parsed.quantity > parsed.stockItem.stock) {
-      return `⚠️ สต็อกไม่เพียงพอ! มีอยู่: ${parsed.stockItem.stock} ${parsed.stockItem.unit}`;
+      const errorMsg = `⚠️ สต็อกไม่เพียงพอ!\n\n` +
+        `📦 สินค้า: ${parsed.stockItem.item}\n` +
+        `❌ ต้องการ: ${parsed.quantity} ${parsed.stockItem.unit}\n` +
+        `✅ มีอยู่: ${parsed.stockItem.stock} ${parsed.stockItem.unit}`;
+      
+      if (!isAdmin) {
+        await notifyAdmin(`⚠️ สต็อกไม่พอ\n${parsed.customer} ต้องการ ${parsed.stockItem.item} ${parsed.quantity}`);
+      }
+      
+      return errorMsg;
     }
 
-    const isCredit = lower.includes('เครดิต') || lower.includes('ค้าง');
+    // Check max quantity
+    if (parsed.quantity > CONFIG.MAX_ORDER_QUANTITY) {
+      return `❌ จำนวนมากเกินไป!\n\nสั่งได้สูงสุด ${CONFIG.MAX_ORDER_QUANTITY} ${parsed.stockItem.unit}`;
+    }
+
+    // Create order
+    const isCredit = lower.includes('เครดิต') || lower.includes('ค้าง') || lower.includes('ไว้ก่อน');
+    const totalAmount = parsed.quantity * parsed.stockItem.price;
+
     const result = await createOrder({
       customer: parsed.customer,
       item: parsed.stockItem.item,
       quantity: parsed.quantity,
+      deliveryPerson: '',
       isCredit,
-      totalAmount: parsed.quantity * parsed.stockItem.price
+      totalAmount
     });
 
-    await updateStock(parsed.stockItem.item, parsed.stockItem.unit, (parsed.stockItem.stock - parsed.quantity));
+    // Update stock
+    const newStock = parsed.stockItem.stock - parsed.quantity;
+    const stockUpdated = await updateStock(parsed.stockItem.item, parsed.stockItem.unit, newStock);
+    
+    if (!stockUpdated) {
+      await notifyAdmin(`❌ CRITICAL: Order #${result.orderNo} created but stock update FAILED!\nItem: ${parsed.stockItem.item}`);
+      return `⚠️ คำสั่งซื้อสำเร็จ แต่อัปเดตสต็อกล้มเหลว\nกรุณาแจ้งแอดมินตรวจสอบคำสั่งซื้อ #${result.orderNo}`;
+    }
+    
     await loadStockCache(true);
 
-    return `✅ รับคำสั่งซื้อเรียบร้อย!\nเลขที่: #${result.orderNo}\nสินค้า: ${parsed.stockItem.item}\nรวม: ${result.totalAmount}฿`;
+    // Build response
+    let response = isAdmin 
+      ? `✅ บันทึกคำสั่งซื้อสำเร็จ! (Admin)\n`
+      : `✅ รับคำสั่งซื้อเรียบร้อยค่ะ!\n`;
+    
+    response += `${'='.repeat(30)}\n\n` +
+      `📋 คำสั่งซื้อ: #${result.orderNo}\n` +
+      `👤 ลูกค้า: ${parsed.customer}\n` +
+      `📦 สินค้า: ${parsed.stockItem.item}\n` +
+      `🔢 จำนวน: ${parsed.quantity} ${parsed.stockItem.unit}\n` +
+      `💰 ราคา: ${parsed.stockItem.price.toLocaleString()}฿/${parsed.stockItem.unit}\n` +
+      `💵 ยอดรวม: ${totalAmount.toLocaleString()}฿\n` +
+      `${isCredit ? '📖 การชำระ: เครดิต (ค้างชำระ)' : '✅ การชำระ: จ่ายแล้ว'}\n`;
+    
+    if (isAdmin) {
+      response += `\n📊 สต็อกคงเหลือ: ${newStock} ${parsed.stockItem.unit}`;
+      if (newStock < CONFIG.LOW_STOCK_THRESHOLD) {
+        response += `\n⚠️ แจ้งเตือน: สต็อกเหลือน้อย!`;
+      }
+    } else {
+      response += `\n\n🙏 ขอบคุณที่สั่งซื้อค่ะ`;
+    }
+
+    if (parsed.warning) {
+      response += `\n\n${parsed.warning}`;
+    }
+
+    // Notify admin
+    await notifyAdminNewOrder({
+      orderNo: result.orderNo,
+      customer: parsed.customer,
+      item: parsed.stockItem.item,
+      quantity: parsed.quantity,
+      unit: parsed.stockItem.unit,
+      total: totalAmount,
+      isCredit,
+      deliveryPerson: '',
+      newStock,
+      userId: isAdmin ? `${userId.substring(0, 12)}... (ADMIN)` : userId.substring(0, 12) + '...'
+    });
+
+    return response;
 
   } catch (error) {
-    Logger.error('Order logic failed', error);
-    return '❌ ระบบขัดข้อง กรุณาลองใหม่';
+    Logger.error('Order processing failed', error);
+    await notifyAdmin(`❌ Order Error\nUser: ${userId}\nError: ${error.message}\nInput: ${text}`);
+    return '❌ เกิดข้อผิดพลาดในการบันทึกคำสั่งซื้อ\nลองใหม่หรือติดต่อแอดมินค่ะ';
   }
 }
 
-
 async function handleVoiceMessage(messageId, replyToken, userId) {
   try {
-    // Check if user can place orders
-    if (!AccessControl.canPerformAction(userId, 'place_order')) {
-      AccessControl.logAccess(userId, 'place_order', false);
+    if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
       await replyToLine(replyToken, '🔒 ระบบปิดการรับคำสั่งซื้อชั่วคราว');
       return;
     }
@@ -235,7 +357,7 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
       return;
     }
 
-    Logger.success(`✅ Transcript: "${voiceResult.text}"`);
+    Logger.success(`✅ Voice transcript: "${voiceResult.text}"`);
     
     await replyToLine(replyToken, `🎤 ได้ยิน: "${voiceResult.text}"\n\n⏳ กำลังประมวลผล...`);
     
@@ -287,39 +409,10 @@ async function replyToLine(replyToken, text) {
     Logger.error('replyToLine error', error);
   }
 }
-function isRetryableError(error) {
-  const retryable = [
-    'ECONNRESET',
-    'ETIMEDOUT',
-    'ENOTFOUND',
-    '429',
-    'quota',
-    'rate limit'
-  ];
-  
-  const errorMsg = error.message?.toLowerCase() || '';
-  return retryable.some(keyword => errorMsg.includes(keyword.toLowerCase()));
-}
 
-// User-friendly error messages
-async function sendErrorReply(replyToken, error) {
-  let message = '❌ เกิดข้อผิดพลาด\n\n';
-  
-  if (error.message?.includes('quota') || error.message?.includes('429')) {
-    message += '⏳ ระบบยุ่งมาก กรุณารอ 1-2 นาทีแล้วลองใหม่';
-  } else if (error.message?.includes('transcribe')) {
-    message += '🎤 ระบบแปลงเสียงมีปัญหา\nลองพิมพ์แทนได้เลยค่ะ';
-  } else if (error.message?.includes('Sheets')) {
-    message += '📊 ไม่สามารถเชื่อมต่อ Google Sheets\nแจ้งแอดมินด่วนค่ะ';
-  } else {
-    message += 'ลองใหม่อีกครั้งนะคะ\nหรือติดต่อแอดมินถ้าปัญหายังคงอยู่';
-  }
-  
-  await replyToLine(replyToken, message);
-}
 async function pushLowStockAlert(itemName, currentStock, unit) {
-  if (!CONFIG.ADMIN_LINE_ID) {
-    Logger.warn('ADMIN_LINE_ID not configured, skipping low stock alert');
+  if (!CONFIG.ADMIN_USER_ID) {
+    Logger.warn('ADMIN_USER_ID not configured, skipping low stock alert');
     return;
   }
 
@@ -328,8 +421,7 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
     const allLowStock = stockCache.filter(item => item.stock < CONFIG.LOW_STOCK_THRESHOLD);
     
     let message = `⚠️ แจ้งเตือนสต็อกเหลือน้อย!\n${'='.repeat(30)}\n\n`;
-    message += `🔴 เพิ่งหมด:\n`;
-    message += `• ${itemName}: ${currentStock} ${unit}\n\n`;
+    message += `🔴 เพิ่งหมด:\n• ${itemName}: ${currentStock} ${unit}\n\n`;
     
     if (allLowStock.length > 1) {
       message += `⚠️ สินค้าอื่นที่เหลือน้อย (${allLowStock.length - 1}):\n`;
@@ -343,7 +435,7 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
     
     message += `\n💡 กรุณาเติมสต็อกโดยเร็ว`;
     
-    await pushToLine(CONFIG.ADMIN_LINE_ID, message);
+    await pushToLine(CONFIG.ADMIN_USER_ID, message);
     Logger.success('Low stock alert sent to admin');
   } catch (error) {
     Logger.error('Failed to send low stock alert', error);
@@ -358,24 +450,17 @@ function getHelpMessage(isAdmin) {
       `• "dashboard" - ดูสรุปยอดขาย\n\n` +
       `🔧 จัดการ:\n` +
       `• "รีเฟรช" - โหลดข้อมูลใหม่\n` +
-      `• "เพิ่มสต็อก [สินค้า] [จำนวน]"\n` +
-      `• "จ่ายแล้ว [เลขคำสั่ง]" - อัปเดตชำระเงิน\n\n` +
+      `• "เพิ่มสต็อก [สินค้า] [จำนวน]"\n\n` +
       `📦 สั่งซื้อ:\n` +
       `• พิมพ์: "คุณสมชาย สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"\n` +
-      `• เสียง: กดไมค์แล้วพูด\n\n` +
-      `ℹ️ สต็อกจะแจ้งเตือนอัตโนมัติเมื่อเหลือน้อย`;
+      `• เสียง: กดไมค์แล้วพูด`;
   } else {
     return `🛒 วิธีสั่งซื้อ\n${'='.repeat(30)}\n\n` +
-      `📝 พิมพ์ข้อความ:\n` +
-      `"[ชื่อลูกค้า] สั่ง [สินค้า] [จำนวน]"\n\n` +
+      `📝 พิมพ์: "[ชื่อลูกค้า] สั่ง [สินค้า] [จำนวน]"\n\n` +
       `ตัวอย่าง:\n` +
       `• "คุณสมชาย สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"\n` +
       `• "พี่ใหญ่ เอาเบียร์ช้าง 5 กระป๋อง"\n\n` +
-      `🎤 หรือส่งข้อความเสียง:\n` +
-      `กดไมค์แล้วพูดตามตัวอย่างข้างบน\n\n` +
-      `💳 การชำระเงิน:\n` +
-      `• เพิ่ม "เครดิต" หรือ "ค้าง" = ค้างชำระ\n` +
-      `• ไม่ระบุ = จ่ายเงินแล้ว`;
+      `🎤 หรือส่งเสียง: กดไมค์แล้วพูด`;
   }
 }
 
@@ -385,7 +470,6 @@ async function generateDashboard() {
   
   let totalSales = 0;
   let totalProfit = 0;
-  let totalOrders = orders.length;
   let creditOrders = 0;
   let creditAmount = 0;
   
@@ -401,21 +485,16 @@ async function generateDashboard() {
   const lowStockItems = stockCache.filter(item => item.stock < CONFIG.LOW_STOCK_THRESHOLD);
   
   let message = `📊 Dashboard วันนี้\n${'='.repeat(30)}\n\n`;
-  message += `📈 ยอดขาย\n`;
-  message += `• คำสั่งซื้อ: ${totalOrders} รายการ\n`;
+  message += `📈 ยอดขาย\n• คำสั่งซื้อ: ${orders.length} รายการ\n`;
   message += `• ยอดขายรวม: ${totalSales.toLocaleString()}฿\n`;
   message += `• กำไรรวม: ${totalProfit.toLocaleString()}฿\n\n`;
-  
-  message += `💳 เครดิต\n`;
-  message += `• ค้างชำระ: ${creditOrders} รายการ\n`;
+  message += `💳 เครดิต\n• ค้างชำระ: ${creditOrders} รายการ\n`;
   message += `• ยอดเงิน: ${creditAmount.toLocaleString()}฿\n\n`;
-  
-  message += `📦 สต็อก\n`;
-  message += `• สินค้าทั้งหมด: ${stockCache.length} รายการ\n`;
-  message += `• ⚠️ สต็อกเหลือน้อย: ${lowStockItems.length} รายการ\n`;
+  message += `📦 สต็อก\n• สินค้าทั้งหมด: ${stockCache.length} รายการ\n`;
+  message += `• ⚠️ สต็อกเหลือน้อย: ${lowStockItems.length} รายการ`;
   
   if (lowStockItems.length > 0) {
-    message += `\n${'='.repeat(30)}\n⚠️ รายการสต็อกเหลือน้อย:\n`;
+    message += `\n\n⚠️ รายการสต็อกเหลือน้อย:\n`;
     lowStockItems.forEach(item => {
       message += `• ${item.item}: ${item.stock} ${item.unit}\n`;
     });
@@ -424,13 +503,9 @@ async function generateDashboard() {
   return message;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 // ============================================================================
 // WEBHOOK
 // ============================================================================
-
 
 app.post('/webhook', async (req, res) => {
   try {
