@@ -201,16 +201,7 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
 // START SERVER
 // ============================================================================
 
-app.listen(PORT, async () => {
-  console.log('\n' + '='.repeat(50));
-  console.log('🚀 LINE Order Bot - Multi-Item System');
-  console.log('='.repeat(50));
-  console.log(`📍 Port: ${PORT}`);
-  console.log(`⏰ Bangkok time: ${getThaiDateTimeString()}`);
-  console.log('='.repeat(50) + '\n');
-  
-  await initializeApp();
-});
+
 
 async function handleTextMessage(text, userId) {
   
