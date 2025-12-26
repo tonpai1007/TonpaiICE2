@@ -1,15 +1,16 @@
 // ============================================================================
-// IMPROVED ORDER PARSER - orderParser.js
+// FIXED ORDER PARSER - orderParser.js
+// Ensures ALL responses return items[] array for consistency
 // ============================================================================
 
 const { Logger, PerformanceMonitor } = require('./logger');
-const { normalizeText, similarity } = require('./utils');
+
 const { generateWithGemini, getGemini } = require('./aiServices');
 const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-const { getStockCache, getCustomerCache } = require('./cacheManager');
+const { getStockCache,} = require('./cacheManager');
 
 // ============================================================================
-// MAIN PARSING FUNCTION
+// MAIN PARSING FUNCTION - ALWAYS RETURNS items[] ARRAY
 // ============================================================================
 
 async function parseOrder(userInput) {
@@ -29,12 +30,12 @@ async function parseOrder(userInput) {
     if (genAI) {
       const result = await parseOrderWithGemini(userInput, stockCache);
       PerformanceMonitor.end('parseOrder');
-      return result;
+      return result; // Already normalized to multi-item format
     } else {
       Logger.warn('Gemini not available, using fallback parser');
       const result = fallbackParserWithRAG(userInput, stockCache);
       PerformanceMonitor.end('parseOrder');
-      return result;
+      return result; // Already normalized to multi-item format
     }
   } catch (error) {
     Logger.error('parseOrder error', error);
@@ -44,7 +45,7 @@ async function parseOrder(userInput) {
 }
 
 // ============================================================================
-// GEMINI PARSER WITH ENHANCED PROMPTING
+// GEMINI PARSER WITH MULTI-ITEM NORMALIZATION
 // ============================================================================
 
 async function parseOrderWithGemini(userInput, stockCache) {
@@ -188,13 +189,21 @@ ${stockCatalog}${customerContext}
                 `เหตุผล: ${result.reasoning}`;
     }
 
+    // ============================================================================
+    // 🔬 CRITICAL FIX: NORMALIZE TO MULTI-ITEM FORMAT
+    // ============================================================================
     return {
       success: true,
       action: result.action || 'order',
-      stockItem: matchedItem,
-      matchedName: matchedItem.item,
-      quantity: result.quantity || 1,
       customer: finalCustomer,
+      deliveryPerson: '', // Extract if needed
+      paymentStatus: userInput.toLowerCase().includes('เครดิต') ? 'credit' : 'cash',
+      items: [
+        {
+          stockItem: matchedItem,
+          quantity: result.quantity || 1
+        }
+      ],
       confidence: result.confidence || 'medium',
       reasoning: result.reasoning || '',
       warning: warning,
@@ -208,7 +217,7 @@ ${stockCatalog}${customerContext}
 }
 
 // ============================================================================
-// FALLBACK PARSER WITH RAG
+// FALLBACK PARSER WITH MULTI-ITEM NORMALIZATION
 // ============================================================================
 
 function fallbackParserWithRAG(text, stockCache) {
@@ -261,13 +270,21 @@ function fallbackParserWithRAG(text, stockCache) {
 
   PerformanceMonitor.end('fallbackParserWithRAG');
 
+  // ============================================================================
+  // 🔬 CRITICAL FIX: NORMALIZE TO MULTI-ITEM FORMAT
+  // ============================================================================
   return {
     success: true,
     action: 'order',
-    stockItem: bestItem,
-    matchedName: bestItem.item,
-    quantity,
-    customer,
+    customer: customer,
+    deliveryPerson: '',
+    paymentStatus: text.toLowerCase().includes('เครดิต') ? 'credit' : 'cash',
+    items: [
+      {
+        stockItem: bestItem,
+        quantity: quantity
+      }
+    ],
     confidence: bestScore > 70 ? 'high' : bestScore > 50 ? 'medium' : 'low',
     reasoning: `Fallback RAG match (${bestScore.toFixed(1)}%)`,
     warning: warning,
