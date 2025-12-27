@@ -53,6 +53,9 @@ async function parseOrderWithGemini(userInput, stockCache) {
     let detectedCustomer = null;
     let highestCustomerScore = 0;
     
+    // STRICTER THRESHOLD: Only accept customer matches above 60%
+    const CUSTOMER_MATCH_THRESHOLD = 0.60; // Raised from 0.45
+    
     // Find best customer match
     for (const result of customerResults) {
       if (result.similarity > highestCustomerScore) {
@@ -61,9 +64,13 @@ async function parseOrderWithGemini(userInput, stockCache) {
       }
     }
     
-    if (detectedCustomer && highestCustomerScore > 0.45) {
+    // Only use if confidence is high enough
+    if (detectedCustomer && highestCustomerScore > CUSTOMER_MATCH_THRESHOLD) {
       Logger.success(`Customer: ${detectedCustomer} (${(highestCustomerScore * 100).toFixed(1)}%)`);
     } else {
+      if (detectedCustomer) {
+        Logger.warn(`Customer match too low: ${detectedCustomer} (${(highestCustomerScore * 100).toFixed(1)}%) - treating as unknown`);
+      }
       detectedCustomer = null;
     }
 
@@ -85,9 +92,9 @@ async function parseOrderWithGemini(userInput, stockCache) {
       return `[${idx}] ${item.item} (${item.category}) | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
     }).join('\n');
 
-    // Step 4: Build customer list
-    const customerList = customerCache.slice(0, 20).map(c => c.name).join(', ');
-
+    // Step 4: Build customer list with examples
+    const customerList = customerCache.slice(0, 30).map(c => c.name).join(', ');
+    
     // Step 5: Enhanced schema
     const schema = {
       type: 'object',
@@ -98,7 +105,12 @@ async function parseOrderWithGemini(userInput, stockCache) {
         },
         customer: { 
           type: 'string',
-          description: 'ชื่อลูกค้าที่ชัดเจนที่สุด หรือ "ไม่ระบุ"'
+          description: 'ชื่อลูกค้าที่ชัดเจนที่สุด หรือ "ไม่ระบุ" ถ้าไม่มีในระบบ'
+        },
+        customer_confidence: {
+          type: 'string',
+          enum: ['high', 'medium', 'low'],
+          description: 'ความมั่นใจในการจับคู่ลูกค้า'
         },
         delivery_person: {
           type: 'string',
@@ -125,89 +137,96 @@ async function parseOrderWithGemini(userInput, stockCache) {
           enum: ['cash', 'credit']
         }
       },
-      required: ['action', 'customer', 'delivery_person', 'items', 'payment_status']
+      required: ['action', 'customer', 'customer_confidence', 'delivery_person', 'items', 'payment_status']
     };
 
-    // Step 6: Ultra-precise prompt
+    // Step 6: Ultra-precise prompt with better customer handling
     const prompt = `คุณคือ AI ผู้เชี่ยวชาญระบบคำสั่งซื้อร้านน้ำแข็ง ที่มีความแม่นยำสูงสุด
 
 📋 รายการสินค้าทั้งหมด (index: 0-${relevantStock.length - 1}):
 ${stockCatalog}
 
-👥 รายชื่อลูกค้าในระบบ:
+👥 รายชื่อลูกค้าในระบบทั้งหมด:
 ${customerList}
-${detectedCustomer ? `\n✅ ระบบตรวจพบว่าน่าจะเป็น: "${detectedCustomer}" (ความมั่นใจ ${(highestCustomerScore * 100).toFixed(0)}%)` : ''}
+${detectedCustomer ? `\n✅ ระบบตรวจพบว่าน่าจะเป็น: "${detectedCustomer}" (ความมั่นใจสูง ${(highestCustomerScore * 100).toFixed(0)}%)` : '\n⚠️ ระบบไม่พบลูกค้าที่ตรงกัน - ใช้ชื่อจากข้อความโดยตรง'}
 
 🎯 คำสั่งจากลูกค้า: "${userInput}"
 
 ⚠️ กฎการวิเคราะห์ที่เข้มงวด:
 
-1. **ชื่อลูกค้า (CRITICAL)**:
-   - ต้องหาชื่อที่ชัดเจนที่สุด
-   - ชื่อที่ขึ้นต้นด้วย "พี่", "น้อง", "คุณ", "ลุง", "ป้า" = ลูกค้า
-   - ตัวอย่าง: "พี่กาแฟ" → customer: "กาแฟ" หรือ "พี่กาแฟ"
-   - ถ้าไม่แน่ใจ → ใช้ชื่อที่ระบบตรวจพบ
-   - ไม่มีเลย → "ไม่ระบุ"
+1. **ชื่อลูกค้า (CRITICAL - อ่านให้ดี!):**
+   
+   วิธีหาชื่อลูกค้า:
+   a) ถ้าระบบตรวจพบลูกค้าที่มั่นใจสูง (>60%) → ใช้ชื่อนั้น
+   b) ถ้าไม่มีการตรวจพบ หรือความมั่นใจต่ำ:
+      - หาชื่อที่มีคำนำหน้า: "พี่", "น้อง", "คุณ", "ลุง", "ป้า", "เจ้า"
+      - ตัวอย่าง: "พี่กาแฟ" → customer: "พี่กาแฟ", confidence: "high"
+      - ตัวอย่าง: "เจ้นุ้ย" → customer: "เจ้นุ้ย", confidence: "medium"
+      - ตัวอย่าง: "น้องแดง" → customer: "น้องแดง", confidence: "high"
+   c) ถ้าไม่มีชื่อเลย → customer: "ไม่ระบุ", confidence: "low"
+   
+   ⚠️ **ห้ามแก้ไขชื่อ หรือ เดาชื่อ!**
+   - "เจ้นุ้ย" ≠ "ป้าผัดไทย" (ไม่คล้ายกันเลย!)
+   - "พี่หมู" ≠ "พี่มด" (ต่างคนกัน!)
+   - ใช้ชื่อตามที่ได้ยิน ไม่ใช่เดา
 
-2. **ผู้ส่ง (delivery_person)**:
+2. **ผู้ส่ง (delivery_person):**
    - หาคำว่า: "ส่งโดย X", "ให้ X ส่ง", "โดย X", "ฝาก X ส่ง"
    - ตัวอย่าง: 
      - "ส่งโดยพี่หมู" → "พี่หมู"
      - "ให้น้องแดงส่ง" → "น้องแดง"
-     - "โดยลุงเล็ก" → "ลุงเล็ก"
    - ไม่มี → ""
 
-3. **การจับคู่สินค้า (ULTRA PRECISE)**:
+3. **การจับคู่สินค้า (ULTRA PRECISE):**
    - ต้องตรงทุกคำ ไม่เดา
    - "น้ำแข็งหลอดใหญ่" ≠ "น้ำแข็งหลอดเล็ก" (ห้ามสลับ!)
-   - "น้ำแข็งแผ่น" ≠ "น้ำแข็งเกร็ด" (ห้ามสลับ!)
-   - "น้ำแข็งบดละเอียด" ≠ "น้ำแข็งบดหยาบ" (ห้ามสลับ!)
-   - ถ้าลูกค้าพูด "น้ำแข็ง" อย่างเดียว (ไม่ระบุประเภท):
-     → confidence: "low"
-     → reasoning: "ลูกค้าไม่ระบุประเภทน้ำแข็งชัดเจน"
+   - "น้ำแข็งบดหยาบ" ≠ "น้ำแข็งบดละเอียด" (ห้ามสลับ!)
+   - ถ้าไม่ชัดเจน → confidence: "low" + อธิบายเหตุผล
 
-4. **จำนวน**:
-   - ตัวเลข + หน่วยนับ (ถุง, กระสอบ, ขวด, กระป๋อง) = จำนวน
-   - "2 ถุง" → quantity: 2
-   - "สามกระป๋อง" → quantity: 3
-   - ไม่ระบุ → quantity: 1
+4. **จำนวน:**
+   - ตัวเลข + หน่วยนับ = จำนวน
+   - "2 ถุง" → 2
+   - "สามกระป๋อง" → 3
+   - ไม่ระบุ → 1
 
-5. **Multi-Item Detection**:
-   - หาคำว่า "กับ", "และ", "แล้วก็", "อีก"
-   - ตัวอย่าง: "น้ำแข็ง 2 ถุง กับ เบียร์ 5 กระป๋อง"
-     → items: [{...}, {...}]
-
-6. **Payment Status**:
+5. **Payment Status:**
    - มีคำว่า "เครดิต" → "credit"
    - ไม่มี → "cash"
 
 ตัวอย่างที่ถูกต้อง:
 
-Input: "พี่กาแฟ สั่งน้ำแข็งหลอดใหญ่ 2 ถุง ส่งโดยพี่หมู"
+Input: "เจ้นุ้ย บดหยาบ 3 ถุง"
+(ระบบไม่พบลูกค้า "เจ้นุ้ย" ในฐานข้อมูล)
 Output: {
-  customer: "กาแฟ",
-  delivery_person: "พี่หมู",
+  customer: "เจ้นุ้ย",
+  customer_confidence: "medium",
   items: [{
-    matched_stock_index: (index ของ "น้ำแข็งหลอดใหญ่"),
-    quantity: 2,
-    confidence: "high",
-    reasoning: "ระบุประเภทชัดเจน: หลอดใหญ่"
-  }]
-}
-
-Input: "คุณสมชาย น้ำแข็ง 3 ถุง"
-Output: {
-  customer: "สมชาย",
-  delivery_person: "",
-  items: [{
-    matched_stock_index: (เลือกน้ำแข็งที่เป็นไปได้มากที่สุด),
+    matched_stock_index: (index ของ "น้ำแข็งบดหยาบ"),
     quantity: 3,
-    confidence: "low",
-    reasoning: "ไม่ระบุประเภทน้ำแข็ง (หลอดใหญ่/เล็ก/เกร็ด/แผ่น)"
+    confidence: "high",
+    reasoning: "จับคู่กับ น้ำแข็งบดหยาบ ชัดเจน"
   }]
 }
 
-⚠️ CRITICAL: matched_stock_index ต้องอยู่ในช่วง 0-${relevantStock.length - 1} เท่านั้น!
+Input: "พี่กาแฟ น้ำแข็ง 2"
+(มี "พี่กาแฟ" ในระบบ)
+Output: {
+  customer: "พี่กาแฟ",
+  customer_confidence: "high",
+  items: [{
+    matched_stock_index: (เลือกน้ำแข็งที่เป็นไปได้),
+    quantity: 2,
+    confidence: "low",
+    reasoning: "ไม่ระบุประเภทน้ำแข็งชัดเจน"
+  }]
+}
+
+⚠️ สำคัญ:
+- matched_stock_index ต้องอยู่ในช่วง 0-${relevantStock.length - 1}
+- ใช้ชื่อลูกค้าตามที่ได้ยิน ไม่ใช่เดาจากฐานข้อมูล
+- customer_confidence = "high" ถ้ามีในระบบ หรือมีคำนำหน้าชัดเจน
+- customer_confidence = "medium" ถ้าเป็นชื่อเฉยๆ ไม่มีในระบบ
+- customer_confidence = "low" ถ้าไม่มีชื่อเลย
 
 ตอบเป็น JSON`;
 
@@ -252,16 +271,36 @@ Output: {
       return fallbackParserWithRAG(userInput, stockCache);
     }
 
-    const finalCustomer = detectedCustomer || result.customer || 'ไม่ระบุ';
+    // Step 9: Final customer decision with override logic
+    let finalCustomer = result.customer || 'ไม่ระบุ';
+    let customerWarning = null;
+    
+    // Override if detected customer is high confidence and Gemini returned different
+    if (detectedCustomer && highestCustomerScore > 0.70) {
+      if (finalCustomer !== detectedCustomer && finalCustomer !== 'ไม่ระบุ') {
+        Logger.warn(`Gemini suggested "${finalCustomer}" but RAG detected "${detectedCustomer}" with ${(highestCustomerScore * 100).toFixed(1)}% - using RAG`);
+        finalCustomer = detectedCustomer;
+        customerWarning = `ℹ️ ระบบจับคู่ลูกค้าเป็น "${detectedCustomer}" โดยอัตโนมัติ`;
+      }
+    }
+    
+    // Add warning for low confidence customer matches
+    if (result.customer_confidence === 'low' || result.customer_confidence === 'medium') {
+      if (finalCustomer !== 'ไม่ระบุ') {
+        customerWarning = `⚠️ ไม่แน่ใจชื่อลูกค้า: "${finalCustomer}" - ตรวจสอบด้วย`;
+      }
+    }
+
     const deliveryPerson = result.delivery_person || '';
 
-    Logger.success(`✓ Customer="${finalCustomer}", Delivery="${deliveryPerson}", Items=${validatedItems.length}`);
+    Logger.success(`✓ Customer="${finalCustomer}" (${result.customer_confidence}), Delivery="${deliveryPerson}", Items=${validatedItems.length}`);
 
-    let warning = null;
+    let warning = customerWarning;
     const lowConfItems = validatedItems.filter(i => i.confidence === 'low');
     if (lowConfItems.length > 0) {
-      warning = `⚠️ ระบบไม่แน่ใจในสินค้า ${lowConfItems.length} รายการ:\n` +
+      const itemWarning = `⚠️ ระบบไม่แน่ใจในสินค้า ${lowConfItems.length} รายการ:\n` +
                 lowConfItems.map(i => `• ${i.stockItem.item}: ${i.reasoning}`).join('\n');
+      warning = warning ? `${warning}\n\n${itemWarning}` : itemWarning;
     }
 
     return {
@@ -280,7 +319,6 @@ Output: {
     return fallbackParserWithRAG(userInput, stockCache);
   }
 }
-
 // ============================================================================
 // FALLBACK PARSER
 // ============================================================================
