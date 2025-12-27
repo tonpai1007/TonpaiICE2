@@ -1,41 +1,131 @@
 // ============================================================================
-// AI VOICE SERVICE - USES FULL DATABASE CONTEXT
+// GOOGLE SPEECH-TO-TEXT VOICE SERVICE
 // ============================================================================
 
-const { configManager } = require('./config');
+const speech = require('@google-cloud/speech');
+const { configManager, loadGoogleCredentials } = require('./config');
 const { Logger } = require('./logger');
-const { transcribeAudio, generateWithGemini } = require('./aiServices');
+const { generateWithGemini } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
 
+let speechClient = null;
+
 // ============================================================================
-// BUILD VOCABULARY FOR ASSEMBLYAI
+// INITIALIZE GOOGLE SPEECH
 // ============================================================================
 
-function buildEnhancedVocabulary() {
+function initializeSpeechClient() {
+  if (speechClient) return speechClient;
+  
+  try {
+    const credentials = loadGoogleCredentials();
+    
+    speechClient = new speech.SpeechClient({
+      credentials
+    });
+    
+    Logger.success('Google Speech-to-Text initialized');
+    return speechClient;
+  } catch (error) {
+    Logger.error('Failed to initialize Google Speech', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// BUILD SPEECH CONTEXT (VOCABULARY HINTS)
+// ============================================================================
+
+function buildSpeechContext() {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
-  const vocabulary = new Set();
+  const phrases = new Set();
 
+  // Add all customer names
   customerCache.forEach(customer => {
-    vocabulary.add(customer.name);
-    customer.name.split(/\s+/).forEach(word => {
-      if (word.length >= 2) vocabulary.add(word);
-    });
+    phrases.add(customer.name);
   });
 
+  // Add all product names
   stockCache.forEach(item => {
-    vocabulary.add(item.item);
-    vocabulary.add(item.category);
-    item.item.split(/\s+/).forEach(word => {
-      if (word.length >= 2) vocabulary.add(word);
-    });
+    phrases.add(item.item);
   });
 
-  const finalVocab = Array.from(vocabulary).filter(word => word && word.length >= 2);
-  Logger.success(`Vocabulary: ${finalVocab.length} words`);
+  // Add common keywords
+  const keywords = [
+    'น้ำแข็ง', 'หลอด', 'บด', 'แผ่น', 'เกร็ด',
+    'ใหญ่', 'เล็ก', 'ละเอียด', 'หยาบ',
+    'ถุง', 'กระสอบ', 'ขวด', 'กระป๋อง',
+    'สั่ง', 'ซื้อ', 'ส่งโดย', 'เครดิต',
+    'พี่', 'น้อง', 'คุณ', 'ลุง', 'ป้า'
+  ];
   
-  return finalVocab;
+  keywords.forEach(word => phrases.add(word));
+
+  const finalPhrases = Array.from(phrases).slice(0, 500); // Google limit
+  Logger.success(`Speech context: ${finalPhrases.length} phrases`);
+  
+  return finalPhrases;
+}
+
+// ============================================================================
+// TRANSCRIBE AUDIO WITH GOOGLE SPEECH
+// ============================================================================
+
+async function transcribeAudioWithGoogle(audioBuffer) {
+  try {
+    const client = initializeSpeechClient();
+    const phrases = buildSpeechContext();
+    
+    Logger.info(`Transcribing with Google (${(audioBuffer.length / 1024).toFixed(1)}KB)`);
+    
+    const audio = {
+      content: audioBuffer.toString('base64')
+    };
+    
+    const config = {
+      encoding: 'OGG_OPUS', // LINE uses OGG Opus
+      sampleRateHertz: 16000,
+      languageCode: 'th-TH', // Thai language
+      alternativeLanguageCodes: ['en-US'], // Fallback to English
+      enableAutomaticPunctuation: true,
+      model: 'default',
+      useEnhanced: true,
+      speechContexts: [{
+        phrases: phrases,
+        boost: 20 // Max boost for context
+      }]
+    };
+    
+    const request = {
+      audio: audio,
+      config: config
+    };
+    
+    const [response] = await client.recognize(request);
+    
+    if (!response.results || response.results.length === 0) {
+      throw new Error('No transcription results');
+    }
+    
+    const transcription = response.results
+      .map(result => result.alternatives[0].transcript)
+      .join(' ');
+    
+    const confidence = response.results[0].alternatives[0].confidence || 0;
+    
+    Logger.success(`✅ Google transcribed: "${transcription}" (${(confidence * 100).toFixed(1)}%)`);
+    
+    return {
+      text: transcription,
+      confidence: confidence
+    };
+    
+  } catch (error) {
+    Logger.error('Google Speech transcription failed', error);
+    throw error;
+  }
 }
 
 // ============================================================================
@@ -44,12 +134,9 @@ function buildEnhancedVocabulary() {
 
 async function aiCorrectTranscription(rawText, stockCache, customerCache) {
   try {
-    Logger.info('🤖 AI correcting with full database context...');
+    Logger.info('🤖 AI correcting transcription...');
 
-    // Send ENTIRE product list
     const allProducts = stockCache.map(p => p.item).join('\n');
-    
-    // Send ENTIRE customer list
     const allCustomers = customerCache.map(c => c.name).join('\n');
 
     const schema = {
@@ -83,30 +170,28 @@ ${allCustomers}
 "${rawText}"
 
 งาน:
-1. แก้ไขข้อผิดพลาดจากการแปลงเสียง
-2. จับคู่ชื่อลูกค้าและสินค้ากับฐานข้อมูล
-3. แก้ไขคำที่ออกเสียงคล้ายกัน
+1. ตรวจสอบว่าชื่อลูกค้าและสินค้าตรงกับฐานข้อมูลหรือไม่
+2. แก้ไขคำที่อาจจะผิด
+3. จัดรูปแบบให้ชัดเจน
 
 กฎ:
-- "ติด", "ทิด" → "พี่"
-- "น้องแห่ง", "น้ำแห่ง" → "น้ำแข็ง"
-- "บท" → "บด"
-- "หล่อด" → "หลอด"
 - ใช้ชื่อที่ตรงกับฐานข้อมูล
+- เก็บโครงสร้าง: [ลูกค้า] สั่ง [สินค้า] [จำนวน]
+- เพิ่ม "ส่งโดย [คน]" ถ้ามี
 
 ตัวอย่าง:
-Input: "ติดกาแฟน้องแห่งบท 2 ถุง"
+Input: "พี่กาแฟ สั่งน้ำแข็งบด 2 ถุง"
 Output: {
-  corrected_text: "พี่กาแฟ น้ำแข็งบด 2 ถุง",
+  corrected_text: "พี่กาแฟ สั่งน้ำแข็งบด 2 ถุง",
   confidence: "high",
-  changes: "ติด→พี่, น้องแห่ง→น้ำแข็ง, บท→บด"
+  changes: "ไม่มีการแก้ไข"
 }
 
 แก้ไขให้ตรงกับฐานข้อมูล ตอบเป็น JSON`;
 
     const result = await generateWithGemini(prompt, schema, 0.1);
 
-    Logger.success(`✅ "${rawText}" → "${result.corrected_text}"`);
+    Logger.success(`✅ AI: "${rawText}" → "${result.corrected_text}"`);
     Logger.info(`Changes: ${result.changes}`);
 
     return {
@@ -130,24 +215,25 @@ Output: {
 // ============================================================================
 
 async function processVoiceMessage(audioBuffer) {
-  const MIN_CONFIDENCE = configManager.get('VOICE_MIN_CONFIDENCE', 0.55);
+  const MIN_CONFIDENCE = configManager.get('VOICE_MIN_CONFIDENCE', 0.7);
   const MIN_TEXT_LENGTH = configManager.get('VOICE_MIN_TEXT_LENGTH', 3);
   
   try {
-    Logger.info('🎤 Processing voice...');
+    Logger.info('🎤 Processing voice with Google Speech...');
     
-    const vocabulary = buildEnhancedVocabulary();
-    const transcriptionResult = await transcribeAudio(audioBuffer, vocabulary);
+    // Step 1: Transcribe with Google
+    const transcriptionResult = await transcribeAudioWithGoogle(audioBuffer);
     
     Logger.info(`Raw: "${transcriptionResult.text}" (${(transcriptionResult.confidence * 100).toFixed(1)}%)`);
     
     if (!transcriptionResult.text || transcriptionResult.text.trim().length < MIN_TEXT_LENGTH) {
       return {
         success: false,
-        error: '🎤 ฟังไม่ชัด กรุณาพูดใหม่\n\n💡 พูดช้าๆ ชัดเจน เช่น: "พี่กาแฟ สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"'
+        error: '🎤 ฟังไม่ชัด กรุณาพูดใหม่\n\n💡 พูดช้าๆ ชัดเจน เช่น:\n"พี่กาแฟ สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"'
       };
     }
     
+    // Step 2: AI correction
     const stockCache = getStockCache();
     const customerCache = getCustomerCache();
     
@@ -159,13 +245,14 @@ async function processVoiceMessage(audioBuffer) {
     
     Logger.success(`✅ Final: "${aiCorrected.corrected}"`);
     
+    // Step 3: Build warning
     let warning = null;
     
     if (transcriptionResult.confidence < MIN_CONFIDENCE) {
       warning = '⚠️ การแปลงเสียงไม่แน่นอน กรุณาตรวจสอบ';
     } else if (aiCorrected.confidence === 'low') {
       warning = `ℹ️ AI แก้ไขแล้วแต่ไม่แน่ใจ: ${aiCorrected.changes}`;
-    } else if (aiCorrected.confidence === 'medium') {
+    } else if (aiCorrected.confidence === 'medium' && aiCorrected.changes !== 'ไม่มีการแก้ไข') {
       warning = `ℹ️ ${aiCorrected.changes}`;
     }
     
@@ -189,6 +276,13 @@ async function processVoiceMessage(audioBuffer) {
       };
     }
     
+    if (error.message?.includes('Invalid audio')) {
+      return {
+        success: false,
+        error: '❌ รูปแบบเสียงไม่ถูกต้อง ลองบันทึกใหม่'
+      };
+    }
+    
     return {
       success: false,
       error: '❌ เกิดข้อผิดพลาด ลองใหม่หรือพิมพ์แทน'
@@ -197,7 +291,7 @@ async function processVoiceMessage(audioBuffer) {
 }
 
 // ============================================================================
-// FETCH AUDIO
+// FETCH AUDIO FROM LINE
 // ============================================================================
 
 async function fetchAudioFromLine(messageId) {
@@ -227,8 +321,12 @@ async function fetchAudioFromLine(messageId) {
   }
 }
 
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
 module.exports = {
   processVoiceMessage,
   fetchAudioFromLine,
-  buildEnhancedVocabulary
+  initializeSpeechClient
 };

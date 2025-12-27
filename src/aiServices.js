@@ -1,12 +1,12 @@
-// aiServices.js - Gemini and AssemblyAI integration
+// ============================================================================
+// AI SERVICES - Gemini Only (AssemblyAI Removed)
+// ============================================================================
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { AssemblyAI } = require('assemblyai');
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 
 let genAI = null;
-let assemblyClient = null;
 
 // ============================================================================
 // INITIALIZATION
@@ -22,15 +22,7 @@ function initializeAIServices() {
       Logger.warn('Gemini API key not provided');
     }
 
-    // Initialize AssemblyAI
-    if (CONFIG.ASSEMBLYAI_API_KEY) {
-      assemblyClient = new AssemblyAI({ apiKey: CONFIG.ASSEMBLYAI_API_KEY });
-      Logger.success('AssemblyAI initialized');
-    } else {
-      Logger.warn('AssemblyAI API key not provided');
-    }
-
-    return { genAI, assemblyClient };
+    return { genAI };
   } catch (error) {
     Logger.error('Failed to initialize AI services', error);
     throw error;
@@ -48,12 +40,12 @@ async function generateWithGemini(prompt, schema = null, temperature = 0.1) {
 
   try {
     const config = {
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3-flash',
       generationConfig: {
         temperature,
-        topP: 0.9,
-        topK: 400,
-        responseMimeType: "application/json",
+        topP: 0.95,
+        topK: 40,
+        maxOutputTokens: 8192,
       }
     };
 
@@ -78,57 +70,11 @@ async function generateWithGemini(prompt, schema = null, temperature = 0.1) {
 }
 
 // ============================================================================
-// ASSEMBLYAI OPERATIONS
-// ============================================================================
-
-async function transcribeAudio(audioBuffer, boostWords = []) {
-  if (!assemblyClient) {
-    throw new Error('AssemblyAI not initialized');
-  }
-
-  try {
-    Logger.info(`Transcribing audio (${(audioBuffer.length / 1024).toFixed(1)}KB)`);
-
-    const transcript = await assemblyClient.transcripts.transcribe({
-      audio: audioBuffer,
-      language_code: 'th',
-      speech_model: 'best',
-      punctuate: true,
-      format_text: true,
-      word_boost: boostWords,
-      boost_param: 'high',
-      dual_channel: false,
-      speaker_labels: false,
-      language_detection: false
-    });
-
-    if (transcript.status === 'error') {
-      throw new Error(transcript.error);
-    }
-
-    const transcribed = transcript.text || '';
-    const confidence = transcript.confidence || 0;
-
-    Logger.info(`Transcribed: "${transcribed}" (${(confidence * 100).toFixed(1)}%)`);
-
-    return {
-      text: transcribed,
-      confidence
-    };
-  } catch (error) {
-    Logger.error('AssemblyAI transcription failed', error);
-    throw error;
-  }
-}
-
-// ============================================================================
 // EXPORTS
 // ============================================================================
 
 module.exports = {
   initializeAIServices,
   getGemini: () => genAI,
-  getAssembly: () => assemblyClient,
-  generateWithGemini,
-  transcribeAudio
+  generateWithGemini
 };
