@@ -3,7 +3,7 @@ const express = require('express');
 // ⚠️  CRITICAL: Validate config BEFORE importing any other modules
 const { CONFIG, validateConfig, configManager } = require('./config');
 const { Logger } = require('./logger');
-
+const { scheduleCleanup } = require('./cleanupService');
 // Validate config IMMEDIATELY to prevent ReferenceErrors during module loading
 try {
   validateConfig(); 
