@@ -1,11 +1,18 @@
-// ============================================================================
-// ULTRA-ACCURATE ORDER PARSER
-// ============================================================================
+// orderParser.js - Resilient Order Parser with Graceful Degradation
 
 const { Logger, PerformanceMonitor } = require('./logger');
-const { generateWithGemini, getGemini } = require('./aiServices');
+const { normalizeText, similarity } = require('./utils');
+const { 
+  generateWithGemini, 
+  isGeminiAvailable, 
+  shouldUseGemini 
+} = require('./aiServices');
 const { stockVectorStore, customerVectorStore } = require('./vectorStore');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
+
+// ============================================================================
+// MAIN PARSING FUNCTION - WITH SERVICE HEALTH CHECK
+// ============================================================================
 
 async function parseOrder(userInput) {
   const stockCache = getStockCache();
@@ -13,89 +20,135 @@ async function parseOrder(userInput) {
   if (stockCache.length === 0) {
     return {
       success: false,
-      error: 'ยังไม่มีสินค้าในระบบ กรุณาเพิ่มสินค้าก่อน'
+      error: '❌ ยังไม่มีสินค้าในระบบ กรุณาเพิ่มสินค้าก่อน'
     };
   }
 
   try {
     PerformanceMonitor.start('parseOrder');
     
-    const genAI = getGemini();
-    if (genAI) {
-      const result = await parseOrderWithGemini(userInput, stockCache);
-      PerformanceMonitor.end('parseOrder');
-      return result;
+    // Strategy: Check if Gemini is available, otherwise use RAG fallback
+    if (shouldUseGemini()) {
+      Logger.info('🧠 Using Gemini AI Parser');
+      try {
+        const result = await parseOrderWithGemini(userInput, stockCache);
+        PerformanceMonitor.end('parseOrder');
+        return result;
+      } catch (geminiError) {
+        // If Gemini fails, log the error and fall back to RAG
+        Logger.warn(`⚠️ Gemini parsing failed: ${geminiError.message}`);
+        Logger.info('🔄 Falling back to RAG parser...');
+        
+        if (geminiError.code === 'QUOTA_EXCEEDED') {
+          Logger.warn('💢 Gemini quota exceeded - using RAG fallback');
+        }
+        
+        const result = fallbackParserWithRAG(userInput, stockCache);
+        PerformanceMonitor.end('parseOrder');
+        return result;
+      }
     } else {
-      Logger.warn('Gemini not available, using fallback parser');
+      Logger.info('📊 Using RAG-only parser (Gemini unavailable)');
       const result = fallbackParserWithRAG(userInput, stockCache);
       PerformanceMonitor.end('parseOrder');
       return result;
     }
   } catch (error) {
-    Logger.error('parseOrder error', error);
+    Logger.error('❌ parseOrder critical failure', error);
     PerformanceMonitor.end('parseOrder');
+    
+    // Last resort: basic fallback
     return fallbackParserWithRAG(userInput, stockCache);
   }
 }
 
 // ============================================================================
-// GEMINI PARSER - ULTRA ACCURATE
+// GEMINI PARSER - ENHANCED ERROR HANDLING
 // ============================================================================
 
 async function parseOrderWithGemini(userInput, stockCache) {
   try {
-    Logger.info('Starting ultra-accurate Gemini parse', userInput);
+    Logger.info('🔍 Starting Gemini parse with customer context');
 
-    // Step 1: Get ALL customers for better matching
-    const customerCache = getCustomerCache();
-    const customerResults = customerVectorStore.search(userInput, 10);
-    
+    // Step 1: Extract customer using RAG
+    const customerResults = customerVectorStore.search(userInput, 3);
     let detectedCustomer = null;
-    let highestCustomerScore = 0;
     
-    // STRICTER THRESHOLD: Only accept customer matches above 60%
-    const CUSTOMER_MATCH_THRESHOLD = 0.60; // Raised from 0.45
-    
-    // Find best customer match
-    for (const result of customerResults) {
-      if (result.similarity > highestCustomerScore) {
-        highestCustomerScore = result.similarity;
-        detectedCustomer = result.metadata.name;
-      }
-    }
-    
-    // Only use if confidence is high enough
-    if (detectedCustomer && highestCustomerScore > CUSTOMER_MATCH_THRESHOLD) {
-      Logger.success(`Customer: ${detectedCustomer} (${(highestCustomerScore * 100).toFixed(1)}%)`);
-    } else {
-      if (detectedCustomer) {
-        Logger.warn(`Customer match too low: ${detectedCustomer} (${(highestCustomerScore * 100).toFixed(1)}%) - treating as unknown`);
-      }
-      detectedCustomer = null;
+    if (customerResults.length > 0 && customerResults[0].similarity > 0.5) {
+      detectedCustomer = customerResults[0].metadata.name;
+      Logger.success(`✅ Customer detected: ${detectedCustomer} (${(customerResults[0].similarity * 100).toFixed(1)}%)`);
     }
 
-    // Step 2: Get TOP 20 relevant products using RAG
+    // Step 2: Get relevant products using RAG
     const productQuery = detectedCustomer 
       ? userInput.replace(new RegExp(detectedCustomer, 'gi'), '').trim()
       : userInput;
     
-    const ragResults = stockVectorStore.search(productQuery, 20);
+    const ragResults = stockVectorStore.search(productQuery, 10);
     
-    const relevantStock = ragResults.length > 0 && ragResults[0].similarity > 0.25
+    const relevantStock = ragResults.length > 0 && ragResults[0].similarity > 0.3
       ? ragResults.map(r => stockCache[r.metadata.index])
-      : stockCache.slice(0, 40);
+      : stockCache.slice(0, 20);
     
-    Logger.info(`Using ${relevantStock.length} products for context`);
+    Logger.info(`📦 Using ${relevantStock.length} products for context`);
     
-    // Step 3: Build detailed stock catalog
+    // Step 3: Build stock catalog
     const stockCatalog = relevantStock.map((item, idx) => {
-      return `[${idx}] ${item.item} (${item.category}) | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
+      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
     }).join('\n');
 
-    // Step 4: Build customer list with examples
-    const customerList = customerCache.slice(0, 30).map(c => c.name).join(', ');
-    
-    // Step 5: Enhanced schema
+    // Step 4: Build customer context
+    let customerContext = '';
+    if (detectedCustomer) {
+      customerContext = `\n\n✅ ลูกค้าที่ตรวจพบ: "${detectedCustomer}"`;
+    } else if (customerResults.length > 0) {
+      const suggestions = customerResults.slice(0, 3).map(c => c.metadata.name).join(', ');
+      customerContext = `\n\n💡 ลูกค้าที่คล้ายกัน: ${suggestions}`;
+    }
+
+    // Step 5: Multi-item detection prompt
+    const detectionPrompt = `คุณคือ AI ตรวจจับคำสั่งซื้อที่อาจมีหลายรายการ
+
+📝 คำสั่ง: "${userInput}"
+
+ตรวจสอบว่ามี:
+1. หลายสินค้า (เช่น "น้ำแข็ง 2 ถุง กับเบียร์ 5 กระป๋อง")
+2. คำว่า "กับ", "และ", "แล้วก็", "อีก", "เพิ่ม"
+
+ตอบเป็น JSON:
+{
+  "isMultiItem": true/false,
+  "itemCount": จำนวนสินค้า,
+  "splitSuggestion": ["รายการ 1", "รายการ 2", ...]
+}`;
+
+    // Check if multi-item order
+    const detectionSchema = {
+      type: 'object',
+      properties: {
+        isMultiItem: { type: 'boolean' },
+        itemCount: { type: 'integer' },
+        splitSuggestion: { type: 'array', items: { type: 'string' } }
+      },
+      required: ['isMultiItem', 'itemCount']
+    };
+
+    let detection;
+    try {
+      detection = await generateWithGemini(detectionPrompt, detectionSchema, 0.1);
+    } catch (detectionError) {
+      Logger.warn('⚠️ Multi-item detection failed, assuming single item');
+      detection = { isMultiItem: false, itemCount: 1 };
+    }
+
+    Logger.info(`🔎 Detection: Multi-item=${detection.isMultiItem}, Count=${detection.itemCount}`);
+
+    // Handle multi-item order
+    if (detection.isMultiItem && detection.itemCount > 1) {
+      return await parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer);
+    }
+
+    // Single item parsing
     const schema = {
       type: 'object',
       properties: {
@@ -103,258 +156,170 @@ async function parseOrderWithGemini(userInput, stockCache) {
           type: 'string', 
           enum: ['order', 'add_stock', 'unclear']
         },
-        customer: { 
+        matched_stock_index: { type: 'integer' },
+        quantity: { type: 'integer' },
+        customer: { type: 'string' },
+        deliveryPerson: { type: 'string' },
+        paymentStatus: { 
           type: 'string',
-          description: 'ชื่อลูกค้าที่ชัดเจนที่สุด หรือ "ไม่ระบุ" ถ้าไม่มีในระบบ'
+          enum: ['cash', 'credit', 'unpaid']
         },
-        customer_confidence: {
-          type: 'string',
-          enum: ['high', 'medium', 'low'],
-          description: 'ความมั่นใจในการจับคู่ลูกค้า'
+        confidence: { 
+          type: 'string', 
+          enum: ['high', 'medium', 'low']
         },
-        delivery_person: {
-          type: 'string',
-          description: 'ชื่อผู้ส่ง (ถ้ามีคำว่า "ส่งโดย", "ให้...ส่ง") หรือ ""'
-        },
-        items: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              matched_stock_index: { type: 'integer' },
-              quantity: { type: 'integer' },
-              confidence: {
-                type: 'string',
-                enum: ['high', 'medium', 'low']
-              },
-              reasoning: { type: 'string' }
-            },
-            required: ['matched_stock_index', 'quantity', 'confidence', 'reasoning']
-          }
-        },
-        payment_status: {
-          type: 'string',
-          enum: ['cash', 'credit']
-        }
+        reasoning: { type: 'string' }
       },
-      required: ['action', 'customer', 'customer_confidence', 'delivery_person', 'items', 'payment_status']
+      required: ['action', 'matched_stock_index', 'quantity', 'customer', 'confidence', 'reasoning']
     };
 
-    // Step 6: Ultra-precise prompt with better customer handling
-    const prompt = `คุณคือ AI ผู้เชี่ยวชาญระบบคำสั่งซื้อร้านน้ำแข็ง ที่มีความแม่นยำสูงสุด
+    const prompt = `คุณคือ AI ผู้เชี่ยวชาญระบบคำสั่งซื้อร้านน้ำแข็ง
 
-📋 รายการสินค้าทั้งหมด (index: 0-${relevantStock.length - 1}):
-${stockCatalog}
-
-👥 รายชื่อลูกค้าในระบบทั้งหมด:
-${customerList}
-${detectedCustomer ? `\n✅ ระบบตรวจพบว่าน่าจะเป็น: "${detectedCustomer}" (ความมั่นใจสูง ${(highestCustomerScore * 100).toFixed(0)}%)` : '\n⚠️ ระบบไม่พบลูกค้าที่ตรงกัน - ใช้ชื่อจากข้อความโดยตรง'}
+📋 รายการสินค้า (index: 0-${relevantStock.length - 1}):
+${stockCatalog}${customerContext}
 
 🎯 คำสั่งจากลูกค้า: "${userInput}"
 
-⚠️ กฎการวิเคราะห์ที่เข้มงวด:
-
-1. **ชื่อลูกค้า (CRITICAL - อ่านให้ดี!):**
-   
-   วิธีหาชื่อลูกค้า:
-   a) ถ้าระบบตรวจพบลูกค้าที่มั่นใจสูง (>60%) → ใช้ชื่อนั้น
-   b) ถ้าไม่มีการตรวจพบ หรือความมั่นใจต่ำ:
-      - หาชื่อที่มีคำนำหน้า: "พี่", "น้อง", "คุณ", "ลุง", "ป้า", "เจ้า"
-      - ตัวอย่าง: "พี่กาแฟ" → customer: "พี่กาแฟ", confidence: "high"
-      - ตัวอย่าง: "เจ้นุ้ย" → customer: "เจ้นุ้ย", confidence: "medium"
-      - ตัวอย่าง: "น้องแดง" → customer: "น้องแดง", confidence: "high"
-   c) ถ้าไม่มีชื่อเลย → customer: "ไม่ระบุ", confidence: "low"
-   
-   ⚠️ **ห้ามแก้ไขชื่อ หรือ เดาชื่อ!**
-   - "เจ้นุ้ย" ≠ "ป้าผัดไทย" (ไม่คล้ายกันเลย!)
-   - "พี่หมู" ≠ "พี่มด" (ต่างคนกัน!)
-   - ใช้ชื่อตามที่ได้ยิน ไม่ใช่เดา
-
-2. **ผู้ส่ง (delivery_person):**
-   - หาคำว่า: "ส่งโดย X", "ให้ X ส่ง", "โดย X", "ฝาก X ส่ง"
-   - ตัวอย่าง: 
-     - "ส่งโดยพี่หมู" → "พี่หมู"
-     - "ให้น้องแดงส่ง" → "น้องแดง"
-   - ไม่มี → ""
-
-3. **การจับคู่สินค้า (ULTRA PRECISE):**
-   - ต้องตรงทุกคำ ไม่เดา
-   - "น้ำแข็งหลอดใหญ่" ≠ "น้ำแข็งหลอดเล็ก" (ห้ามสลับ!)
-   - "น้ำแข็งบดหยาบ" ≠ "น้ำแข็งบดละเอียด" (ห้ามสลับ!)
-   - ถ้าไม่ชัดเจน → confidence: "low" + อธิบายเหตุผล
-
-4. **จำนวน:**
-   - ตัวเลข + หน่วยนับ = จำนวน
-   - "2 ถุง" → 2
-   - "สามกระป๋อง" → 3
-   - ไม่ระบุ → 1
-
-5. **Payment Status:**
-   - มีคำว่า "เครดิต" → "credit"
-   - ไม่มี → "cash"
-
-ตัวอย่างที่ถูกต้อง:
-
-Input: "เจ้นุ้ย บดหยาบ 3 ถุง"
-(ระบบไม่พบลูกค้า "เจ้นุ้ย" ในฐานข้อมูล)
-Output: {
-  customer: "เจ้นุ้ย",
-  customer_confidence: "medium",
-  items: [{
-    matched_stock_index: (index ของ "น้ำแข็งบดหยาบ"),
-    quantity: 3,
-    confidence: "high",
-    reasoning: "จับคู่กับ น้ำแข็งบดหยาบ ชัดเจน"
-  }]
-}
-
-Input: "พี่กาแฟ น้ำแข็ง 2"
-(มี "พี่กาแฟ" ในระบบ)
-Output: {
-  customer: "พี่กาแฟ",
-  customer_confidence: "high",
-  items: [{
-    matched_stock_index: (เลือกน้ำแข็งที่เป็นไปได้),
-    quantity: 2,
-    confidence: "low",
-    reasoning: "ไม่ระบุประเภทน้ำแข็งชัดเจน"
-  }]
-}
-
-⚠️ สำคัญ:
-- matched_stock_index ต้องอยู่ในช่วง 0-${relevantStock.length - 1}
-- ใช้ชื่อลูกค้าตามที่ได้ยิน ไม่ใช่เดาจากฐานข้อมูล
-- customer_confidence = "high" ถ้ามีในระบบ หรือมีคำนำหน้าชัดเจน
-- customer_confidence = "medium" ถ้าเป็นชื่อเฉยๆ ไม่มีในระบบ
-- customer_confidence = "low" ถ้าไม่มีชื่อเลย
+⚠️ กฎสำคัญ:
+1. จำนวน vs ราคา: "น้ำแข็ง 45" = ราคา 45฿, "น้ำแข็ง 2 ถุง" = จำนวน 2
+2. ชื่อลูกค้า: หาคำนำหน้า พี่/น้อง/คุณ
+3. matched_stock_index ต้องอยู่ใน 0-${relevantStock.length - 1}
+4. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
+5. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
 
 ตอบเป็น JSON`;
 
-    // Step 7: Call Gemini with very low temperature
-    const result = await generateWithGemini(prompt, schema, 0.01);
+    const result = await generateWithGemini(prompt, schema, 0.1);
 
-    // Step 8: Validate
-    if (!result.items || result.items.length === 0) {
-      Logger.error('No items returned');
-      return fallbackParserWithRAG(userInput, stockCache);
+    // Validate index
+    const localIndex = result.matched_stock_index;
+    if (localIndex < 0 || localIndex >= relevantStock.length) {
+      Logger.error(`❌ Invalid index: ${localIndex}`);
+      throw new Error('INVALID_INDEX');
     }
 
-    const validatedItems = [];
-    let hasError = false;
+    const matchedItem = relevantStock[localIndex];
+    const finalCustomer = detectedCustomer || result.customer || 'ไม่ระบุ';
 
-    for (const item of result.items) {
-      const localIndex = item.matched_stock_index;
-      
-      if (localIndex < 0 || localIndex >= relevantStock.length) {
-        Logger.error(`Invalid index: ${localIndex}`);
-        hasError = true;
-        break;
-      }
-
-      const matchedItem = relevantStock[localIndex];
-      if (!matchedItem) {
-        hasError = true;
-        break;
-      }
-
-      validatedItems.push({
-        stockItem: matchedItem,
-        quantity: item.quantity || 1,
-        confidence: item.confidence || 'medium',
-        reasoning: item.reasoning || ''
-      });
-
-      Logger.success(`✓ ${matchedItem.item} x${item.quantity} (${item.confidence})`);
-    }
-
-    if (hasError) {
-      return fallbackParserWithRAG(userInput, stockCache);
-    }
-
-    // Step 9: Final customer decision with override logic
-    let finalCustomer = result.customer || 'ไม่ระบุ';
-    let customerWarning = null;
-    
-    // Override if detected customer is high confidence and Gemini returned different
-    if (detectedCustomer && highestCustomerScore > 0.70) {
-      if (finalCustomer !== detectedCustomer && finalCustomer !== 'ไม่ระบุ') {
-        Logger.warn(`Gemini suggested "${finalCustomer}" but RAG detected "${detectedCustomer}" with ${(highestCustomerScore * 100).toFixed(1)}% - using RAG`);
-        finalCustomer = detectedCustomer;
-        customerWarning = `ℹ️ ระบบจับคู่ลูกค้าเป็น "${detectedCustomer}" โดยอัตโนมัติ`;
-      }
-    }
-    
-    // Add warning for low confidence customer matches
-    if (result.customer_confidence === 'low' || result.customer_confidence === 'medium') {
-      if (finalCustomer !== 'ไม่ระบุ') {
-        customerWarning = `⚠️ ไม่แน่ใจชื่อลูกค้า: "${finalCustomer}" - ตรวจสอบด้วย`;
-      }
-    }
-
-    const deliveryPerson = result.delivery_person || '';
-
-    Logger.success(`✓ Customer="${finalCustomer}" (${result.customer_confidence}), Delivery="${deliveryPerson}", Items=${validatedItems.length}`);
-
-    let warning = customerWarning;
-    const lowConfItems = validatedItems.filter(i => i.confidence === 'low');
-    if (lowConfItems.length > 0) {
-      const itemWarning = `⚠️ ระบบไม่แน่ใจในสินค้า ${lowConfItems.length} รายการ:\n` +
-                lowConfItems.map(i => `• ${i.stockItem.item}: ${i.reasoning}`).join('\n');
-      warning = warning ? `${warning}\n\n${itemWarning}` : itemWarning;
-    }
+    Logger.success(`✅ Parsed: ${finalCustomer} | ${matchedItem.item} x${result.quantity}`);
 
     return {
       success: true,
       action: result.action || 'order',
+      stockItem: matchedItem,
+      matchedName: matchedItem.item,
+      quantity: result.quantity || 1,
       customer: finalCustomer,
-      deliveryPerson: deliveryPerson,
-      paymentStatus: result.payment_status || 'cash',
-      items: validatedItems,
-      warning: warning,
-      usedRAG: true
+      deliveryPerson: result.deliveryPerson || '',
+      paymentStatus: result.paymentStatus || 'unpaid',
+      confidence: result.confidence || 'medium',
+      reasoning: result.reasoning || '',
+      warning: result.confidence === 'low' ? '⚠️ ระบบไม่แน่ใจ กรุณาตรวจสอบ' : null,
+      usedAI: true
     };
 
   } catch (error) {
-    Logger.error('Gemini parsing error', error);
-    return fallbackParserWithRAG(userInput, stockCache);
+    Logger.error('❌ Gemini parsing error', error);
+    
+    // Re-throw with code for upstream handling
+    if (error.code === 'SERVICE_UNAVAILABLE' || 
+        error.code === 'QUOTA_EXCEEDED' ||
+        error.code === 'TIMEOUT') {
+      throw error;
+    }
+    
+    // For other errors, use fallback
+    throw new Error('GEMINI_PARSE_FAILED');
   }
 }
+
 // ============================================================================
-// FALLBACK PARSER
+// MULTI-ITEM ORDER PARSER
+// ============================================================================
+
+async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer) {
+  Logger.info(`🔄 Parsing ${detection.itemCount} items...`);
+  
+  const items = [];
+  let deliveryPerson = '';
+  let paymentStatus = 'unpaid';
+  
+  // Extract global info
+  if (userInput.toLowerCase().includes('เครดิต')) paymentStatus = 'credit';
+  if (userInput.toLowerCase().includes('จ่ายแล้ว')) paymentStatus = 'cash';
+  
+  const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
+  if (deliveryMatch) deliveryPerson = deliveryMatch[1];
+  
+  // Parse each item
+  for (const itemText of detection.splitSuggestion || []) {
+    try {
+      const itemResult = await parseOrder(itemText);
+      if (itemResult.success && itemResult.stockItem) {
+        items.push({
+          stockItem: itemResult.stockItem,
+          quantity: itemResult.quantity
+        });
+      }
+    } catch (itemError) {
+      Logger.warn(`⚠️ Failed to parse item: ${itemText}`);
+    }
+  }
+  
+  if (items.length === 0) {
+    throw new Error('MULTI_ITEM_PARSE_FAILED');
+  }
+  
+  Logger.success(`✅ Parsed ${items.length} items successfully`);
+  
+  return {
+    success: true,
+    action: 'order',
+    items: items,
+    customer: detectedCustomer || 'ไม่ระบุ',
+    deliveryPerson: deliveryPerson,
+    paymentStatus: paymentStatus,
+    confidence: 'medium',
+    reasoning: `Multi-item order detected (${items.length} items)`,
+    usedAI: true,
+    isMultiItem: true
+  };
+}
+
+// ============================================================================
+// FALLBACK PARSER WITH RAG
 // ============================================================================
 
 function fallbackParserWithRAG(text, stockCache) {
   PerformanceMonitor.start('fallbackParserWithRAG');
-  Logger.info('Using fallback parser', text);
+  Logger.info('📊 Using RAG fallback parser');
   
-  const customerResults = customerVectorStore.search(text, 1);
+  // Extract customer
   let customer = 'ไม่ระบุ';
-  
+  const customerResults = customerVectorStore.search(text, 1);
   if (customerResults.length > 0 && customerResults[0].similarity > 0.5) {
     customer = customerResults[0].metadata.name;
   }
   
-  let deliveryPerson = '';
-  const deliveryMatch = text.match(/(?:ส่งโดย|โดย|ให้|ฝาก)(.+?)(?:ส่ง|นำ|เอา|$)/i);
-  if (deliveryMatch) {
-    deliveryPerson = deliveryMatch[1].trim().replace(/พี่|น้อง|คุณ|ลุง|ป้า/gi, '').trim();
-  }
+  // Extract quantity
+  const { quantity, matched: quantityStr } = extractQuantity(text);
   
-  const { quantity } = extractQuantity(text);
-  
+  // Clean text
   const searchText = text
     .toLowerCase()
     .replace(new RegExp(customer, 'gi'), '')
-    .replace(/สั่ง|ซื้อ|เอา|ขอ|ส่ง|โดย|ให้|พี่|น้อง|คุณ|ลุง|ป้า|เครดิต|\d+/gi, '')
+    .replace(quantityStr, '')
+    .replace(/สั่ง|ซื้อ|เอา|ขอ|ส่ง|โดย|ให้|พี่|น้อง|คุณ/gi, '')
     .trim();
   
+  // Search products
   const ragResults = stockVectorStore.search(searchText, 5);
   
   if (ragResults.length === 0) {
     PerformanceMonitor.end('fallbackParserWithRAG');
     return {
       success: false,
-      error: '❌ ไม่พบสินค้า กรุณาพิมพ์ชื่อสินค้าให้ชัดเจน'
+      error: '❌ ไม่พบสินค้า กรุณาระบุชื่อสินค้าที่ชัดเจน'
     };
   }
 
@@ -362,26 +327,29 @@ function fallbackParserWithRAG(text, stockCache) {
   const bestItem = stockCache[bestMatch.metadata.index];
   const bestScore = bestMatch.similarity * 100;
 
+  Logger.info(`📦 Best match: ${bestItem.item} (${bestScore.toFixed(1)}%)`);
+
   PerformanceMonitor.end('fallbackParserWithRAG');
 
   return {
     success: true,
     action: 'order',
-    customer: customer,
-    deliveryPerson: deliveryPerson,
-    paymentStatus: text.toLowerCase().includes('เครดิต') ? 'credit' : 'cash',
-    items: [
-      {
-        stockItem: bestItem,
-        quantity: quantity,
-        confidence: bestScore > 70 ? 'high' : bestScore > 50 ? 'medium' : 'low',
-        reasoning: `Fallback (${bestScore.toFixed(1)}%)`
-      }
-    ],
-    warning: bestScore < 60 ? `⚠️ ระบบไม่แน่ใจ (${bestScore.toFixed(1)}%)` : null,
-    usedRAG: true
+    stockItem: bestItem,
+    matchedName: bestItem.item,
+    quantity,
+    customer,
+    deliveryPerson: '',
+    paymentStatus: 'unpaid',
+    confidence: bestScore > 70 ? 'high' : bestScore > 50 ? 'medium' : 'low',
+    reasoning: `RAG fallback (${bestScore.toFixed(1)}%)`,
+    warning: bestScore < 60 ? '⚠️ ระบบไม่แน่ใจ กรุณาตรวจสอบ' : null,
+    usedAI: false
   };
 }
+
+// ============================================================================
+// HELPER: EXTRACT QUANTITY
+// ============================================================================
 
 function extractQuantity(text) {
   const thaiNumbers = {
@@ -389,13 +357,15 @@ function extractQuantity(text) {
     'ห้า': 5, 'หก': 6, 'เจ็ด': 7, 'แปด': 8, 'เก้า': 9, 'สิบ': 10
   };
   
-  const digitMatch = text.match(/(\d+)\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง|กระป๋อง|ซอง)/i);
+  // Try digit with unit
+  const digitMatch = text.match(/(\d+)\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง|กระป๋อง)/i);
   if (digitMatch) {
     return { quantity: parseInt(digitMatch[1]), matched: digitMatch[0] };
   }
   
+  // Try Thai numbers
   for (const [thai, num] of Object.entries(thaiNumbers)) {
-    const pattern = new RegExp(`(${thai})\\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง)`, 'i');
+    const pattern = new RegExp(`(${thai})\\s*(?:ถุง|กระสอบ|แพ็ค|ขวด)`, 'i');
     const match = text.match(pattern);
     if (match) {
       return { quantity: num, matched: match[0] };
@@ -405,4 +375,10 @@ function extractQuantity(text) {
   return { quantity: 1, matched: '' };
 }
 
-module.exports = { parseOrder };
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+module.exports = {
+  parseOrder
+};
