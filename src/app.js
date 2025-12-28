@@ -63,7 +63,10 @@ async function initializeApp() {
     
     Logger.info('Loading customer cache...');
     await loadCustomerCache(true);
-    
+    const { scheduleCleanup } = require('./cleanupService');
+    scheduleCleanup();
+
+    Logger.success('✅ System initialized - Ready to process orders! 🎯');
     // Log admin configuration
     const admins = configManager.get('ADMIN_USER_IDS', []);
     if (admins.length > 0) {
@@ -203,6 +206,7 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
 
 
 
+
 async function handleTextMessage(text, userId) {
   
   if (!userId) {
@@ -214,9 +218,26 @@ async function handleTextMessage(text, userId) {
   const isAdmin = AccessControl.isAdmin(userId);
 
   // ============================================================================
-  // 1. USER INFO & SYSTEM COMMANDS
+  // AI COMMAND DETECTION - Let AI figure out what user wants
   // ============================================================================
-  
+
+  const hasNumber = /\d+/.test(text);
+  const possibleCommand = (
+    text.includes('จ่าย') || text.includes('จ้าย') || text.includes('ชำระ') ||
+    text.includes('ส่ง') || text.includes('ส้ง') ||
+    text.includes('เครดิต') || text.includes('เคริดิต') ||
+    text.includes('ยังไม่จ่าย')
+  );
+
+  if (possibleCommand) {
+    const commandResult = await detectAndExecuteCommand(text, userId, isAdmin);
+    if (commandResult) return commandResult;
+  }
+
+  // ============================================================================
+  // SYSTEM COMMANDS
+  // ============================================================================
+
   if (lower === 'ข้อมูลของฉัน' || lower === 'whoami' || lower === 'myinfo') {
     return AccessControl.getUserInfoText(userId);
   }
@@ -229,7 +250,8 @@ async function handleTextMessage(text, userId) {
     await loadCustomerCache(true);
     return '✅ รีเฟรชข้อมูลเรียบร้อย\n\n📊 สถานะระบบพร้อมใช้งาน';
   }
-  if (lower.includes('ค้างชำระ') || lower.includes('ยังไม่จ่าย') || lower === 'pending') {
+
+  if (lower.includes('ค้างชำระ') || lower === 'pending') {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_PAYMENT_HISTORY)) {
       AccessControl.logAccess(userId, PERMISSIONS.VIEW_PAYMENT_HISTORY, false);
       return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_PAYMENT_HISTORY);
@@ -254,11 +276,10 @@ async function handleTextMessage(text, userId) {
     
     message += `${'='.repeat(30)}\n`;
     message += `💵 รวมค้างชำระ: ${pending.totalAmount.toLocaleString()}฿\n\n`;
-    message += `💡 พิมพ์ "จ่ายแล้ว [เลขคำสั่ง]" เพื่ออัปเดต`;
+    message += `💡 พิมพ์ "จ่ายแล้ว" เพื่ออัปเดตล่าสุด`;
     
     return message;
   }
-  
 
   if (lower.includes('คำสั่งซื้อ') || lower.includes('orders')) {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.VIEW_ORDERS)) {
@@ -291,116 +312,36 @@ async function handleTextMessage(text, userId) {
       return AccessControl.getAccessDeniedMessage(PERMISSIONS.VIEW_DASHBOARD);
     }
     return await generateDashboard();
-  } 
-  if (lower.includes('จ่ายแล้ว') && /\d+/.test(text)) {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
-      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
-      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
-    }
-    
-    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
-    const orderNo = text.match(/\d+/)[0];
-    const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
-    
-    if (!result.success) {
-      return result.error;
-    }
-    
-    return `✅ อัปเดตการชำระเงินสำเร็จ!\n\n` +
-      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
-      `👤 ลูกค้า: ${result.customer}\n` +
-      `📦 สินค้า: ${result.item}\n` +
-      `💰 ยอดเงิน: ${result.total}฿\n` +
-      `🔄 ${result.oldStatus} → ${result.newStatus}`;
-  }
-  
-  // Mark as credit: "เครดิต 123"
-  if (lower.includes('เครดิต') && /\d+/.test(text) && !lower.includes('สั่ง')) {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
-      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
-      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
-    }
-    
-    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
-    const orderNo = text.match(/\d+/)[0];
-    const result = await updateOrderPaymentStatus(orderNo, 'เครดิต');
-    
-    if (!result.success) {
-      return result.error;
-    }
-    
-    return `📖 เปลี่ยนเป็นเครดิตแล้ว!\n\n` +
-      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
-      `👤 ลูกค้า: ${result.customer}\n` +
-      `💰 ยอดเงิน: ${result.total}฿\n` +
-      `🔄 ${result.oldStatus} → เครดิต`;
-  }
-  
-  // Mark as unpaid: "ยังไม่จ่าย 123"
-  if (lower.includes('ยังไม่จ่าย') && /\d+/.test(text)) {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
-      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, false);
-      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
-    }
-    
-    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_PAYMENT, true);
-    const orderNo = text.match(/\d+/)[0];
-    const result = await updateOrderPaymentStatus(orderNo, 'ยังไม่จ่าย');
-    
-    if (!result.success) {
-      return result.error;
-    }
-    
-    return `⏳ เปลี่ยนสถานะแล้ว!\n\n` +
-      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
-      `👤 ลูกค้า: ${result.customer}\n` +
-      `🔄 ${result.oldStatus} → ยังไม่จ่าย`;
-  } 
-  if ((lower.includes('ส่งแล้ว') || lower.includes('ส่งเสร็จ')) && /\d+/.test(text)) {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_DELIVERY)) {
-      AccessControl.logAccess(userId, PERMISSIONS.UPDATE_DELIVERY, false);
-      return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_DELIVERY);
-    }
-    
-    AccessControl.logAccess(userId, PERMISSIONS.UPDATE_DELIVERY, true);
-    const orderNo = text.match(/\d+/)[0];
-    const result = await updateOrderDeliveryStatus(orderNo, 'ส่งเสร็จแล้ว');
-    
-    if (!result.success) {
-      return result.error;
-    }
-    
-    return `🚚 อัปเดตการจัดส่งสำเร็จ!\n\n` +
-      `📋 คำสั่งซื้อ #${result.orderNo}\n` +
-      `👤 ลูกค้า: ${result.customer}\n` +
-      `📦 สินค้า: ${result.item}\n` +
-      `✅ สถานะ: ${result.newStatus}`;
   }
 
   if (lower === 'help' || lower === 'ช่วยเหลือ' || lower === '?') {
     return getHelpMessage(isAdmin);
   }
 
+  // Manual cleanup command (admin only)
+  if ((lower === 'cleanup' || lower.includes('ลบข้อมูล')) && isAdmin) {
+    const { manualCleanup } = require('./cleanupService');
+    const result = await manualCleanup();
+    return result;
+  }
+
   // ============================================================================
-  // 2. ORDER PROCESSING
+  // ORDER PROCESSING
   // ============================================================================
   
-   if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
+  if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
     return AccessControl.getAccessDeniedMessage(PERMISSIONS.PLACE_ORDER);
   }
 
   try {
-    // Load cache to ensure RAG has data
     await loadStockCache();
     
-    // Parse order using REVOLUTIONARY multi-item parser
     const parsed = await parseOrder(text);
 
     if (!parsed.success) {
       return parsed.error + (parsed.warning ? '\n\n' + parsed.warning : '');
     }
 
-    // Handle add stock action (single item)
     if (parsed.action === 'add_stock') {
       if (!AccessControl.canPerformAction(userId, PERMISSIONS.ADD_STOCK)) {
         return AccessControl.getAccessDeniedMessage(PERMISSIONS.ADD_STOCK);
@@ -421,19 +362,15 @@ async function handleTextMessage(text, userId) {
              `📊 สต็อกใหม่: ${newStock} ${parsed.stockItem.unit}`;
     }
 
-    // ============================================================================
-    // PROCESS MULTI-ITEM ORDER
-    // ============================================================================
-    
     Logger.info(`Processing ${parsed.items.length} items for ${parsed.customer}`);
     
-    const isCredit = parsed.paymentStatus === 'credit';
+    // CRITICAL: Default payment status is CREDIT unless explicitly marked as paid
+    const isCredit = true; // ALL orders are credit by default
     const orderResults = [];
     let totalAmount = 0;
     let hasStockError = false;
     let stockErrors = [];
 
-    // Step 1: Validate ALL items have sufficient stock
     for (const { stockItem, quantity } of parsed.items) {
       if (quantity > stockItem.stock) {
         hasStockError = true;
@@ -450,7 +387,6 @@ async function handleTextMessage(text, userId) {
       }
     }
 
-    // If any stock error, report ALL problems
     if (hasStockError) {
       let errorMsg = `⚠️ สต็อกไม่เพียงพอ!\n\n`;
       stockErrors.forEach(err => {
@@ -466,7 +402,6 @@ async function handleTextMessage(text, userId) {
       return errorMsg;
     }
 
-    // Step 2: Create orders for ALL items
     for (const { stockItem, quantity } of parsed.items) {
       const itemTotal = quantity * stockItem.price;
       totalAmount += itemTotal;
@@ -480,7 +415,6 @@ async function handleTextMessage(text, userId) {
         totalAmount: itemTotal
       });
 
-      // Update stock immediately after order creation
       const newStock = stockItem.stock - quantity;
       const stockUpdated = await updateStock(stockItem.item, stockItem.unit, newStock);
       
@@ -501,10 +435,8 @@ async function handleTextMessage(text, userId) {
       Logger.success(`Order created: #${result.orderNo} - ${stockItem.item} x${quantity}`);
     }
 
-    // Step 3: Reload cache after all stock updates
     await loadStockCache(true);
 
-    // Step 4: Build comprehensive response
     let response = isAdmin 
       ? `✅ บันทึกคำสั่งซื้อสำเร็จ! (${parsed.items.length} รายการ)\n`
       : `✅ รับคำสั่งซื้อเรียบร้อยค่ะ!\n`;
@@ -518,7 +450,6 @@ async function handleTextMessage(text, userId) {
     
     response += `\n📦 รายการสินค้า:\n\n`;
 
-    // List all items
     orderResults.forEach((order, idx) => {
       response += `${idx + 1}. ${order.item}\n`;
       response += `   📋 คำสั่งซื้อ: #${order.orderNo}\n`;
@@ -536,17 +467,11 @@ async function handleTextMessage(text, userId) {
     });
 
     response += `${'='.repeat(30)}\n`;
-    response += `💵 ยอดรวมทั้งหมด: ${totalAmount.toLocaleString()}฿\n`;
+    response += `💵 ยอดรวมทั้งหมด: ${totalAmount.toLocaleString()}฿\n\n`;
 
-    // Show payment status clearly
-    if (isCredit) {
-      response += `📖 สถานะ: เครดิต (ค้างชำระ)\n`;
-    } else {
-      response += `⏳ สถานะ: ยังไม่จ่าย\n`;
-      if (isAdmin) {
-        const firstOrderNo = orderResults[0].orderNo;
-        response += `💡 พิมพ์ "จ่ายแล้ว ${firstOrderNo}" เมื่อได้รับเงิน\n`;
-      }
+    response += `📖 การชำระเงิน: เครดิต (บันทึกเป็นหนี้)\n`;
+    if (isAdmin) {
+      response += `💡 พิมพ์ "จ่ายแล้ว" เมื่อลูกค้าชำระเงิน`;
     }
 
     if (!isAdmin) {
@@ -557,17 +482,15 @@ async function handleTextMessage(text, userId) {
       response += `\n\n${parsed.warning}`;
     }
 
-    // Step 5: Notify admin with ALL items
     await notifyAdminMultiItemOrder({
       customer: parsed.customer,
       items: orderResults,
       deliveryPerson: parsed.deliveryPerson,
       totalAmount: totalAmount,
-      isCredit: isCredit,
+      isCredit: true, // Always credit by default
       userId: isAdmin ? `${userId.substring(0, 12)}... (ADMIN)` : userId.substring(0, 12) + '...'
     });
 
-    // Step 6: Check for low stock alerts
     for (const order of orderResults) {
       if (order.newStock < CONFIG.LOW_STOCK_THRESHOLD) {
         await pushLowStockAlert(order.item, order.newStock, order.unit);
@@ -580,6 +503,177 @@ async function handleTextMessage(text, userId) {
     Logger.error('Order processing failed', error);
     await notifyAdmin(`❌ Order Error\nUser: ${userId}\nError: ${error.message}\nInput: ${text}`);
     return '❌ เกิดข้อผิดพลาดในการบันทึกคำสั่งซื้อ\nลองใหม่หรือติดต่อแอดมินค่ะ';
+  }
+}
+async function detectAndExecuteCommand(text, userId, isAdmin) {
+  try {
+    Logger.info('🤖 AI detecting command...');
+
+    // Get recent orders for context
+    const recentOrders = await getOrders({ date: getThaiDateString() });
+    const latestOrder = recentOrders.length > 0 ? recentOrders[recentOrders.length - 1] : null;
+
+    const schema = {
+      type: 'object',
+      properties: {
+        is_command: {
+          type: 'boolean',
+          description: 'true = คำสั่งระบบ, false = คำสั่งซื้อสินค้า'
+        },
+        command_type: {
+          type: 'string',
+          enum: ['payment_paid', 'payment_credit', 'payment_unpaid', 'delivery_done', 'none'],
+          description: 'ประเภทคำสั่ง'
+        },
+        order_number: {
+          type: 'integer',
+          description: 'เลขคำสั่งซื้อ (ถ้าไม่ระบุ = เลขล่าสุด)'
+        },
+        confidence: {
+          type: 'string',
+          enum: ['high', 'medium', 'low']
+        }
+      },
+      required: ['is_command', 'command_type', 'order_number', 'confidence']
+    };
+
+    const prompt = `คุณคือ AI ที่เข้าใจคำสั่งภาษาไทยแบบยืดหยุ่น
+
+🎯 ข้อความจากผู้ใช้: "${text}"
+
+📋 คำสั่งซื้อล่าสุด: ${latestOrder ? `#${latestOrder.orderNo} - ${latestOrder.customer} - ${latestOrder.item}` : 'ไม่มี'}
+
+งาน: ตรวจสอบว่าเป็นคำสั่งระบบหรือคำสั่งซื้อสินค้า
+
+คำสั่งระบบที่รู้จัก:
+
+1. **payment_paid** (อัปเดตว่าจ่ายแล้ว):
+   - "จ่ายแล้ว", "จ่ายเเล้ว", "จ้ายแล้ว", "ชำระแล้ว"
+   - "จ่าย", "จ้าย", "ชำระ" (ถ้าไม่มีบริบทสินค้า)
+   - ตัวอย่าง: "จ่ายแล้ว", "94 จ่ายแล้ว", "จ่าย 94"
+
+2. **payment_credit** (เปลี่ยนเป็นเครดิต):
+   - "เครดิต", "เคริดิต", "เครติด"
+   - ตัวอย่าง: "เครดิต", "94 เครดิต"
+
+3. **payment_unpaid** (เปลี่ยนเป็นยังไม่จ่าย):
+   - "ยังไม่จ่าย", "ยังไม่จ้าย", "ไม่จ่าย"
+   - ตัวอย่าง: "94 ยังไม่จ่าย"
+
+4. **delivery_done** (ส่งเสร็จแล้ว):
+   - "ส่งแล้ว", "ส่งเเล้ว", "ส้งแล้ว", "ส่งเสร็จ"
+   - ตัวอย่าง: "ส่งแล้ว", "94 ส่งแล้ว"
+
+5. **none** (ไม่ใช่คำสั่งระบบ):
+   - คำสั่งซื้อสินค้า เช่น "พี่กาแฟ สั่งน้ำแข็ง 2 ถุง"
+   - คำถาม หรือข้อความทั่วไป
+
+กฎ:
+- ถ้าไม่ระบุเลขคำสั่งซื้อ → ใช้เลขล่าสุด (${latestOrder ? latestOrder.orderNo : 0})
+- ถ้ามีตัวเลข → ใช้ตัวเลขนั้น
+- ถ้าข้อความมีชื่อสินค้าและจำนวน → is_command: false
+
+ตัวอย่าง:
+
+Input: "จ่ายแล้ว"
+Output: {
+  is_command: true,
+  command_type: "payment_paid",
+  order_number: ${latestOrder ? latestOrder.orderNo : 0},
+  confidence: "high"
+}
+
+Input: "94 จ่าย"
+Output: {
+  is_command: true,
+  command_type: "payment_paid",
+  order_number: 94,
+  confidence: "high"
+}
+
+Input: "ส่งเเล้ว"
+Output: {
+  is_command: true,
+  command_type: "delivery_done",
+  order_number: ${latestOrder ? latestOrder.orderNo : 0},
+  confidence: "high"
+}
+
+Input: "พี่กาแฟ สั่งน้ำแข็ง 2 ถุง"
+Output: {
+  is_command: false,
+  command_type: "none",
+  order_number: 0,
+  confidence: "high"
+}
+
+วิเคราะห์และตอบเป็น JSON`;
+
+    const result = await generateWithGemini(prompt, schema, 0.1);
+
+    Logger.info(`Command detection: ${result.command_type}, Order: ${result.order_number}, Confidence: ${result.confidence}`);
+
+    if (!result.is_command || result.command_type === 'none') {
+      return null; // Not a command, process as order
+    }
+
+    // Execute command
+    switch (result.command_type) {
+      case 'payment_paid':
+        if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+          return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+        }
+        const paidResult = await updateOrderPaymentStatus(result.order_number, 'จ่ายแล้ว');
+        if (!paidResult.success) return paidResult.error;
+        return `✅ อัปเดตการชำระเงินสำเร็จ!\n\n` +
+          `📋 คำสั่งซื้อ #${paidResult.orderNo}\n` +
+          `👤 ลูกค้า: ${paidResult.customer}\n` +
+          `📦 สินค้า: ${paidResult.item}\n` +
+          `💰 ยอดเงิน: ${paidResult.total}฿\n` +
+          `🔄 ${paidResult.oldStatus} → ${paidResult.newStatus}`;
+
+      case 'payment_credit':
+        if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+          return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+        }
+        const creditResult = await updateOrderPaymentStatus(result.order_number, 'เครดิต');
+        if (!creditResult.success) return creditResult.error;
+        return `📖 เปลี่ยนเป็นเครดิตแล้ว!\n\n` +
+          `📋 คำสั่งซื้อ #${creditResult.orderNo}\n` +
+          `👤 ลูกค้า: ${creditResult.customer}\n` +
+          `💰 ยอดเงิน: ${creditResult.total}฿\n` +
+          `🔄 ${creditResult.oldStatus} → เครดิต`;
+
+      case 'payment_unpaid':
+        if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
+          return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
+        }
+        const unpaidResult = await updateOrderPaymentStatus(result.order_number, 'ยังไม่จ่าย');
+        if (!unpaidResult.success) return unpaidResult.error;
+        return `⏳ เปลี่ยนสถานะแล้ว!\n\n` +
+          `📋 คำสั่งซื้อ #${unpaidResult.orderNo}\n` +
+          `👤 ลูกค้า: ${unpaidResult.customer}\n` +
+          `🔄 ${unpaidResult.oldStatus} → ยังไม่จ่าย`;
+
+      case 'delivery_done':
+        if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_DELIVERY)) {
+          return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_DELIVERY);
+        }
+        const deliveryResult = await updateOrderDeliveryStatus(result.order_number, 'ส่งเสร็จแล้ว');
+        if (!deliveryResult.success) return deliveryResult.error;
+        return `🚚 อัปเดตการจัดส่งสำเร็จ!\n\n` +
+          `📋 คำสั่งซื้อ #${deliveryResult.orderNo}\n` +
+          `👤 ลูกค้า: ${deliveryResult.customer}\n` +
+          `📦 สินค้า: ${deliveryResult.item}\n` +
+          `✅ สถานะ: ${deliveryResult.newStatus}`;
+
+      default:
+        return null;
+    }
+
+  } catch (error) {
+    Logger.error('AI command detection failed', error);
+    return null; // Fallback to order processing
   }
 }
 async function notifyAdminMultiItemOrder(data) {
