@@ -1,71 +1,90 @@
-// orderService.js - FIXED Payment Status Logic
+// orderService.js - FULLY FIXED to match app.js expectations
+
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString, getThaiDateString, convertThaiDateToGregorian } = require('./utils');
 const { getSheetData, appendSheetData, updateSheetData, batchUpdateSheet } = require('./googleServices');
 const { getStockCache } = require('./cacheManager');
+
 // ============================================================================
-// CREATE ORDER WITH SMART PAYMENT DETECTION
+// PAYMENT STATUS MAPPING
+// ============================================================================
+
+const PAYMENT_STATUS_MAP = {
+  'paid': 'จ่ายแล้ว',
+  'credit': 'เครดิต',
+  'unpaid': 'ยังไม่จ่าย'
+};
+
+// ============================================================================
+// CREATE SINGLE ORDER - FIXED SIGNATURE
 // ============================================================================
 
 async function createOrder(orderData) {
   try {
-    const { customer, items, deliveryPerson, isCredit } = orderData;
+    // Validate input
+    if (!orderData) {
+      throw new Error('orderData is required');
+    }
+
+    const { 
+      customer, 
+      item, 
+      quantity, 
+      deliveryPerson = '', 
+      isCredit = false,
+      paymentStatus,
+      totalAmount 
+    } = orderData;
+    
+    // Validate required fields
+    if (!customer || !item || !quantity || !totalAmount) {
+      Logger.error('Missing required fields', orderData);
+      throw new Error('Missing required order fields: customer, item, quantity, totalAmount');
+    }
+
+    Logger.info(`📝 Creating order: ${customer} - ${item} x${quantity}`);
     
     // Get next order number
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:A');
     const nextOrderNo = rows.length || 1;
 
-    // Calculate total
-    const totalAmount = items.reduce((sum, item) => 
-      sum + (item.quantity * item.stockItem.price), 0
-    );
-    
-    // Payment status
-    const paymentStatus = isCredit ? 'เครดิต' : 'ยังไม่จ่าย';
-    const timestamp = getThaiDateTimeString();
+    // Determine payment status
+    let thaiPaymentStatus;
+    if (paymentStatus) {
+      thaiPaymentStatus = PAYMENT_STATUS_MAP[paymentStatus] || 'ยังไม่จ่าย';
+    } else {
+      thaiPaymentStatus = isCredit ? 'เครดิต' : 'ยังไม่จ่าย';
+    }
 
-    // Create order header
+    Logger.info(`💰 Payment status: ${thaiPaymentStatus}`);
+
     const orderRow = [
-      nextOrderNo,                    // รหัสคำสั่ง
-      timestamp,                      // วันที่
-      customer,                       // ลูกค้า
-      deliveryPerson || '',           // ผู้ส่ง
-      'รอดำเนินการ',                  // สถานะการจัดส่ง
-      paymentStatus,                  // สถานะการชำระ
-      totalAmount,                    // ยอดรวม
-      ''                              // หมายเหตุ
+      nextOrderNo,
+      getThaiDateTimeString(),
+      customer,
+      item,
+      quantity,
+      '', // Note
+      deliveryPerson || '',
+      'รอดำเนินการ', // Delivery status
+      thaiPaymentStatus,
+      totalAmount
     ];
 
-    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H', [orderRow]);
+    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J', [orderRow]);
     
-    // Create line items
-    const lineItemRows = items.map(item => [
-      nextOrderNo,                              // รหัสคำสั่ง
-      item.stockItem.item,                      // สินค้า
-      item.quantity,                            // จำนวน
-      item.stockItem.unit,                      // หน่วย
-      item.stockItem.price,                     // ราคาต่อหน่วย
-      item.stockItem.cost || 0,                 // ต้นทุนต่อหน่วย
-      item.quantity * item.stockItem.price      // รวม
-    ]);
-
-    await appendSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G', lineItemRows);
-    
-    // If credit, add to เครดิต sheet
-    if (isCredit) {
-      await addCreditRecord(nextOrderNo, customer, totalAmount, timestamp);
-    }
-    
-    Logger.success(`Order #${nextOrderNo} created with ${items.length} items`);
+    Logger.success(`✅ Order #${nextOrderNo} created - ${thaiPaymentStatus}`);
     
     return {
       success: true,
       orderNo: nextOrderNo,
-      paymentStatus,
-      totalAmount,
-      itemCount: items.length,
-      items: items
+      paymentStatus: thaiPaymentStatus,
+      paymentStatusCode: paymentStatus || (isCredit ? 'credit' : 'unpaid'),
+      customer,
+      item,
+      quantity,
+      totalAmount
     };
   } catch (error) {
     Logger.error('createOrder failed', error);
@@ -73,102 +92,68 @@ async function createOrder(orderData) {
   }
 }
 
-
-async function addCreditRecord(orderNo, customer, amount, timestamp) {
-  try {
-    // Add 30 days for due date
-    const dueDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    const dueDateStr = dueDate.toLocaleDateString('th-TH');
-    
-    const creditRow = [
-      timestamp,          // วันที่
-      customer,           // ลูกค้า
-      orderNo,            // รหัสคำสั่ง
-      amount,             // ยอดเงิน
-      'ค้างชำระ',         // สถานะ
-      dueDateStr,         // วันครบกำหนด
-      ''                  // หมายเหตุ
-    ];
-    
-    await appendSheetData(CONFIG.SHEET_ID, 'เครดิต!A:G', [creditRow]);
-    Logger.success(`Credit record added for order #${orderNo}`);
-  } catch (error) {
-    Logger.error('Failed to add credit record', error);
-    // Don't throw - credit tracking is secondary
-  }
-}
-
 // ============================================================================
-// GET ORDERS
+// GET ORDERS WITH FILTERS
 // ============================================================================
 
 async function getOrders(filters = {}) {
   try {
-    const { customer, date, orderNo, paymentStatus, deliveryStatus } = filters;
+    const { customer, date, orderNo, paymentStatus } = filters;
     
-    // Get order headers
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
-    // Get line items
-    const lineItemRows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
-    
-    if (orderRows.length <= 1) {
+    if (rows.length <= 1) {
       return [];
     }
     
-    // Filter orders
-    const filteredOrders = orderRows.slice(1).filter(row => {
+    const stockCache = getStockCache();
+    
+    return rows.slice(1).filter(row => {
+      // Filter by order number
       if (orderNo && row[0] != orderNo) return false;
       
+      // Filter by date
       if (date) {
         const orderDateRaw = (row[1] || '').trim();
         let orderDate = orderDateRaw.split(' ')[0];
+        
         if (orderDateRaw.includes('/')) {
           const converted = convertThaiDateToGregorian(orderDateRaw);
           if (converted) orderDate = converted;
         }
+        
         if (orderDate !== date) return false;
       }
       
+      // Filter by customer
       if (customer) {
         const orderCustomer = (row[2] || '').trim().toLowerCase();
-        if (!orderCustomer.includes(customer.toLowerCase())) return false;
+        const searchCustomer = customer.toLowerCase();
+        if (!orderCustomer.includes(searchCustomer)) return false;
       }
       
-      if (paymentStatus && row[5] !== paymentStatus) return false;
-      if (deliveryStatus && row[4] !== deliveryStatus) return false;
+      // Filter by payment status
+      if (paymentStatus) {
+        const status = (row[8] || '').trim();
+        if (status !== paymentStatus) return false;
+      }
       
       return true;
-    });
-
-    // Build order objects with line items
-    return filteredOrders.map(row => {
-      const orderNumber = row[0];
-      
-      // Get line items for this order
-      const items = lineItemRows
-        .slice(1)
-        .filter(lineRow => lineRow[0] == orderNumber)
-        .map(lineRow => ({
-          item: lineRow[1] || '',
-          quantity: parseInt(lineRow[2] || 0),
-          unit: lineRow[3] || '',
-          price: parseFloat(lineRow[4] || 0),
-          cost: parseFloat(lineRow[5] || 0),
-          total: parseFloat(lineRow[6] || 0)
-        }));
-
+    }).map(row => {
+      const stockItem = stockCache.find(s => s.item === row[3]);
       return {
-        orderNo: orderNumber,
-        date: row[1] || '',
-        customer: row[2] || '',
-        deliveryPerson: row[3] || '',
-        deliveryStatus: row[4] || 'รอดำเนินการ',
-        paymentStatus: row[5] || 'ยังไม่จ่าย',
-        total: parseFloat(row[6] || 0),
-        note: row[7] || '',
-        items: items,
-        itemCount: items.length
+        orderNo: row[0],
+        date: row[1],
+        customer: row[2],
+        item: row[3],
+        qty: parseInt(row[4] || 0),
+        unit: stockItem?.unit || '',
+        note: row[5] || '',
+        delivery: row[6] || '',
+        deliveryStatus: row[7] || 'รอดำเนินการ',
+        paymentStatus: row[8] || 'ยังไม่จ่าย',
+        total: parseFloat(row[9] || 0),
+        cost: stockItem ? stockItem.cost * parseInt(row[4] || 0) : 0
       };
     });
   } catch (error) {
@@ -176,13 +161,14 @@ async function getOrders(filters = {}) {
     throw error;
   }
 }
+
 // ============================================================================
-// UPDATE PAYMENT STATUS (ADMIN ONLY)
+// UPDATE PAYMENT STATUS
 // ============================================================================
 
 async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
     let rowIndex = -1;
     for (let i = 1; i < rows.length; i++) {
@@ -193,39 +179,34 @@ async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล
     }
 
     if (rowIndex === -1) {
-      return { success: false, error: `ไม่พบคำสั่งซื้อ #${orderNo}` };
+      return {
+        success: false,
+        error: `ไม่พบคำสั่งซื้อ #${orderNo}`
+      };
     }
 
-    const currentStatus = rows[rowIndex - 1][5] || '';
+    const validStatuses = ['ยังไม่จ่าย', 'จ่ายแล้ว', 'เครดิต', 'ยกเลิก'];
+    if (!validStatuses.includes(newStatus)) {
+      return {
+        success: false,
+        error: `สถานะไม่ถูกต้อง: ${newStatus}`
+      };
+    }
+
+    const currentStatus = rows[rowIndex - 1][8] || '';
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${rowIndex}`, [[newStatus]]);
+
     const customer = rows[rowIndex - 1][2] || 'ลูกค้า';
-    const total = rows[rowIndex - 1][6] || '0';
-    
-    // Update payment status in คำสั่งซื้อ sheet (column F = index 5)
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!F${rowIndex}`, [[newStatus]]);
+    const item = rows[rowIndex - 1][3] || '';
+    const total = rows[rowIndex - 1][9] || '0';
 
-    // Update credit sheet if applicable
-    if (currentStatus === 'เครดิต' && newStatus === 'จ่ายแล้ว') {
-      await updateCreditStatus(orderNo, 'ชำระแล้ว');
-    } else if (newStatus === 'เครดิต' && currentStatus !== 'เครดิต') {
-      // Changed to credit - add credit record
-      await addCreditRecord(orderNo, customer, parseFloat(total), rows[rowIndex - 1][1]);
-    }
-
-    // Get line items for display
-    const lineItems = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
-    const items = lineItems
-      .slice(1)
-      .filter(row => row[0] == orderNo)
-      .map(row => `${row[1]} x${row[2]}`)
-      .join(', ');
-
-    Logger.success(`Payment updated: Order #${orderNo} - ${currentStatus} → ${newStatus}`);
+    Logger.success(`💰 Payment updated: Order #${orderNo} - ${currentStatus} → ${newStatus}`);
 
     return {
       success: true,
       orderNo,
       customer,
-      items,
+      item,
       total,
       oldStatus: currentStatus,
       newStatus
@@ -237,12 +218,100 @@ async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล
 }
 
 // ============================================================================
-// UPDATE DELIVERY STATUS (ADMIN ONLY)
+// UPDATE MULTIPLE PAYMENTS - BATCH
+// ============================================================================
+
+async function updateMultiplePaymentStatus(orderNos, newStatus = 'จ่ายแล้ว') {
+  if (!Array.isArray(orderNos) || orderNos.length === 0) {
+    return {
+      success: false,
+      error: 'กรุณาระบุหมายเลขคำสั่งซื้อ'
+    };
+  }
+
+  try {
+    Logger.info(`🔄 Updating payment for ${orderNos.length} orders...`);
+    
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
+    const batchUpdates = [];
+    const results = [];
+    
+    for (const orderNo of orderNos) {
+      let rowIndex = -1;
+      
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i][0] == orderNo) {
+          rowIndex = i + 1;
+          break;
+        }
+      }
+
+      if (rowIndex === -1) {
+        Logger.warn(`⚠️ Order #${orderNo} not found`);
+        results.push({
+          orderNo,
+          success: false,
+          error: 'ไม่พบคำสั่งซื้อ'
+        });
+        continue;
+      }
+
+      const currentStatus = rows[rowIndex - 1][8] || '';
+      const customer = rows[rowIndex - 1][2] || '';
+      const item = rows[rowIndex - 1][3] || '';
+      const total = parseFloat(rows[rowIndex - 1][9] || 0);
+
+      batchUpdates.push({
+        range: `คำสั่งซื้อ!I${rowIndex}`,
+        values: [[newStatus]]
+      });
+
+      results.push({
+        orderNo,
+        success: true,
+        customer,
+        item,
+        total,
+        oldStatus: currentStatus,
+        newStatus
+      });
+    }
+
+    // Execute batch update
+    if (batchUpdates.length > 0) {
+      await batchUpdateSheet(CONFIG.SHEET_ID, batchUpdates);
+      Logger.success(`✅ Updated ${batchUpdates.length} orders successfully`);
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.filter(r => !r.success).length;
+    const totalAmount = results
+      .filter(r => r.success)
+      .reduce((sum, r) => sum + r.total, 0);
+
+    return {
+      success: successCount > 0,
+      results,
+      summary: {
+        total: orderNos.length,
+        success: successCount,
+        failed: failCount,
+        totalAmount
+      }
+    };
+  } catch (error) {
+    Logger.error('updateMultiplePaymentStatus failed', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// UPDATE DELIVERY STATUS
 // ============================================================================
 
 async function updateOrderDeliveryStatus(orderNo, newStatus = 'ส่งเสร็จแล้ว') {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     
     let rowIndex = -1;
     for (let i = 1; i < rows.length; i++) {
@@ -253,36 +322,34 @@ async function updateOrderDeliveryStatus(orderNo, newStatus = 'ส่งเส�
     }
 
     if (rowIndex === -1) {
-      return { success: false, error: `ไม่พบคำสั่งซื้อ #${orderNo}` };
+      return {
+        success: false,
+        error: `ไม่พบคำสั่งซื้อ #${orderNo}`
+      };
     }
 
     const validStatuses = ['รอดำเนินการ', 'กำลังจัดส่ง', 'ส่งเสร็จแล้ว', 'ยกเลิก'];
     if (!validStatuses.includes(newStatus)) {
-      return { success: false, error: `สถานะไม่ถูกต้อง: ${newStatus}` };
+      return {
+        success: false,
+        error: `สถานะไม่ถูกต้อง: ${newStatus}`
+      };
     }
 
-    // Update delivery status (column E = index 4)
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${rowIndex}`, [[newStatus]]);
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!H${rowIndex}`, [[newStatus]]);
 
     const customer = rows[rowIndex - 1][2] || 'ลูกค้า';
-    const deliveryPerson = rows[rowIndex - 1][3] || '';
-    
-    // Get line items
-    const lineItems = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
-    const items = lineItems
-      .slice(1)
-      .filter(row => row[0] == orderNo)
-      .map(row => `${row[1]} x${row[2]}`)
-      .join(', ');
+    const item = rows[rowIndex - 1][3] || '';
+    const delivery = rows[rowIndex - 1][6] || '';
 
-    Logger.success(`Delivery updated: Order #${orderNo} → ${newStatus}`);
+    Logger.success(`🚚 Delivery updated: Order #${orderNo} → ${newStatus}`);
 
     return {
       success: true,
       orderNo,
       customer,
-      items,
-      deliveryPerson,
+      item,
+      delivery,
       newStatus
     };
   } catch (error) {
@@ -292,9 +359,8 @@ async function updateOrderDeliveryStatus(orderNo, newStatus = 'ส่งเส�
 }
 
 // ============================================================================
-// GET PENDING PAYMENTS (ADMIN ONLY)
+// GET PENDING PAYMENTS
 // ============================================================================
-
 
 async function getPendingPayments() {
   try {
@@ -316,30 +382,11 @@ async function getPendingPayments() {
     throw error;
   }
 }
+
 // ============================================================================
 // UPDATE STOCK
 // ============================================================================
-async function updateCreditStatus(orderNo, newStatus) {
-  try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'เครดิต!A:G');
-    
-    let rowIndex = -1;
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][2] == orderNo) {  // Column C = รหัสคำสั่ง
-        rowIndex = i + 1;
-        break;
-      }
-    }
-    
-    if (rowIndex !== -1) {
-      await updateSheetData(CONFIG.SHEET_ID, `เครดิต!E${rowIndex}`, [[newStatus]]);
-      Logger.success(`Credit status updated for order #${orderNo}`);
-    }
-  } catch (error) {
-    Logger.error('Failed to update credit status', error);
-    // Don't throw - continue even if credit update fails
-  }
-}
+
 async function updateStock(itemName, unit, newStock) {
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
@@ -352,11 +399,12 @@ async function updateStock(itemName, unit, newStock) {
 
       if (rowName === key && rowUnit === unit.toLowerCase()) {
         await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
-        Logger.success(`Stock updated: ${itemName} = ${newStock}`);
+        Logger.success(`📦 Stock updated: ${itemName} = ${newStock}`);
         return true;
       }
     }
     
+    Logger.warn(`⚠️ Stock item not found: ${itemName} (${unit})`);
     return false;
   } catch (error) {
     Logger.error('updateStock failed', error);
@@ -364,58 +412,110 @@ async function updateStock(itemName, unit, newStock) {
   }
 }
 
+// ============================================================================
+// DETECT PAYMENT INTENT FROM USER INPUT
+// ============================================================================
 
-async function cancelOrder(orderNo, reason = '') {
-  try {
-    const orders = await getOrders({ orderNo });
-    
-    if (orders.length === 0) {
-      return { success: false, error: `ไม่พบคำสั่งซื้อ #${orderNo}` };
-    }
-    
-    const order = orders[0];
-    
-    // Update order status
-    const deliveryResult = await updateOrderDeliveryStatus(orderNo, 'ยกเลิก');
-    
-    // Restore stock
-    for (const item of order.items) {
-      const stockCache = getStockCache();
-      const stockItem = stockCache.find(s => s.item === item.item);
-      
-      if (stockItem) {
-        const newStock = stockItem.stock + item.quantity;
-        await updateStock(item.item, item.unit, newStock);
-      }
-    }
-    
-    // Update credit if applicable
-    if (order.paymentStatus === 'เครดิต') {
-      await updateCreditStatus(orderNo, 'ยกเลิก');
-    }
-    
-    Logger.success(`Order #${orderNo} cancelled and stock restored`);
-    
-    return {
-      success: true,
-      orderNo,
-      customer: order.customer,
-      reason
-    };
-  } catch (error) {
-    Logger.error('cancelOrder failed', error);
-    throw error;
+function detectPaymentIntent(userInput) {
+  const lower = userInput.toLowerCase();
+  
+  // Check for explicit paid keywords
+  const paidKeywords = ['จ่ายแล้ว', 'จ่ายเงินแล้ว', 'เงินสด', 'จ่ายสด', 'ชำระแล้ว'];
+  if (paidKeywords.some(kw => lower.includes(kw))) {
+    Logger.info('💰 Detected: จ่ายแล้ว');
+    return 'paid';
   }
+  
+  // Check for credit keywords
+  const creditKeywords = ['เครดิต', 'เครดิด', 'เคริดิต', 'ค้าง'];
+  if (creditKeywords.some(kw => lower.includes(kw))) {
+    Logger.info('📖 Detected: เครดิต');
+    return 'credit';
+  }
+  
+  // Default: unpaid
+  Logger.info('⏳ Default: ยังไม่จ่าย');
+  return 'unpaid';
 }
+
+// ============================================================================
+// USER-FRIENDLY PAYMENT STATUS DISPLAY
+// ============================================================================
+
+function getPaymentStatusMessage(paymentStatus) {
+  const messages = {
+    'paid': {
+      icon: '✅',
+      text: 'จ่ายแล้ว',
+      description: 'ชำระเงินเรียบร้อย'
+    },
+    'credit': {
+      icon: '📖',
+      text: 'เครดิต',
+      description: 'ค้างชำระ (จ่ายทีหลัง)'
+    },
+    'unpaid': {
+      icon: '⏳',
+      text: 'ยังไม่จ่าย',
+      description: 'รอรับชำระเงิน'
+    }
+  };
+  
+  return messages[paymentStatus] || messages['unpaid'];
+}
+
+// ============================================================================
+// BULK PAYMENT UPDATE
+// ============================================================================
+
+async function bulkUpdatePaymentStatus(orderNos, newStatus) {
+  if (!Array.isArray(orderNos)) {
+    orderNos = [orderNos];
+  }
+  
+  Logger.info(`🔄 Bulk payment update: ${orderNos.length} orders → ${newStatus}`);
+  
+  const results = [];
+  for (const orderNo of orderNos) {
+    try {
+      const result = await updateOrderPaymentStatus(orderNo, newStatus);
+      results.push(result);
+    } catch (error) {
+      Logger.error(`Failed to update #${orderNo}`, error);
+      results.push({
+        success: false,
+        orderNo,
+        error: error.message
+      });
+    }
+  }
+  
+  const successCount = results.filter(r => r.success).length;
+  Logger.success(`✅ Updated ${successCount}/${orderNos.length} orders`);
+  
+  return {
+    success: successCount > 0,
+    total: orderNos.length,
+    successful: successCount,
+    failed: orderNos.length - successCount,
+    results
+  };
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
 
 module.exports = {
   createOrder,
   getOrders,
   updateOrderPaymentStatus,
+  updateMultiplePaymentStatus,
   updateOrderDeliveryStatus,
   getPendingPayments,
   updateStock,
-  cancelOrder,
-  updateCreditStatus,
-  addCreditRecord
+  detectPaymentIntent,
+  getPaymentStatusMessage,
+  bulkUpdatePaymentStatus,
+  PAYMENT_STATUS_MAP
 };
