@@ -1,4 +1,4 @@
-// orderParser.js - Resilient Order Parser with Graceful Degradation
+// orderParser.js - FIXED: Multi-item voice order parsing
 
 const { Logger, PerformanceMonitor } = require('./logger');
 const { normalizeText, similarity } = require('./utils');
@@ -27,7 +27,6 @@ async function parseOrder(userInput) {
   try {
     PerformanceMonitor.start('parseOrder');
     
-    // Strategy: Check if Gemini is available, otherwise use RAG fallback
     if (shouldUseGemini()) {
       Logger.info('🧠 Using Gemini AI Parser');
       try {
@@ -35,13 +34,8 @@ async function parseOrder(userInput) {
         PerformanceMonitor.end('parseOrder');
         return result;
       } catch (geminiError) {
-        // If Gemini fails, log the error and fall back to RAG
         Logger.warn(`⚠️ Gemini parsing failed: ${geminiError.message}`);
         Logger.info('🔄 Falling back to RAG parser...');
-        
-        if (geminiError.code === 'QUOTA_EXCEEDED') {
-          Logger.warn('💢 Gemini quota exceeded - using RAG fallback');
-        }
         
         const result = fallbackParserWithRAG(userInput, stockCache);
         PerformanceMonitor.end('parseOrder');
@@ -56,8 +50,6 @@ async function parseOrder(userInput) {
   } catch (error) {
     Logger.error('❌ parseOrder critical failure', error);
     PerformanceMonitor.end('parseOrder');
-    
-    // Last resort: basic fallback
     return fallbackParserWithRAG(userInput, stockCache);
   }
 }
@@ -94,7 +86,7 @@ async function parseOrderWithGemini(userInput, stockCache) {
     
     // Step 3: Build stock catalog
     const stockCatalog = relevantStock.map((item, idx) => {
-      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | รายการสินค้า: ${item.stock}`;
+      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
     }).join('\n');
 
     // Step 4: Build customer context
@@ -109,7 +101,7 @@ async function parseOrderWithGemini(userInput, stockCache) {
     // Step 5: Multi-item detection prompt
     const detectionPrompt = `คุณคือ AI ตรวจจับคำสั่งซื้อที่อาจมีหลายรายการ
 
-📝 คำสั่ง: "${userInput}"
+🔍 คำสั่ง: "${userInput}"
 
 ตรวจสอบว่ามี:
 1. หลายสินค้า (เช่น "น้ำแข็ง 2 ถุง กับเบียร์ 5 กระป๋อง")
@@ -122,7 +114,6 @@ async function parseOrderWithGemini(userInput, stockCache) {
   "splitSuggestion": ["รายการ 1", "รายการ 2", ...]
 }`;
 
-    // Check if multi-item order
     const detectionSchema = {
       type: 'object',
       properties: {
@@ -143,9 +134,15 @@ async function parseOrderWithGemini(userInput, stockCache) {
 
     Logger.info(`🔎 Detection: Multi-item=${detection.isMultiItem}, Count=${detection.itemCount}`);
 
-    // Handle multi-item order
+    // Handle multi-item order - FIXED VERSION
     if (detection.isMultiItem && detection.itemCount > 1) {
-      return await parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer);
+      return await parseMultiItemOrder(
+        userInput, 
+        stockCache, 
+        detection, 
+        detectedCustomer,
+        relevantStock // Pass relevant stock for better matching
+      );
     }
 
     // Single item parsing
@@ -220,24 +217,15 @@ ${stockCatalog}${customerContext}
 
   } catch (error) {
     Logger.error('❌ Gemini parsing error', error);
-    
-    // Re-throw with code for upstream handling
-    if (error.code === 'SERVICE_UNAVAILABLE' || 
-        error.code === 'QUOTA_EXCEEDED' ||
-        error.code === 'TIMEOUT') {
-      throw error;
-    }
-    
-    // For other errors, use fallback
     throw new Error('GEMINI_PARSE_FAILED');
   }
 }
 
 // ============================================================================
-// MULTI-ITEM ORDER PARSER - FIXED TO USE RAG
+// MULTI-ITEM ORDER PARSER - COMPLETELY REWRITTEN
 // ============================================================================
 
-async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer) {
+async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer, relevantStock) {
   Logger.info(`🔄 Parsing ${detection.itemCount} items...`);
   
   const items = [];
@@ -251,13 +239,13 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
   const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
   if (deliveryMatch) deliveryPerson = deliveryMatch[1];
   
-  // Parse each item using RAG fallback (more reliable for sub-items)
+  // FIXED: Use ENHANCED fallback for each item
   for (const itemText of detection.splitSuggestion || []) {
     try {
-      Logger.info(`🧠 Parsing sub-item: "${itemText}"`);
+      Logger.info(`🔍 Parsing sub-item: "${itemText}"`);
       
-      // Use RAG fallback for sub-items to avoid recursive Gemini calls
-      const itemResult = fallbackParserWithRAG(itemText, stockCache);
+      // Use enhanced fallback with explicit stock search
+      const itemResult = enhancedFallbackParser(itemText, relevantStock || stockCache);
       
       if (itemResult.success && itemResult.stockItem) {
         items.push({
@@ -266,10 +254,12 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
         });
         Logger.success(`✅ Parsed: ${itemResult.stockItem.item} x${itemResult.quantity}`);
       } else {
-        Logger.warn(`⚠️ Failed to parse item: "${itemText}"`);
+        Logger.warn(`⚠️ Failed to parse: "${itemText}" - ${itemResult.error || 'No match'}`);
+        // Continue with other items instead of failing completely
       }
     } catch (itemError) {
-      Logger.warn(`⚠️ Exception parsing item: ${itemText}`, itemError);
+      Logger.warn(`⚠️ Exception parsing: ${itemText}`, itemError);
+      // Continue with other items
     }
   }
   
@@ -279,7 +269,7 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
     throw new Error('MULTI_ITEM_PARSE_FAILED');
   }
   
-  Logger.success(`✅ Parsed ${items.length} items successfully`);
+  Logger.success(`✅ Parsed ${items.length}/${detection.itemCount} items successfully`);
   
   return {
     success: true,
@@ -288,15 +278,108 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
     customer: detectedCustomer || 'ไม่ระบุ',
     deliveryPerson: deliveryPerson,
     paymentStatus: paymentStatus,
-    confidence: 'medium',
-    reasoning: `Multi-item order detected (${items.length} items)`,
+    confidence: items.length === detection.itemCount ? 'high' : 'medium',
+    reasoning: `Multi-item order: ${items.length} items parsed`,
+    warning: items.length < detection.itemCount 
+      ? `⚠️ ระบุ ${detection.itemCount} รายการ แต่แปลงได้ ${items.length} รายการ` 
+      : null,
     usedAI: true,
     isMultiItem: true
   };
 }
 
 // ============================================================================
-// FALLBACK PARSER WITH RAG
+// ENHANCED FALLBACK PARSER - FOR SUB-ITEMS
+// ============================================================================
+
+function enhancedFallbackParser(text, stockCache) {
+  Logger.info(`🔍 Enhanced fallback for: "${text}"`);
+  
+  // Extract quantity first
+  const { quantity, matched: quantityStr } = extractQuantity(text);
+  
+  // Clean text for product search
+  const searchText = text
+    .toLowerCase()
+    .replace(quantityStr, '')
+    .replace(/สั่ง|ซื้อ|เอา|ขอ|ส่ง|โดย|ให้|พี่|น้อง|คุณ/gi, '')
+    .trim();
+  
+  Logger.info(`🔎 Searching for: "${searchText}" (qty: ${quantity})`);
+  
+  // Try multiple search strategies
+  const strategies = [
+    // Strategy 1: Exact match (normalized)
+    () => {
+      const normalized = normalizeText(searchText);
+      return stockCache.find(item => 
+        normalizeText(item.item) === normalized
+      );
+    },
+    
+    // Strategy 2: Contains match
+    () => {
+      const normalized = normalizeText(searchText);
+      return stockCache.find(item => 
+        normalizeText(item.item).includes(normalized) ||
+        normalized.includes(normalizeText(item.item))
+      );
+    },
+    
+    // Strategy 3: Vector search (if available)
+    () => {
+      const ragResults = stockVectorStore.search(searchText, 1);
+      if (ragResults.length > 0 && ragResults[0].similarity > 0.4) {
+        const index = ragResults[0].metadata.index;
+        return stockCache[index];
+      }
+      return null;
+    },
+    
+    // Strategy 4: Word-level fuzzy match
+    () => {
+      const words = searchText.split(/\s+/);
+      for (const word of words) {
+        if (word.length < 3) continue;
+        
+        const found = stockCache.find(item => 
+          normalizeText(item.item).includes(normalizeText(word))
+        );
+        if (found) return found;
+      }
+      return null;
+    }
+  ];
+  
+  // Try each strategy until one succeeds
+  for (let i = 0; i < strategies.length; i++) {
+    try {
+      const match = strategies[i]();
+      if (match) {
+        Logger.success(`✅ Match found (strategy ${i + 1}): ${match.item}`);
+        return {
+          success: true,
+          stockItem: match,
+          quantity: quantity,
+          confidence: i === 0 ? 'high' : i === 1 ? 'medium' : 'low',
+          usedAI: false
+        };
+      }
+    } catch (strategyError) {
+      Logger.warn(`Strategy ${i + 1} failed:`, strategyError);
+    }
+  }
+  
+  Logger.error(`❌ No match found for: "${searchText}"`);
+  
+  return {
+    success: false,
+    error: `ไม่พบสินค้า: "${searchText}"`
+  };
+}
+
+// ============================================================================
+// ORIGINAL FALLBACK PARSER WITH RAG
 // ============================================================================
 
 function fallbackParserWithRAG(text, stockCache) {
@@ -367,14 +450,14 @@ function extractQuantity(text) {
   };
   
   // Try digit with unit
-  const digitMatch = text.match(/(\d+)\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง|กระป๋อง)/i);
+  const digitMatch = text.match(/(\d+)\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง|กระป๋อง|ลัง)/i);
   if (digitMatch) {
     return { quantity: parseInt(digitMatch[1]), matched: digitMatch[0] };
   }
   
   // Try Thai numbers
   for (const [thai, num] of Object.entries(thaiNumbers)) {
-    const pattern = new RegExp(`(${thai})\\s*(?:ถุง|กระสอบ|แพ็ค|ขวด)`, 'i');
+    const pattern = new RegExp(`(${thai})\\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|ลัง)`, 'i');
     const match = text.match(pattern);
     if (match) {
       return { quantity: num, matched: match[0] };
