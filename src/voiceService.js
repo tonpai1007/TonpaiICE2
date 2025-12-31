@@ -1,12 +1,11 @@
-// ============================================================================
-// GOOGLE SPEECH-TO-TEXT VOICE SERVICE - ENHANCED
-// ============================================================================
+// voiceService.js - FIXED: Only use AI correction when needed
 
 const speech = require('@google-cloud/speech');
 const { configManager, loadGoogleCredentials } = require('./config');
 const { Logger } = require('./logger');
-const { generateWithGemini } = require('./aiServices');
+const { generateWithGemini, isGeminiAvailable } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
+const { stockVectorStore } = require('./vectorStore');
 
 let speechClient = null;
 
@@ -63,38 +62,34 @@ function buildSpeechContext() {
   
   keywords.forEach(word => phrases.add(word));
 
-  const finalPhrases = Array.from(phrases).slice(0, 500); // Google limit
+  const finalPhrases = Array.from(phrases).slice(0, 500);
   Logger.success(`Speech context: ${finalPhrases.length} phrases`);
   
   return finalPhrases;
 }
 
 // ============================================================================
-// DETECT AUDIO FORMAT (Enhanced)
+// DETECT AUDIO FORMAT
 // ============================================================================
 
 function detectAudioFormat(buffer) {
-  // Check for OGG Opus (LINE's format)
   if (buffer[0] === 0x4F && buffer[1] === 0x67 && buffer[2] === 0x67 && buffer[3] === 0x53) {
     return 'OGG_OPUS';
   }
   
-  // Check for WEBM
   if (buffer[0] === 0x1A && buffer[1] === 0x45 && buffer[2] === 0xDF && buffer[3] === 0xA3) {
     return 'WEBM_OPUS';
   }
   
-  // Check for M4A/MP4
   if (buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70) {
     return 'MP4';
   }
   
-  // Default
   return 'OGG_OPUS';
 }
 
 // ============================================================================
-// TRANSCRIBE AUDIO WITH GOOGLE SPEECH (ENHANCED)
+// TRANSCRIBE AUDIO WITH GOOGLE SPEECH
 // ============================================================================
 
 async function transcribeAudioWithGoogle(audioBuffer) {
@@ -107,12 +102,10 @@ async function transcribeAudioWithGoogle(audioBuffer) {
     
     Logger.info(`Transcribing with Google: ${audioSize}KB (${audioFormat})`);
     
-    // Check if audio is too small
     if (audioBuffer.length < 1000) {
       throw new Error('Audio file too small (likely empty or corrupted)');
     }
     
-    // Check if audio is too large (>10MB)
     if (audioBuffer.length > 10 * 1024 * 1024) {
       throw new Error('Audio file too large (max 10MB)');
     }
@@ -121,7 +114,6 @@ async function transcribeAudioWithGoogle(audioBuffer) {
       content: audioBuffer.toString('base64')
     };
     
-    // Try multiple configurations in order of likelihood
     const configs = [
       {
         name: 'OGG_OPUS (LINE Default)',
@@ -154,12 +146,11 @@ async function transcribeAudioWithGoogle(audioBuffer) {
           enableAutomaticPunctuation: true,
           model: 'default',
           useEnhanced: true,
-          maxAlternatives: 3, // Get multiple alternatives
+          maxAlternatives: 3,
           speechContexts: [{
             phrases: phrases,
             boost: 20
           }],
-          // Enable word-level confidence
           enableWordConfidence: true,
           enableWordTimeOffsets: true
         };
@@ -171,16 +162,12 @@ async function transcribeAudioWithGoogle(audioBuffer) {
         
         const [response] = await client.recognize(request);
         
-        Logger.debug('Google Response:', JSON.stringify(response, null, 2));
-        
-        // Check if we got results
         if (!response.results || response.results.length === 0) {
           Logger.warn(`No results with ${configVariant.name}`);
           lastError = new Error(`No transcription results with ${configVariant.name}`);
-          continue; // Try next config
+          continue;
         }
         
-        // Get best alternative
         const result = response.results[0];
         const alternatives = result.alternatives || [];
         
@@ -193,7 +180,6 @@ async function transcribeAudioWithGoogle(audioBuffer) {
         const transcription = bestAlternative.transcript;
         const confidence = bestAlternative.confidence || 0;
         
-        // Log all alternatives for debugging
         if (alternatives.length > 1) {
           Logger.info('Alternative transcriptions:');
           alternatives.forEach((alt, idx) => {
@@ -201,7 +187,6 @@ async function transcribeAudioWithGoogle(audioBuffer) {
           });
         }
         
-        // Check if transcription is meaningful
         if (!transcription || transcription.trim().length === 0) {
           Logger.warn('Empty transcription');
           continue;
@@ -226,23 +211,17 @@ async function transcribeAudioWithGoogle(audioBuffer) {
       }
     }
     
-    // If we got here, all configs failed
     throw lastError || new Error('All transcription configs failed');
     
   } catch (error) {
     Logger.error('Google Speech transcription failed', error);
     
-    // Provide more specific error messages
     if (error.message?.includes('Audio file too')) {
-      throw error; // Re-throw with our custom message
+      throw error;
     }
     
     if (error.code === 11 || error.message?.includes('INVALID_ARGUMENT')) {
       throw new Error('Invalid audio format - LINE audio may be corrupted');
-    }
-    
-    if (error.code === 3 || error.message?.includes('INVALID_ARGUMENT')) {
-      throw new Error('Audio encoding not recognized - try recording again');
     }
     
     throw error;
@@ -250,12 +229,27 @@ async function transcribeAudioWithGoogle(audioBuffer) {
 }
 
 // ============================================================================
-// AI CORRECTION WITH FULL DATABASE
+// SMART AI CORRECTION - ONLY WHEN NEEDED
 // ============================================================================
 
-async function aiCorrectTranscription(rawText, stockCache, customerCache) {
+async function smartAICorrection(rawText, confidence, stockCache, customerCache) {
   try {
-    Logger.info('🤖 AI correcting transcription...');
+    // ✅ CRITICAL FIX: Only use AI if confidence is LOW or text looks suspicious
+    const needsCorrection = 
+      confidence < 0.75 || // Low confidence
+      !hasValidProductName(rawText, stockCache) || // No product found
+      !hasValidCustomerName(rawText, customerCache); // No customer found
+    
+    if (!needsCorrection) {
+      Logger.info(`✅ Transcription looks good (${(confidence * 100).toFixed(1)}%) - skipping AI correction`);
+      return {
+        corrected: rawText,
+        confidence: 'high',
+        changes: 'ไม่มีการแก้ไข - ผลการแปลงเสียงดีอยู่แล้ว'
+      };
+    }
+    
+    Logger.info(`🤖 AI correction needed (confidence: ${(confidence * 100).toFixed(1)}%)`);
 
     const allProducts = stockCache.slice(0, 50).map(p => p.item).join('\n');
     const allCustomers = customerCache.slice(0, 30).map(c => c.name).join('\n');
@@ -292,13 +286,15 @@ ${allCustomers}
 
 งาน:
 1. ตรวจสอบว่าชื่อลูกค้าและสินค้าตรงกับฐานข้อมูลหรือไม่
-2. แก้ไขคำที่อาจจะผิด
-3. จัดรูปแบบให้ชัดเจน
+2. แก้ไขเฉพาะคำที่ผิดเท่านั้น
+3. **อย่าเปลี่ยนคำที่ถูกต้องอยู่แล้ว**
+4. ถ้าไม่แน่ใจ อย่าแก้
 
-กฎ:
-- ใช้ชื่อที่ตรงกับฐานข้อมูล
+กฎสำคัญ:
+- ถ้าข้อความถูกต้องอยู่แล้ว ให้คืนค่าเหมือนเดิม
+- แก้เฉพาะชื่อที่ผิดพลาด
 - เก็บโครงสร้าง: [ลูกค้า] สั่ง [สินค้า] [จำนวน]
-- เพิ่ม "ส่งโดย [คน]" ถ้ามี
+- เพิ่ม "สั่งโดย [คน]" ถ้ามี
 
 ตัวอย่าง:
 Input: "พี่กาแฟ สั่งน้ำแข็งบด 2 ถุง"
@@ -332,17 +328,36 @@ Output: {
 }
 
 // ============================================================================
-// PROCESS VOICE MESSAGE (ENHANCED)
+// HELPER: CHECK IF TEXT HAS VALID PRODUCT
+// ============================================================================
+
+function hasValidProductName(text, stockCache) {
+  const results = stockVectorStore.search(text, 1);
+  return results.length > 0 && results[0].similarity > 0.5;
+}
+
+// ============================================================================
+// HELPER: CHECK IF TEXT HAS VALID CUSTOMER
+// ============================================================================
+
+function hasValidCustomerName(text, customerCache) {
+  const normalizedText = text.toLowerCase();
+  return customerCache.some(customer => 
+    normalizedText.includes(customer.name.toLowerCase())
+  );
+}
+
+// ============================================================================
+// PROCESS VOICE MESSAGE (FIXED)
 // ============================================================================
 
 async function processVoiceMessage(audioBuffer) {
-  const MIN_CONFIDENCE = configManager.get('VOICE_MIN_CONFIDENCE', 0.5); // Lowered threshold
+  const MIN_CONFIDENCE = configManager.get('VOICE_MIN_CONFIDENCE', 0.5);
   const MIN_TEXT_LENGTH = configManager.get('VOICE_MIN_TEXT_LENGTH', 3);
   
   try {
     Logger.info('🎤 Processing voice with Google Speech...');
     
-    // Validate audio buffer
     if (!audioBuffer || audioBuffer.length === 0) {
       return {
         success: false,
@@ -358,7 +373,7 @@ async function processVoiceMessage(audioBuffer) {
     
     if (!transcriptionResult.text || transcriptionResult.text.trim().length < MIN_TEXT_LENGTH) {
       let errorMsg = '🎤 ฟังไม่ชัด กรุณาพูดใหม่\n\n💡 เคล็ดลับ:\n';
-      errorMsg += '• พูดช้าๆ ชัดเจน\n';
+      errorMsg += '• พูดชัดๆ ชัดเจน\n';
       errorMsg += '• อยู่ในที่เงียบ\n';
       errorMsg += '• ถือไมค์ใกล้ปาก\n';
       errorMsg += '• ตัวอย่าง: "พี่กาแฟ สั่งน้ำแข็งหลอดใหญ่ 2 ถุง"';
@@ -369,12 +384,13 @@ async function processVoiceMessage(audioBuffer) {
       };
     }
     
-    // Step 2: AI correction
+    // Step 2: Smart AI correction (only when needed)
     const stockCache = getStockCache();
     const customerCache = getCustomerCache();
     
-    const aiCorrected = await aiCorrectTranscription(
+    const aiCorrected = await smartAICorrection(
       transcriptionResult.text,
+      transcriptionResult.confidence,
       stockCache,
       customerCache
     );
@@ -388,11 +404,10 @@ async function processVoiceMessage(audioBuffer) {
       warning = '⚠️ การแปลงเสียงไม่แน่นอน กรุณาตรวจสอบความถูกต้อง';
     } else if (aiCorrected.confidence === 'low') {
       warning = `ℹ️ AI แก้ไขแล้วแต่ไม่แน่ใจ: ${aiCorrected.changes}`;
-    } else if (aiCorrected.confidence === 'medium' && aiCorrected.changes !== 'ไม่มีการแก้ไข') {
+    } else if (aiCorrected.confidence === 'medium' && aiCorrected.changes !== 'ไม่มีการแก้ไข' && aiCorrected.changes !== 'ไม่มีการแก้ไข - ผลการแปลงเสียงดีอยู่แล้ว') {
       warning = `ℹ️ ${aiCorrected.changes}`;
     }
     
-    // Add alternatives to warning if available and confidence is low
     if (transcriptionResult.alternatives && transcriptionResult.alternatives.length > 0 && 
         transcriptionResult.confidence < 0.7) {
       warning = (warning || '') + '\n\n🔄 ทางเลือกอื่น:\n';
@@ -415,7 +430,6 @@ async function processVoiceMessage(audioBuffer) {
   } catch (error) {
     Logger.error('Voice processing failed', error);
     
-    // More specific error handling
     if (error.message?.includes('Audio file too small')) {
       return {
         success: false,
@@ -451,7 +465,6 @@ async function processVoiceMessage(audioBuffer) {
       };
     }
     
-    // Generic error
     return {
       success: false,
       error: '❌ เกิดข้อผิดพลาด\nลองใหม่หรือพิมพ์แทนค่ะ\n\n' + 
@@ -461,7 +474,7 @@ async function processVoiceMessage(audioBuffer) {
 }
 
 // ============================================================================
-// FETCH AUDIO FROM LINE (ENHANCED)
+// FETCH AUDIO FROM LINE
 // ============================================================================
 
 async function fetchAudioFromLine(messageId) {
@@ -476,8 +489,7 @@ async function fetchAudioFromLine(messageId) {
         headers: { 
           'Authorization': `Bearer ${LINE_TOKEN}` 
         },
-        // Add timeout
-        signal: AbortSignal.timeout(30000) // 30 seconds
+        signal: AbortSignal.timeout(30000)
       }
     );
 
@@ -492,7 +504,6 @@ async function fetchAudioFromLine(messageId) {
     
     Logger.success(`✅ Audio fetched: ${sizeKB}KB`);
     
-    // Validate buffer
     if (buffer.length === 0) {
       throw new Error('LINE returned empty audio file');
     }
