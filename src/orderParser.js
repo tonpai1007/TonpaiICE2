@@ -1,4 +1,4 @@
-// orderParser.js - FIXED: Resilient Order Parser with Graceful Degradation
+// orderParser.js - Resilient Order Parser with Graceful Degradation
 
 const { Logger, PerformanceMonitor } = require('./logger');
 const { normalizeText, similarity } = require('./utils');
@@ -84,17 +84,17 @@ async function parseOrderWithGemini(userInput, stockCache) {
       ? userInput.replace(new RegExp(detectedCustomer, 'gi'), '').trim()
       : userInput;
     
-    const ragResults = stockVectorStore.search(productQuery, 15); // Increased from 10 to 15
+    const ragResults = stockVectorStore.search(productQuery, 10);
     
     const relevantStock = ragResults.length > 0 && ragResults[0].similarity > 0.3
       ? ragResults.map(r => stockCache[r.metadata.index])
-      : stockCache.slice(0, 30); // Increased fallback from 20 to 30
+      : stockCache.slice(0, 20);
     
     Logger.info(`📦 Using ${relevantStock.length} products for context`);
     
     // Step 3: Build stock catalog
     const stockCatalog = relevantStock.map((item, idx) => {
-      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
+      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | รายการสินค้า: ${item.stock}`;
     }).join('\n');
 
     // Step 4: Build customer context
@@ -143,15 +143,9 @@ async function parseOrderWithGemini(userInput, stockCache) {
 
     Logger.info(`🔎 Detection: Multi-item=${detection.isMultiItem}, Count=${detection.itemCount}`);
 
-    // Handle multi-item order - FIXED: Pass stockCache and customer
+    // Handle multi-item order
     if (detection.isMultiItem && detection.itemCount > 1) {
-      return await parseMultiItemOrder(
-        userInput, 
-        stockCache, 
-        detection, 
-        detectedCustomer,
-        relevantStock // Pass the relevant stock context
-      );
+      return await parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer);
     }
 
     // Single item parsing
@@ -190,24 +184,17 @@ ${stockCatalog}${customerContext}
 1. จำนวน vs ราคา: "น้ำแข็ง 45" = ราคา 45฿, "น้ำแข็ง 2 ถุง" = จำนวน 2
 2. ชื่อลูกค้า: หาคำนำหน้า พี่/น้อง/คุณ
 3. matched_stock_index ต้องอยู่ใน 0-${relevantStock.length - 1}
-4. ⚠️ สำคัญมาก: ถ้าไม่พบสินค้าในรายการ ให้ใส่ -1 และตั้ง action='unclear'
-5. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
-6. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
+4. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
+5. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
 
 ตอบเป็น JSON`;
 
     const result = await generateWithGemini(prompt, schema, 0.1);
 
-    // 🔥 FIX: Handle -1 index (product not found)
+    // Validate index
     const localIndex = result.matched_stock_index;
-    
-    if (localIndex === -1 || result.action === 'unclear') {
-      Logger.warn(`⚠️ Gemini couldn't find product in catalog - falling back to RAG`);
-      throw new Error('PRODUCT_NOT_FOUND');
-    }
-    
     if (localIndex < 0 || localIndex >= relevantStock.length) {
-      Logger.error(`❌ Invalid index: ${localIndex} (valid range: 0-${relevantStock.length - 1})`);
+      Logger.error(`❌ Invalid index: ${localIndex} (valid: 0-${relevantStock.length - 1})`);
       throw new Error('INVALID_INDEX');
     }
 
@@ -235,10 +222,6 @@ ${stockCatalog}${customerContext}
     Logger.error('❌ Gemini parsing error', error);
     
     // Re-throw with code for upstream handling
-    if (error.message === 'PRODUCT_NOT_FOUND' || error.message === 'INVALID_INDEX') {
-      throw new Error('GEMINI_PARSE_FAILED');
-    }
-    
     if (error.code === 'SERVICE_UNAVAILABLE' || 
         error.code === 'QUOTA_EXCEEDED' ||
         error.code === 'TIMEOUT') {
@@ -251,10 +234,10 @@ ${stockCatalog}${customerContext}
 }
 
 // ============================================================================
-// MULTI-ITEM ORDER PARSER - FIXED
+// MULTI-ITEM ORDER PARSER - FIXED TO USE RAG
 // ============================================================================
 
-async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer, relevantStock = null) {
+async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer) {
   Logger.info(`🔄 Parsing ${detection.itemCount} items...`);
   
   const items = [];
@@ -268,11 +251,12 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
   const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
   if (deliveryMatch) deliveryPerson = deliveryMatch[1];
   
-  // USE RAG FALLBACK FOR SUB-ITEMS (prevents index mismatch)
+  // Parse each item using RAG fallback (more reliable for sub-items)
   for (const itemText of detection.splitSuggestion || []) {
     try {
       Logger.info(`🧠 Parsing sub-item: "${itemText}"`);
       
+      // Use RAG fallback for sub-items to avoid recursive Gemini calls
       const itemResult = fallbackParserWithRAG(itemText, stockCache);
       
       if (itemResult.success && itemResult.stockItem) {
@@ -281,13 +265,17 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
           quantity: itemResult.quantity
         });
         Logger.success(`✅ Parsed: ${itemResult.stockItem.item} x${itemResult.quantity}`);
+      } else {
+        Logger.warn(`⚠️ Failed to parse item: "${itemText}"`);
       }
     } catch (itemError) {
-      Logger.warn(`⚠️ Failed parsing: ${itemText}`);
+      Logger.warn(`⚠️ Exception parsing item: ${itemText}`, itemError);
     }
   }
   
+  // If no items were parsed successfully, throw error
   if (items.length === 0) {
+    Logger.error('❌ No items successfully parsed from multi-item order');
     throw new Error('MULTI_ITEM_PARSE_FAILED');
   }
   
@@ -301,7 +289,7 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
     deliveryPerson: deliveryPerson,
     paymentStatus: paymentStatus,
     confidence: 'medium',
-    reasoning: `Multi-item order (${items.length} items)`,
+    reasoning: `Multi-item order detected (${items.length} items)`,
     usedAI: true,
     isMultiItem: true
   };
