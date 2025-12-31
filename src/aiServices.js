@@ -102,7 +102,7 @@ async function generateWithGemini(prompt, schema = null, temperature = 0.1) {
 
   try {
     const config = {
-      model: 'gemini-2.5-flash-lite',
+      model: 'gemini-2.0-flash-lite',
       generationConfig: {
         temperature,
         topP: 0.9,
