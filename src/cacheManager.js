@@ -31,7 +31,7 @@ async function loadStockCache(forceReload = false) {
     PerformanceMonitor.start('loadStockCache');
     Logger.info('Loading stock from Google Sheets...');
 
-    let rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    let rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
 
     // Initialize sample data if empty
     if (rows.length <= 1) {
@@ -40,8 +40,8 @@ async function loadStockCache(forceReload = false) {
         ...row,
         generateSKU(row[0], row[3])
       ]);
-      await appendSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G', sampleWithSKU);
-      rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+      await appendSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G', sampleWithSKU);
+      rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
     }
 
     // Parse rows into structured data
@@ -66,7 +66,7 @@ async function loadStockCache(forceReload = false) {
           const newSKU = generateSKU(it.item, it.unit);
           it.sku = newSKU;
           batchUpdates.push({
-            range: `สต็อก!G${idx + 2}`,
+            range: `รายการสินค้า!G${idx + 2}`,
             values: [[newSKU]]
           });
         }

@@ -268,12 +268,11 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
   const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
   if (deliveryMatch) deliveryPerson = deliveryMatch[1];
   
-  // Parse each item using RAG fallback (more reliable for sub-items)
+  // USE RAG FALLBACK FOR SUB-ITEMS (prevents index mismatch)
   for (const itemText of detection.splitSuggestion || []) {
     try {
       Logger.info(`🧠 Parsing sub-item: "${itemText}"`);
       
-      // Use RAG fallback for sub-items to avoid recursive Gemini calls
       const itemResult = fallbackParserWithRAG(itemText, stockCache);
       
       if (itemResult.success && itemResult.stockItem) {
@@ -282,17 +281,13 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
           quantity: itemResult.quantity
         });
         Logger.success(`✅ Parsed: ${itemResult.stockItem.item} x${itemResult.quantity}`);
-      } else {
-        Logger.warn(`⚠️ Failed to parse item: "${itemText}" - ${itemResult.error || 'unknown error'}`);
       }
     } catch (itemError) {
-      Logger.warn(`⚠️ Exception parsing item: ${itemText}`, itemError);
+      Logger.warn(`⚠️ Failed parsing: ${itemText}`);
     }
   }
   
-  // If no items were parsed successfully, throw error
   if (items.length === 0) {
-    Logger.error('❌ No items successfully parsed from multi-item order');
     throw new Error('MULTI_ITEM_PARSE_FAILED');
   }
   
@@ -306,7 +301,7 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
     deliveryPerson: deliveryPerson,
     paymentStatus: paymentStatus,
     confidence: 'medium',
-    reasoning: `Multi-item order detected (${items.length} items)`,
+    reasoning: `Multi-item order (${items.length} items)`,
     usedAI: true,
     isMultiItem: true
   };

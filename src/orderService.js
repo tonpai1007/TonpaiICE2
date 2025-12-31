@@ -278,7 +278,7 @@ async function rollbackStockUpdates(stockUpdates) {
 async function updateStockWithRetry(itemName, unit, newStock, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+      const rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
       const key = itemName.toLowerCase().trim();
 
       for (let i = 1; i < rows.length; i++) {
@@ -287,7 +287,7 @@ async function updateStockWithRetry(itemName, unit, newStock, maxRetries = 3) {
         const rowUnit = (row[3] || '').trim().toLowerCase();
 
         if (rowName === key && rowUnit === unit.toLowerCase()) {
-          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
+          await updateSheetData(CONFIG.SHEET_ID, `รายการสินค้า!E${i + 1}`, [[newStock]]);
           Logger.success(`📦 Stock updated: ${itemName} = ${newStock} (attempt ${attempt})`);
           return true;
         }
@@ -324,7 +324,7 @@ async function updateStock(itemName, unit, newStock) {
 async function getOrderWithLineItems(orderNo) {
   try {
     // Get order header
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
     const orderRow = orderRows.find(row => row[0] == orderNo);
     
     if (!orderRow) {
