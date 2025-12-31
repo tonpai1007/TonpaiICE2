@@ -134,14 +134,13 @@ async function parseOrderWithGemini(userInput, stockCache) {
 
     Logger.info(`🔎 Detection: Multi-item=${detection.isMultiItem}, Count=${detection.itemCount}`);
 
-    // Handle multi-item order - FIXED VERSION
+    // CRITICAL FIX: Pass FULL stockCache to multi-item parser, not filtered relevantStock
     if (detection.isMultiItem && detection.itemCount > 1) {
       return await parseMultiItemOrder(
         userInput, 
-        stockCache, 
+        stockCache,  // ✅ FULL CACHE
         detection, 
-        detectedCustomer,
-        relevantStock // Pass relevant stock for better matching
+        detectedCustomer
       );
     }
 
@@ -170,7 +169,7 @@ async function parseOrderWithGemini(userInput, stockCache) {
       required: ['action', 'matched_stock_index', 'quantity', 'customer', 'confidence', 'reasoning']
     };
 
-    const prompt = `คุณคือ AI ผู้เชี่ยวชาญระบบคำสั่งซื้อร้านน้ำแข็ง
+    const prompt = `คุณคือ AI ผู้เชี่ยวชาจากระบบคำสั่งซื้อร้านน้ำแข็ง
 
 📋 รายการสินค้า (index: 0-${relevantStock.length - 1}):
 ${stockCatalog}${customerContext}
@@ -222,11 +221,11 @@ ${stockCatalog}${customerContext}
 }
 
 // ============================================================================
-// MULTI-ITEM ORDER PARSER - COMPLETELY REWRITTEN
+// MULTI-ITEM ORDER PARSER - COMPLETELY REWRITTEN (FIXED)
 // ============================================================================
 
-async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer, relevantStock) {
-  Logger.info(`🔄 Parsing ${detection.itemCount} items...`);
+async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer) {
+  Logger.info(`🔄 Parsing ${detection.itemCount} items with FULL stock cache (${stockCache.length} items)...`);
   
   const items = [];
   let deliveryPerson = '';
@@ -239,13 +238,13 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
   const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
   if (deliveryMatch) deliveryPerson = deliveryMatch[1];
   
-  // FIXED: Use ENHANCED fallback for each item
+  // Parse each item using FULL stock cache
   for (const itemText of detection.splitSuggestion || []) {
     try {
       Logger.info(`🔍 Parsing sub-item: "${itemText}"`);
       
-      // Use enhanced fallback with explicit stock search
-      const itemResult = enhancedFallbackParser(itemText, relevantStock || stockCache);
+      // ✅ CRITICAL FIX: Pass FULL stockCache
+      const itemResult = enhancedFallbackParser(itemText, stockCache);
       
       if (itemResult.success && itemResult.stockItem) {
         items.push({
@@ -255,11 +254,9 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
         Logger.success(`✅ Parsed: ${itemResult.stockItem.item} x${itemResult.quantity}`);
       } else {
         Logger.warn(`⚠️ Failed to parse: "${itemText}" - ${itemResult.error || 'No match'}`);
-        // Continue with other items instead of failing completely
       }
     } catch (itemError) {
       Logger.warn(`⚠️ Exception parsing: ${itemText}`, itemError);
-      // Continue with other items
     }
   }
   
@@ -289,11 +286,11 @@ async function parseMultiItemOrder(userInput, stockCache, detection, detectedCus
 }
 
 // ============================================================================
-// ENHANCED FALLBACK PARSER - FOR SUB-ITEMS
+// ENHANCED FALLBACK PARSER - FOR SUB-ITEMS (FIXED)
 // ============================================================================
 
 function enhancedFallbackParser(text, stockCache) {
-  Logger.info(`🔍 Enhanced fallback for: "${text}"`);
+  Logger.info(`🔍 Enhanced fallback for: "${text}" (searching ${stockCache.length} items)`);
   
   // Extract quantity first
   const { quantity, matched: quantityStr } = extractQuantity(text);
@@ -312,42 +309,72 @@ function enhancedFallbackParser(text, stockCache) {
     // Strategy 1: Exact match (normalized)
     () => {
       const normalized = normalizeText(searchText);
-      return stockCache.find(item => 
+      const found = stockCache.find(item => 
         normalizeText(item.item) === normalized
       );
+      if (found) Logger.info(`✅ Strategy 1 (exact): ${found.item}`);
+      return found;
     },
     
-    // Strategy 2: Contains match
+    // Strategy 2: Contains match (bidirectional)
     () => {
       const normalized = normalizeText(searchText);
-      return stockCache.find(item => 
-        normalizeText(item.item).includes(normalized) ||
-        normalized.includes(normalizeText(item.item))
-      );
+      const found = stockCache.find(item => {
+        const itemNorm = normalizeText(item.item);
+        return itemNorm.includes(normalized) || normalized.includes(itemNorm);
+      });
+      if (found) Logger.info(`✅ Strategy 2 (contains): ${found.item}`);
+      return found;
     },
     
-    // Strategy 3: Vector search (if available)
+    // Strategy 3: Word-level match
     () => {
-      const ragResults = stockVectorStore.search(searchText, 1);
-      if (ragResults.length > 0 && ragResults[0].similarity > 0.4) {
-        const index = ragResults[0].metadata.index;
-        return stockCache[index];
-      }
-      return null;
-    },
-    
-    // Strategy 4: Word-level fuzzy match
-    () => {
-      const words = searchText.split(/\s+/);
+      const words = searchText.split(/\s+/).filter(w => w.length >= 2);
       for (const word of words) {
-        if (word.length < 3) continue;
-        
         const found = stockCache.find(item => 
           normalizeText(item.item).includes(normalizeText(word))
         );
-        if (found) return found;
+        if (found) {
+          Logger.info(`✅ Strategy 3 (word "${word}"): ${found.item}`);
+          return found;
+        }
       }
       return null;
+    },
+    
+    // Strategy 4: Vector search (if available)
+    () => {
+      try {
+        const ragResults = stockVectorStore.search(searchText, 1);
+        if (ragResults.length > 0 && ragResults[0].similarity > 0.4) {
+          const index = ragResults[0].metadata.index;
+          const found = stockCache[index];
+          Logger.info(`✅ Strategy 4 (RAG ${(ragResults[0].similarity * 100).toFixed(1)}%): ${found.item}`);
+          return found;
+        }
+      } catch (e) {
+        Logger.warn('RAG search failed:', e.message);
+      }
+      return null;
+    },
+    
+    // Strategy 5: Fuzzy match with similarity threshold
+    () => {
+      let bestMatch = null;
+      let bestScore = 0;
+      
+      for (const item of stockCache) {
+        const score = similarity(normalizeText(searchText), normalizeText(item.item));
+        if (score > bestScore && score > 0.6) {
+          bestScore = score;
+          bestMatch = item;
+        }
+      }
+      
+      if (bestMatch) {
+        Logger.info(`✅ Strategy 5 (fuzzy ${(bestScore * 100).toFixed(1)}%): ${bestMatch.item}`);
+      }
+      return bestMatch;
     }
   ];
   
@@ -356,21 +383,20 @@ function enhancedFallbackParser(text, stockCache) {
     try {
       const match = strategies[i]();
       if (match) {
-        Logger.success(`✅ Match found (strategy ${i + 1}): ${match.item}`);
         return {
           success: true,
           stockItem: match,
           quantity: quantity,
-          confidence: i === 0 ? 'high' : i === 1 ? 'medium' : 'low',
+          confidence: i === 0 ? 'high' : i <= 2 ? 'medium' : 'low',
           usedAI: false
         };
       }
     } catch (strategyError) {
-      Logger.warn(`Strategy ${i + 1} failed:`, strategyError);
+      Logger.warn(`Strategy ${i + 1} failed:`, strategyError.message);
     }
   }
   
-  Logger.error(`❌ No match found for: "${searchText}"`);
+  Logger.error(`❌ No match found for: "${searchText}" after ${strategies.length} strategies`);
   
   return {
     success: false,
