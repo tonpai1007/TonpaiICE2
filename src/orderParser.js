@@ -84,11 +84,11 @@ async function parseOrderWithGemini(userInput, stockCache) {
       ? userInput.replace(new RegExp(detectedCustomer, 'gi'), '').trim()
       : userInput;
     
-    const ragResults = stockVectorStore.search(productQuery, 10);
+    const ragResults = stockVectorStore.search(productQuery, 15); // Increased from 10 to 15
     
     const relevantStock = ragResults.length > 0 && ragResults[0].similarity > 0.3
       ? ragResults.map(r => stockCache[r.metadata.index])
-      : stockCache.slice(0, 20);
+      : stockCache.slice(0, 30); // Increased fallback from 20 to 30
     
     Logger.info(`📦 Using ${relevantStock.length} products for context`);
     
@@ -190,15 +190,22 @@ ${stockCatalog}${customerContext}
 1. จำนวน vs ราคา: "น้ำแข็ง 45" = ราคา 45฿, "น้ำแข็ง 2 ถุง" = จำนวน 2
 2. ชื่อลูกค้า: หาคำนำหน้า พี่/น้อง/คุณ
 3. matched_stock_index ต้องอยู่ใน 0-${relevantStock.length - 1}
-4. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
-5. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
+4. ⚠️ สำคัญมาก: ถ้าไม่พบสินค้าในรายการ ให้ใส่ -1 และตั้ง action='unclear'
+5. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
+6. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
 
 ตอบเป็น JSON`;
 
     const result = await generateWithGemini(prompt, schema, 0.1);
 
-    // Validate index
+    // 🔥 FIX: Handle -1 index (product not found)
     const localIndex = result.matched_stock_index;
+    
+    if (localIndex === -1 || result.action === 'unclear') {
+      Logger.warn(`⚠️ Gemini couldn't find product in catalog - falling back to RAG`);
+      throw new Error('PRODUCT_NOT_FOUND');
+    }
+    
     if (localIndex < 0 || localIndex >= relevantStock.length) {
       Logger.error(`❌ Invalid index: ${localIndex} (valid range: 0-${relevantStock.length - 1})`);
       throw new Error('INVALID_INDEX');
@@ -228,6 +235,10 @@ ${stockCatalog}${customerContext}
     Logger.error('❌ Gemini parsing error', error);
     
     // Re-throw with code for upstream handling
+    if (error.message === 'PRODUCT_NOT_FOUND' || error.message === 'INVALID_INDEX') {
+      throw new Error('GEMINI_PARSE_FAILED');
+    }
+    
     if (error.code === 'SERVICE_UNAVAILABLE' || 
         error.code === 'QUOTA_EXCEEDED' ||
         error.code === 'TIMEOUT') {

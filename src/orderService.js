@@ -579,6 +579,9 @@ module.exports = {
   // NEW: Primary transaction function
   createOrderTransaction,
   
+  // LEGACY COMPATIBILITY: Alias for old code
+  createOrder: createOrderTransaction, // ⚠️ Deprecated - use createOrderTransaction
+  
   // Query functions
   getOrders,
   getOrderWithLineItems,
