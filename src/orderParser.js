@@ -1,496 +1,481 @@
-// orderParser.js - FIXED: Multi-item voice order parsing
-
-const { Logger, PerformanceMonitor } = require('./logger');
-const { normalizeText, similarity } = require('./utils');
-const { 
-  generateWithGemini, 
-  isGeminiAvailable, 
-  shouldUseGemini 
-} = require('./aiServices');
-const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-const { getStockCache, getCustomerCache } = require('./cacheManager');
-
+// orderParser.js - COMPLETELY REBUILT WITH ARCHITECTURAL INTEGRITY
 // ============================================================================
-// MAIN PARSING FUNCTION - WITH SERVICE HEALTH CHECK
+// Design Philosophy:
+// 1. Single Source of Truth: Stock cache structure is THE contract
+// 2. Fail-Fast Validation: Catch errors early, provide clear messages
+// 3. Consistent Output: Always return the SAME structure regardless of path
 // ============================================================================
 
-async function parseOrder(userInput) {
-  const stockCache = getStockCache();
-  
-  if (stockCache.length === 0) {
-    return {
-      success: false,
-      error: '❌ ยังไม่มีสินค้าในระบบ กรุณาเพิ่มสินค้าก่อน'
-    };
+const { Logger } = require('./logger');
+const { normalizeText, calculateAdvancedSimilarity } = require('./utils');
+const { generateWithGemini, isGeminiAvailable } = require('./aiServices');
+const { getStockCache } = require('./cacheManager');
+const { stockVectorStore } = require('./vectorStore');
+
+// ============================================================================
+// CONFIDENCE THRESHOLDS
+// ============================================================================
+
+const CONFIDENCE = {
+  PERFECT_MATCH: 0.95,    // Exact or near-exact match
+  HIGH: 0.80,             // Very confident
+  MEDIUM: 0.65,           // Acceptable
+  LOW: 0.50,              // Risky but allowed
+  REJECT: 0.49            // Below this = reject
+};
+
+// ============================================================================
+// CORE: FIND BEST MATCHING PRODUCT
+// ============================================================================
+
+function findBestMatch(searchTerm, stockCache, minConfidence = CONFIDENCE.LOW) {
+  if (!searchTerm || !stockCache || stockCache.length === 0) {
+    Logger.warn('Invalid search parameters');
+    return null;
   }
 
-  try {
-    PerformanceMonitor.start('parseOrder');
+  const normalized = normalizeText(searchTerm);
+  Logger.info(`Searching for: "${searchTerm}" (normalized: "${normalized}")`);
+
+  let bestMatch = null;
+  let bestScore = 0;
+  let matchMethod = 'none';
+
+  // ========================================================================
+  // PHASE 1: EXACT MATCH (Highest Priority)
+  // ========================================================================
+  for (const product of stockCache) {
+    const productNorm = normalizeText(product.item);
     
-    if (shouldUseGemini()) {
-      Logger.info('🧠 Using Gemini AI Parser');
-      try {
-        const result = await parseOrderWithGemini(userInput, stockCache);
-        PerformanceMonitor.end('parseOrder');
-        return result;
-      } catch (geminiError) {
-        Logger.warn(`⚠️ Gemini parsing failed: ${geminiError.message}`);
-        Logger.info('🔄 Falling back to RAG parser...');
-        
-        const result = fallbackParserWithRAG(userInput, stockCache);
-        PerformanceMonitor.end('parseOrder');
-        return result;
-      }
-    } else {
-      Logger.info('📊 Using RAG-only parser (Gemini unavailable)');
-      const result = fallbackParserWithRAG(userInput, stockCache);
-      PerformanceMonitor.end('parseOrder');
-      return result;
+    if (productNorm === normalized) {
+      Logger.success(`EXACT MATCH: "${product.item}" (100%)`);
+      return {
+        product,
+        confidence: 1.0,
+        method: 'exact'
+      };
     }
-  } catch (error) {
-    Logger.error('❌ parseOrder critical failure', error);
-    PerformanceMonitor.end('parseOrder');
-    return fallbackParserWithRAG(userInput, stockCache);
   }
+
+  // ========================================================================
+  // PHASE 2: SUBSTRING MATCH (High Priority)
+  // ========================================================================
+  for (const product of stockCache) {
+    const productNorm = normalizeText(product.item);
+    
+    // Check if search term contains product name
+    if (normalized.includes(productNorm)) {
+      const score = 0.90 + (productNorm.length / normalized.length) * 0.09;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = product;
+        matchMethod = 'substring_product_in_search';
+      }
+    }
+    
+    // Check if product name contains search term
+    if (productNorm.includes(normalized)) {
+      const score = 0.85 + (normalized.length / productNorm.length) * 0.09;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = product;
+        matchMethod = 'substring_search_in_product';
+      }
+    }
+  }
+
+  // ========================================================================
+  // PHASE 3: FUZZY SIMILARITY (Medium Priority)
+  // ========================================================================
+  if (bestScore < CONFIDENCE.HIGH) {
+    for (const product of stockCache) {
+      const productNorm = normalizeText(product.item);
+      const similarity = calculateAdvancedSimilarity(normalized, productNorm);
+      
+      if (similarity > bestScore) {
+        bestScore = similarity;
+        bestMatch = product;
+        matchMethod = 'fuzzy';
+      }
+    }
+  }
+
+  // ========================================================================
+  // PHASE 4: RAG VECTOR SEARCH (Fallback)
+  // ========================================================================
+  if (bestScore < CONFIDENCE.MEDIUM) {
+    Logger.info('Using RAG vector search...');
+    const ragResults = stockVectorStore.search(searchTerm, 3, 0.3);
+    
+    if (ragResults.length > 0) {
+      const topResult = ragResults[0];
+      const ragProduct = stockCache[topResult.metadata.index];
+      
+      if (ragProduct && topResult.similarity > bestScore) {
+        bestScore = topResult.similarity * 0.9; // Slight penalty for RAG
+        bestMatch = ragProduct;
+        matchMethod = 'rag_vector';
+      }
+    }
+  }
+
+  // ========================================================================
+  // VALIDATION & RETURN
+  // ========================================================================
+  if (!bestMatch || bestScore < minConfidence) {
+    Logger.warn(`No match found for "${searchTerm}" (best: ${bestScore.toFixed(3)})`);
+    return null;
+  }
+
+  const confidencePercent = (bestScore * 100).toFixed(1);
+  Logger.success(`Match: "${bestMatch.item}" (${confidencePercent}% via ${matchMethod})`);
+
+  return {
+    product: bestMatch,
+    confidence: bestScore,
+    method: matchMethod
+  };
 }
 
 // ============================================================================
-// GEMINI PARSER - ENHANCED ERROR HANDLING
+// GEMINI-POWERED MULTI-ITEM PARSER
 // ============================================================================
 
-async function parseOrderWithGemini(userInput, stockCache) {
+async function parseWithGemini(text, customerName) {
+  if (!isGeminiAvailable()) {
+    throw new Error('GEMINI_UNAVAILABLE');
+  }
+
+  Logger.info('Gemini parsing multi-item order...');
+
+  const stockCache = getStockCache();
+  
+  if (stockCache.length === 0) {
+    throw new Error('STOCK_CACHE_EMPTY');
+  }
+
+  // Build product reference (limit to 50 for token efficiency)
+  const productList = stockCache
+    .slice(0, 50)
+    .map(p => `- ${p.item} (${p.unit})`)
+    .join('\n');
+
+  const schema = {
+    type: 'object',
+    properties: {
+      customer: {
+        type: 'string',
+        description: 'Customer name'
+      },
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            product_name: {
+              type: 'string',
+              description: 'Product name matching inventory'
+            },
+            quantity: {
+              type: 'number',
+              description: 'Quantity ordered'
+            }
+          },
+          required: ['product_name', 'quantity']
+        }
+      },
+      is_multi_item: {
+        type: 'boolean',
+        description: 'Whether order has multiple items'
+      }
+    },
+    required: ['customer', 'items', 'is_multi_item']
+  };
+
+  const prompt = `You are an AI assistant parsing Thai product orders.
+
+Available Products:
+${productList}
+
+Customer Input:
+"${text}"
+
+${customerName ? `Detected Customer: "${customerName}"` : ''}
+
+Task:
+1. Identify customer name
+2. Extract all products and quantities
+3. Match products to inventory list (use closest match)
+
+Rules:
+- Use exact product names from inventory
+- If quantity not specified, use 1
+- If customer not found, use "Customer"
+
+Example:
+Input: "Somchai order ice 2 bags, beer 5 cans"
+Output: {
+  "customer": "Somchai",
+  "items": [
+    {"product_name": "ice", "quantity": 2},
+    {"product_name": "beer", "quantity": 5}
+  ],
+  "is_multi_item": true
+}
+
+Return valid JSON that can be immediately processed.`;
+
   try {
-    Logger.info('🔍 Starting Gemini parse with customer context');
-
-    // Step 1: Extract customer using RAG
-    const customerResults = customerVectorStore.search(userInput, 3);
-    let detectedCustomer = null;
-    
-    if (customerResults.length > 0 && customerResults[0].similarity > 0.5) {
-      detectedCustomer = customerResults[0].metadata.name;
-      Logger.success(`✅ Customer detected: ${detectedCustomer} (${(customerResults[0].similarity * 100).toFixed(1)}%)`);
-    }
-
-    // Step 2: Get relevant products using RAG
-    const productQuery = detectedCustomer 
-      ? userInput.replace(new RegExp(detectedCustomer, 'gi'), '').trim()
-      : userInput;
-    
-    const ragResults = stockVectorStore.search(productQuery, 10);
-    
-    const relevantStock = ragResults.length > 0 && ragResults[0].similarity > 0.3
-      ? ragResults.map(r => stockCache[r.metadata.index])
-      : stockCache.slice(0, 20);
-    
-    Logger.info(`📦 Using ${relevantStock.length} products for context`);
-    
-    // Step 3: Build stock catalog
-    const stockCatalog = relevantStock.map((item, idx) => {
-      return `[${idx}] ${item.item} | ${item.price}฿/${item.unit} | สต็อก: ${item.stock}`;
-    }).join('\n');
-
-    // Step 4: Build customer context
-    let customerContext = '';
-    if (detectedCustomer) {
-      customerContext = `\n\n✅ ลูกค้าที่ตรวจพบ: "${detectedCustomer}"`;
-    } else if (customerResults.length > 0) {
-      const suggestions = customerResults.slice(0, 3).map(c => c.metadata.name).join(', ');
-      customerContext = `\n\n💡 ลูกค้าที่คล้ายกัน: ${suggestions}`;
-    }
-
-    // Step 5: Multi-item detection prompt
-    const detectionPrompt = `คุณคือ AI ตรวจจับคำสั่งซื้อที่อาจมีหลายรายการ
-
-🔍 คำสั่ง: "${userInput}"
-
-ตรวจสอบว่ามี:
-1. หลายสินค้า (เช่น "น้ำแข็ง 2 ถุง กับเบียร์ 5 กระป๋อง")
-2. คำว่า "กับ", "และ", "แล้วก็", "อีก", "เพิ่ม"
-
-ตอบเป็น JSON:
-{
-  "isMultiItem": true/false,
-  "itemCount": จำนวนสินค้า,
-  "splitSuggestion": ["รายการ 1", "รายการ 2", ...]
-}`;
-
-    const detectionSchema = {
-      type: 'object',
-      properties: {
-        isMultiItem: { type: 'boolean' },
-        itemCount: { type: 'integer' },
-        splitSuggestion: { type: 'array', items: { type: 'string' } }
-      },
-      required: ['isMultiItem', 'itemCount']
-    };
-
-    let detection;
-    try {
-      detection = await generateWithGemini(detectionPrompt, detectionSchema, 0.1);
-    } catch (detectionError) {
-      Logger.warn('⚠️ Multi-item detection failed, assuming single item');
-      detection = { isMultiItem: false, itemCount: 1 };
-    }
-
-    Logger.info(`🔎 Detection: Multi-item=${detection.isMultiItem}, Count=${detection.itemCount}`);
-
-    // CRITICAL FIX: Pass FULL stockCache to multi-item parser, not filtered relevantStock
-    if (detection.isMultiItem && detection.itemCount > 1) {
-      return await parseMultiItemOrder(
-        userInput, 
-        stockCache,  // ✅ FULL CACHE
-        detection, 
-        detectedCustomer
-      );
-    }
-
-    // Single item parsing
-    const schema = {
-      type: 'object',
-      properties: {
-        action: { 
-          type: 'string', 
-          enum: ['order', 'add_stock', 'unclear']
-        },
-        matched_stock_index: { type: 'integer' },
-        quantity: { type: 'integer' },
-        customer: { type: 'string' },
-        deliveryPerson: { type: 'string' },
-        paymentStatus: { 
-          type: 'string',
-          enum: ['cash', 'credit', 'unpaid']
-        },
-        confidence: { 
-          type: 'string', 
-          enum: ['high', 'medium', 'low']
-        },
-        reasoning: { type: 'string' }
-      },
-      required: ['action', 'matched_stock_index', 'quantity', 'customer', 'confidence', 'reasoning']
-    };
-
-    const prompt = `คุณคือ AI ผู้เชี่ยวชาจากระบบคำสั่งซื้อร้านน้ำแข็ง
-
-📋 รายการสินค้า (index: 0-${relevantStock.length - 1}):
-${stockCatalog}${customerContext}
-
-🎯 คำสั่งจากลูกค้า: "${userInput}"
-
-⚠️ กฎสำคัญ:
-1. จำนวน vs ราคา: "น้ำแข็ง 45" = ราคา 45฿, "น้ำแข็ง 2 ถุง" = จำนวน 2
-2. ชื่อลูกค้า: หาคำนำหน้า พี่/น้อง/คุณ
-3. matched_stock_index ต้องอยู่ใน 0-${relevantStock.length - 1}
-4. การชำระ: หาคำว่า "เครดิต" = credit, "จ่ายแล้ว" = cash, ไม่มี = unpaid
-5. ผู้ส่ง: หา "ส่ง[ชื่อ]" หรือ "โดย[ชื่อ]"
-
-ตอบเป็น JSON`;
-
     const result = await generateWithGemini(prompt, schema, 0.1);
-
-    // Validate index
-    const localIndex = result.matched_stock_index;
-    if (localIndex < 0 || localIndex >= relevantStock.length) {
-      Logger.error(`❌ Invalid index: ${localIndex} (valid: 0-${relevantStock.length - 1})`);
-      throw new Error('INVALID_INDEX');
-    }
-
-    const matchedItem = relevantStock[localIndex];
-    const finalCustomer = detectedCustomer || result.customer || 'ไม่ระบุ';
-
-    Logger.success(`✅ Parsed: ${finalCustomer} | ${matchedItem.item} x${result.quantity}`);
-
+    
+    Logger.info(`Gemini identified: ${result.items.length} items`);
+    
     return {
       success: true,
-      action: result.action || 'order',
-      stockItem: matchedItem,
-      matchedName: matchedItem.item,
-      quantity: result.quantity || 1,
-      customer: finalCustomer,
-      deliveryPerson: result.deliveryPerson || '',
-      paymentStatus: result.paymentStatus || 'unpaid',
-      confidence: result.confidence || 'medium',
-      reasoning: result.reasoning || '',
-      warning: result.confidence === 'low' ? '⚠️ ระบบไม่แน่ใจ กรุณาตรวจสอบ' : null,
-      usedAI: true
+      customer: result.customer || customerName || 'Customer',
+      rawItems: result.items,
+      isMultiItem: result.is_multi_item
     };
-
+    
   } catch (error) {
-    Logger.error('❌ Gemini parsing error', error);
+    Logger.error('Gemini parsing failed', error);
     throw new Error('GEMINI_PARSE_FAILED');
   }
 }
 
 // ============================================================================
-// MULTI-ITEM ORDER PARSER - COMPLETELY REWRITTEN (FIXED)
+// MULTI-ITEM ORDER PROCESSOR
 // ============================================================================
 
-async function parseMultiItemOrder(userInput, stockCache, detection, detectedCustomer) {
-  Logger.info(`🔄 Parsing ${detection.itemCount} items with FULL stock cache (${stockCache.length} items)...`);
-  
-  const items = [];
-  let deliveryPerson = '';
-  let paymentStatus = 'unpaid';
-  
-  // Extract global info
-  if (userInput.toLowerCase().includes('เครดิต')) paymentStatus = 'credit';
-  if (userInput.toLowerCase().includes('จ่ายแล้ว')) paymentStatus = 'cash';
-  
-  const deliveryMatch = userInput.match(/(?:ส่ง|โดย)\s*([ก-๙a-zA-Z]+)/);
-  if (deliveryMatch) deliveryPerson = deliveryMatch[1];
-  
-  // Parse each item using FULL stock cache
-  for (const itemText of detection.splitSuggestion || []) {
-    try {
-      Logger.info(`🔍 Parsing sub-item: "${itemText}"`);
-      
-      // ✅ CRITICAL FIX: Pass FULL stockCache
-      const itemResult = enhancedFallbackParser(itemText, stockCache);
-      
-      if (itemResult.success && itemResult.stockItem) {
-        items.push({
-          stockItem: itemResult.stockItem,
-          quantity: itemResult.quantity
-        });
-        Logger.success(`✅ Parsed: ${itemResult.stockItem.item} x${itemResult.quantity}`);
-      } else {
-        Logger.warn(`⚠️ Failed to parse: "${itemText}" - ${itemResult.error || 'No match'}`);
-      }
-    } catch (itemError) {
-      Logger.warn(`⚠️ Exception parsing: ${itemText}`, itemError);
+async function processMultiItemOrder(rawItems, customerName, stockCache) {
+  Logger.info(`Processing ${rawItems.length} items...`);
+
+  const parsedItems = [];
+  const failures = [];
+
+  for (const rawItem of rawItems) {
+    const productName = rawItem.product_name;
+    const quantity = parseFloat(rawItem.quantity) || 1;
+
+    Logger.info(`Item: "${productName}" x${quantity}`);
+
+    // Find matching product
+    const matchResult = findBestMatch(productName, stockCache, CONFIDENCE.LOW);
+
+    if (!matchResult) {
+      failures.push({
+        input: productName,
+        reason: 'Product not found in inventory'
+      });
+      Logger.warn(`No match for: "${productName}"`);
+      continue;
     }
+
+    // Validate confidence
+    if (matchResult.confidence < CONFIDENCE.LOW) {
+      failures.push({
+        input: productName,
+        matched: matchResult.product.item,
+        confidence: matchResult.confidence,
+        reason: 'Confidence too low'
+      });
+      Logger.warn(`Low confidence: ${matchResult.confidence.toFixed(2)}`);
+      continue;
+    }
+
+    // Validate quantity
+    if (quantity <= 0 || quantity > 10000) {
+      failures.push({
+        input: productName,
+        reason: `Invalid quantity: ${quantity}`
+      });
+      Logger.warn(`Invalid quantity: ${quantity}`);
+      continue;
+    }
+
+    // SUCCESS: Add to parsed items
+    parsedItems.push({
+      stockItem: matchResult.product, // CRITICAL: This is the contract
+      quantity: quantity,
+      confidence: matchResult.confidence,
+      matchMethod: matchResult.method
+    });
+
+    Logger.success(`Added: ${matchResult.product.item} x${quantity}`);
   }
-  
-  // If no items were parsed successfully, throw error
-  if (items.length === 0) {
-    Logger.error('❌ No items successfully parsed from multi-item order');
-    throw new Error('MULTI_ITEM_PARSE_FAILED');
+
+  // ========================================================================
+  // VALIDATION: Did we parse at least ONE item?
+  // ========================================================================
+  if (parsedItems.length === 0) {
+    Logger.error('No items successfully parsed');
+    
+    let errorMsg = 'Cannot parse any products\n\n';
+    
+    if (failures.length > 0) {
+      errorMsg += 'Products not found:\n';
+      failures.forEach(f => {
+        errorMsg += `- "${f.input}": ${f.reason}\n`;
+      });
+      errorMsg += '\nPlease check product names against inventory';
+    }
+    
+    throw new Error(errorMsg);
   }
-  
-  Logger.success(`✅ Parsed ${items.length}/${detection.itemCount} items successfully`);
-  
+
+  // ========================================================================
+  // SUCCESS: Return standardized structure
+  // ========================================================================
+  Logger.success(`Parsed ${parsedItems.length}/${rawItems.length} items successfully`);
+
   return {
     success: true,
-    action: 'order',
-    items: items,
-    customer: detectedCustomer || 'ไม่ระบุ',
-    deliveryPerson: deliveryPerson,
-    paymentStatus: paymentStatus,
-    confidence: items.length === detection.itemCount ? 'high' : 'medium',
-    reasoning: `Multi-item order: ${items.length} items parsed`,
-    warning: items.length < detection.itemCount 
-      ? `⚠️ ระบุ ${detection.itemCount} รายการ แต่แปลงได้ ${items.length} รายการ` 
-      : null,
-    usedAI: true,
-    isMultiItem: true
+    customer: customerName,
+    items: parsedItems, // Array of { stockItem, quantity, confidence, matchMethod }
+    failedItems: failures,
+    totalItems: parsedItems.length
   };
 }
 
 // ============================================================================
-// ENHANCED FALLBACK PARSER - FOR SUB-ITEMS (FIXED)
+// MAIN ENTRY POINT: PARSE ORDER
 // ============================================================================
 
-function enhancedFallbackParser(text, stockCache) {
-  Logger.info(`🔍 Enhanced fallback for: "${text}" (searching ${stockCache.length} items)`);
-  
-  // Extract quantity first
-  const { quantity, matched: quantityStr } = extractQuantity(text);
-  
-  // Clean text for product search
-  const searchText = text
-    .toLowerCase()
-    .replace(quantityStr, '')
-    .replace(/สั่ง|ซื้อ|เอา|ขอ|ส่ง|โดย|ให้|พี่|น้อง|คุณ/gi, '')
-    .trim();
-  
-  Logger.info(`🔎 Searching for: "${searchText}" (qty: ${quantity})`);
-  
-  // Try multiple search strategies
-  const strategies = [
-    // Strategy 1: Exact match (normalized)
-    () => {
-      const normalized = normalizeText(searchText);
-      const found = stockCache.find(item => 
-        normalizeText(item.item) === normalized
-      );
-      if (found) Logger.info(`✅ Strategy 1 (exact): ${found.item}`);
-      return found;
-    },
+async function parseOrder(text, customerContext = null) {
+  try {
+    Logger.info('Starting order parse...');
+    Logger.info(`Input: "${text}"`);
+
+    const stockCache = getStockCache();
     
-    // Strategy 2: Contains match (bidirectional)
-    () => {
-      const normalized = normalizeText(searchText);
-      const found = stockCache.find(item => {
-        const itemNorm = normalizeText(item.item);
-        return itemNorm.includes(normalized) || normalized.includes(itemNorm);
-      });
-      if (found) Logger.info(`✅ Strategy 2 (contains): ${found.item}`);
-      return found;
-    },
+    if (stockCache.length === 0) {
+      throw new Error('STOCK_CACHE_EMPTY: Please refresh cache');
+    }
+
+    // Extract customer name from context or text
+    let customerName = customerContext?.name || null;
     
-    // Strategy 3: Word-level match
-    () => {
-      const words = searchText.split(/\s+/).filter(w => w.length >= 2);
-      for (const word of words) {
-        const found = stockCache.find(item => 
-          normalizeText(item.item).includes(normalizeText(word))
-        );
-        if (found) {
-          Logger.info(`✅ Strategy 3 (word "${word}"): ${found.item}`);
-          return found;
-        }
+    if (!customerName) {
+      // Try to extract customer name from Thai text patterns
+      const customerMatch = text.match(/^([\u0E00-\u0E7Fa-zA-Z\s]+?)(?:\s+\u0E2A\u0E31\u0E48\u0E07|\s+\u0E0B\u0E37\u0E49\u0E2D|\s+\u0E40\u0E2D\u0E32)/);
+      if (customerMatch) {
+        customerName = customerMatch[1].trim();
+        Logger.info(`Customer detected: "${customerName}"`);
       }
-      return null;
-    },
+    }
+
+    customerName = customerName || 'Customer';
+
+    // ========================================================================
+    // DECISION: Use Gemini or Fallback?
+    // ========================================================================
     
-    // Strategy 4: Vector search (if available)
-    () => {
+    let geminiResult = null;
+    
+    if (isGeminiAvailable()) {
       try {
-        const ragResults = stockVectorStore.search(searchText, 1);
-        if (ragResults.length > 0 && ragResults[0].similarity > 0.4) {
-          const index = ragResults[0].metadata.index;
-          const found = stockCache[index];
-          Logger.info(`✅ Strategy 4 (RAG ${(ragResults[0].similarity * 100).toFixed(1)}%): ${found.item}`);
-          return found;
-        }
-      } catch (e) {
-        Logger.warn('RAG search failed:', e.message);
+        geminiResult = await parseWithGemini(text, customerName);
+        Logger.success('Gemini parsing successful');
+      } catch (geminiError) {
+        Logger.warn('Gemini failed, using fallback', geminiError.message);
       }
-      return null;
-    },
+    } else {
+      Logger.info('Gemini unavailable, using direct fallback');
+    }
+
+    // ========================================================================
+    // PROCESS ITEMS (Gemini or Manual Extraction)
+    // ========================================================================
     
-    // Strategy 5: Fuzzy match with similarity threshold
-    () => {
-      let bestMatch = null;
-      let bestScore = 0;
+    let rawItems = [];
+    
+    if (geminiResult && geminiResult.rawItems) {
+      rawItems = geminiResult.rawItems;
+      customerName = geminiResult.customer;
+    } else {
+      // Manual extraction fallback
+      Logger.info('Manual item extraction...');
       
-      for (const item of stockCache) {
-        const score = similarity(normalizeText(searchText), normalizeText(item.item));
-        if (score > bestScore && score > 0.6) {
-          bestScore = score;
-          bestMatch = item;
+      // Remove customer name from text (Thai pattern)
+      let cleanText = text.replace(/^[\u0E00-\u0E7Fa-zA-Z\s]+?(?:\u0E2A\u0E31\u0E48\u0E07|\u0E0B\u0E37\u0E49\u0E2D|\u0E40\u0E2D\u0E32)\s*/, '');
+      
+      // Check if multi-item (comma-separated)
+      const isMultiItem = /[,،]/.test(cleanText);
+      
+      if (isMultiItem) {
+        const segments = cleanText.split(/[,،]/).map(s => s.trim()).filter(Boolean);
+        
+        for (const segment of segments) {
+          const qtyMatch = segment.match(/(\d+(?:\.\d+)?)/);
+          const quantity = qtyMatch ? parseFloat(qtyMatch[1]) : 1;
+          const productName = segment
+            .replace(/\d+(?:\.\d+)?/g, '')
+            .replace(/\u0E16\u0E38\u0E07|\u0E25\u0E31\u0E07|\u0E02\u0E27\u0E14|\u0E01\u0E25\u0E48\u0E2D\u0E07|\u0E41\u0E1E\u0E47\u0E04/g, '')
+            .trim();
+          
+          rawItems.push({ product_name: productName, quantity });
         }
+      } else {
+        // Single item
+        const qtyMatch = cleanText.match(/(\d+(?:\.\d+)?)/);
+        const quantity = qtyMatch ? parseFloat(qtyMatch[1]) : 1;
+        const productName = cleanText
+          .replace(/\d+(?:\.\d+)?/g, '')
+          .replace(/\u0E16\u0E38\u0E07|\u0E25\u0E31\u0E07|\u0E02\u0E27\u0E14|\u0E01\u0E25\u0E48\u0E2D\u0E07|\u0E41\u0E1E\u0E47\u0E04/g, '')
+          .trim();
+        
+        rawItems.push({ product_name: productName, quantity });
       }
-      
-      if (bestMatch) {
-        Logger.info(`✅ Strategy 5 (fuzzy ${(bestScore * 100).toFixed(1)}%): ${bestMatch.item}`);
-      }
-      return bestMatch;
     }
-  ];
-  
-  // Try each strategy until one succeeds
-  for (let i = 0; i < strategies.length; i++) {
-    try {
-      const match = strategies[i]();
-      if (match) {
-        return {
-          success: true,
-          stockItem: match,
-          quantity: quantity,
-          confidence: i === 0 ? 'high' : i <= 2 ? 'medium' : 'low',
-          usedAI: false
-        };
-      }
-    } catch (strategyError) {
-      Logger.warn(`Strategy ${i + 1} failed:`, strategyError.message);
+
+    Logger.info(`Found ${rawItems.length} raw items to process`);
+
+    // ========================================================================
+    // PROCESS & VALIDATE ALL ITEMS
+    // ========================================================================
+    
+    const result = await processMultiItemOrder(rawItems, customerName, stockCache);
+    
+    // Build warning message if needed
+    let warning = null;
+    
+    if (result.failedItems && result.failedItems.length > 0) {
+      warning = `Warning: Could not parse some items (${result.failedItems.length}):\n`;
+      result.failedItems.slice(0, 3).forEach(f => {
+        warning += `- ${f.input}\n`;
+      });
     }
-  }
-  
-  Logger.error(`❌ No match found for: "${searchText}" after ${strategies.length} strategies`);
-  
-  return {
-    success: false,
-    error: `ไม่พบสินค้า: "${searchText}"`
-  };
-}
 
-// ============================================================================
-// ORIGINAL FALLBACK PARSER WITH RAG
-// ============================================================================
+    return {
+      success: true,
+      customer: result.customer,
+      items: result.items, // CRITICAL: Array of { stockItem, quantity }
+      warning
+    };
 
-function fallbackParserWithRAG(text, stockCache) {
-  PerformanceMonitor.start('fallbackParserWithRAG');
-  Logger.info('📊 Using RAG fallback parser');
-  
-  // Extract customer
-  let customer = 'ไม่ระบุ';
-  const customerResults = customerVectorStore.search(text, 1);
-  if (customerResults.length > 0 && customerResults[0].similarity > 0.5) {
-    customer = customerResults[0].metadata.name;
-  }
-  
-  // Extract quantity
-  const { quantity, matched: quantityStr } = extractQuantity(text);
-  
-  // Clean text
-  const searchText = text
-    .toLowerCase()
-    .replace(new RegExp(customer, 'gi'), '')
-    .replace(quantityStr, '')
-    .replace(/สั่ง|ซื้อ|เอา|ขอ|ส่ง|โดย|ให้|พี่|น้อง|คุณ/gi, '')
-    .trim();
-  
-  // Search products
-  const ragResults = stockVectorStore.search(searchText, 5);
-  
-  if (ragResults.length === 0) {
-    PerformanceMonitor.end('fallbackParserWithRAG');
+  } catch (error) {
+    Logger.error('Parse order failed', error);
+    
+    // User-friendly error
+    if (error.message.includes('STOCK_CACHE_EMPTY')) {
+      return {
+        success: false,
+        error: 'System not loaded properly. Please type "refresh"'
+      };
+    }
+    
+    if (error.message.startsWith('Cannot parse')) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+    
     return {
       success: false,
-      error: '❌ ไม่พบสินค้า กรุณาระบุชื่อสินค้าที่ชัดเจน'
+      error: 'Cannot parse order. Please try again or contact admin.'
     };
   }
-
-  const bestMatch = ragResults[0];
-  const bestItem = stockCache[bestMatch.metadata.index];
-  const bestScore = bestMatch.similarity * 100;
-
-  Logger.info(`📦 Best match: ${bestItem.item} (${bestScore.toFixed(1)}%)`);
-
-  PerformanceMonitor.end('fallbackParserWithRAG');
-
-  return {
-    success: true,
-    action: 'order',
-    stockItem: bestItem,
-    matchedName: bestItem.item,
-    quantity,
-    customer,
-    deliveryPerson: '',
-    paymentStatus: 'unpaid',
-    confidence: bestScore > 70 ? 'high' : bestScore > 50 ? 'medium' : 'low',
-    reasoning: `RAG fallback (${bestScore.toFixed(1)}%)`,
-    warning: bestScore < 60 ? '⚠️ ระบบไม่แน่ใจ กรุณาตรวจสอบ' : null,
-    usedAI: false
-  };
-}
-
-// ============================================================================
-// HELPER: EXTRACT QUANTITY
-// ============================================================================
-
-function extractQuantity(text) {
-  const thaiNumbers = {
-    'หนึ่ง': 1, 'นึ่ง': 1, 'สอง': 2, 'สาม': 3, 'สี่': 4, 
-    'ห้า': 5, 'หก': 6, 'เจ็ด': 7, 'แปด': 8, 'เก้า': 9, 'สิบ': 10
-  };
-  
-  // Try digit with unit
-  const digitMatch = text.match(/(\d+)\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|อัน|กล่อง|กระป๋อง|ลัง)/i);
-  if (digitMatch) {
-    return { quantity: parseInt(digitMatch[1]), matched: digitMatch[0] };
-  }
-  
-  // Try Thai numbers
-  for (const [thai, num] of Object.entries(thaiNumbers)) {
-    const pattern = new RegExp(`(${thai})\\s*(?:ถุง|กระสอบ|แพ็ค|ขวด|ลัง)`, 'i');
-    const match = text.match(pattern);
-    if (match) {
-      return { quantity: num, matched: match[0] };
-    }
-  }
-  
-  return { quantity: 1, matched: '' };
 }
 
 // ============================================================================
@@ -498,5 +483,9 @@ function extractQuantity(text) {
 // ============================================================================
 
 module.exports = {
-  parseOrder
+  parseOrder,
+  findBestMatch,
+  parseWithGemini,
+  processMultiItemOrder,
+  CONFIDENCE
 };
