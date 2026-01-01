@@ -1,25 +1,23 @@
 const express = require('express');
+const crypto = require('crypto');
 
-// ⚠️  CRITICAL: Validate config BEFORE importing any other modules
 const { CONFIG, validateConfig, configManager } = require('./config');
 const { Logger } = require('./logger');
 
-// Validate config IMMEDIATELY
 try {
   validateConfig(); 
   Logger.success('✅ Configuration validated');
 } catch (e) {
   Logger.error('❌ Config Validation Failed', e);
-  console.error('\n🔴 CRITICAL ERROR: Invalid configuration');
   process.exit(1);
 }
 
-// NOW safe to import modules
 const { initializeGoogleServices } = require('./googleServices');
 const { initializeAIServices, generateWithGemini, isGeminiAvailable } = require('./aiServices');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { getThaiDateTimeString, getThaiDateString } = require('./utils');
 const { parseOrder } = require('./orderParser');
+const { scheduleDailyDashboard } = require('./dashboardService');
 const { 
   createOrder, 
   getOrders, 
@@ -33,6 +31,27 @@ const { AccessControl, PERMISSIONS } = require('./accessControl');
 
 const app = express();
 app.use(express.json());
+
+// ============================================================================
+// 🔒 WEBHOOK SECURITY: Signature Verification
+// ============================================================================
+
+function validateLineSignature(body, signature) {
+  if (!signature) return false;
+  
+  const secret = configManager.get('LINE_SECRET');
+  if (!secret) return false;
+
+  const hash = crypto.createHmac('sha256', secret)
+    .update(JSON.stringify(body))
+    .digest('base64');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(hash));
+  } catch {
+    return false;
+  }
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -56,6 +75,13 @@ async function initializeApp() {
     
     Logger.info('Loading customer cache...');
     await loadCustomerCache(true);
+    
+    Logger.info('Starting cleanup scheduler...');
+    scheduleCleanup();
+    
+    // ✅ FIX 5: START DASHBOARD SCHEDULER
+    Logger.info('Starting dashboard scheduler...');
+    scheduleDailyDashboard();
     
     const admins = configManager.get('ADMIN_USER_IDS', []);
     if (admins.length > 0) {
@@ -92,17 +118,9 @@ async function initializeSheets() {
   }
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
 async function notifyAdmin(message) {
   const admins = configManager.get('ADMIN_USER_IDS', []);
-  
-  if (admins.length === 0) {
-    Logger.warn('No admin users configured - cannot send notification');
-    return;
-  }
+  if (admins.length === 0) return;
 
   try {
     for (const adminId of admins) {
@@ -151,11 +169,7 @@ async function replyToLine(replyToken, text) {
 
 async function pushLowStockAlert(itemName, currentStock, unit) {
   const admins = configManager.get('ADMIN_USER_IDS', []);
-  
-  if (admins.length === 0) {
-    Logger.warn('No admin users configured, skipping low stock alert');
-    return;
-  }
+  if (admins.length === 0) return;
 
   try {
     const stockCache = require('./cacheManager').getStockCache();
@@ -166,12 +180,9 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
     
     if (allLowStock.length > 1) {
       message += `⚠️ สินค้าอื่นที่เหลือน้อย (${allLowStock.length - 1}):\n`;
-      allLowStock
-        .filter(item => item.item !== itemName)
-        .slice(0, 5)
-        .forEach(item => {
-          message += `• ${item.item}: ${item.stock} ${item.unit}\n`;
-        });
+      allLowStock.filter(item => item.item !== itemName).slice(0, 5).forEach(item => {
+        message += `• ${item.item}: ${item.stock} ${item.unit}\n`;
+      });
     }
     
     message += `\n💡 กรุณาเติมสต็อกโดยเร็ว`;
@@ -180,96 +191,11 @@ async function pushLowStockAlert(itemName, currentStock, unit) {
       await pushToLine(adminId, message);
     }
     
-    Logger.success('Low stock alert sent to admins');
+    Logger.success('Low stock alert sent');
   } catch (error) {
     Logger.error('Failed to send low stock alert', error);
   }
 }
-
-// ============================================================================
-// SMART COMMAND DETECTION
-// ============================================================================
-
-async function detectAndExecuteCommand(text, userId) {
-  const isAdmin = AccessControl.isAdmin(userId);
-  
-  // Simple keyword detection for common commands
-  const lower = text.toLowerCase().replace(/\s+/g, '');
-  
-  // Check simple commands first
-  const simpleCommands = {
-    'รีเฟรsh': 'refresh',
-    'refresh': 'refresh',
-    'โหลดใหม่': 'refresh',
-    'คำสั่งซื้อ': 'orders',
-    'orders': 'orders',
-    'ค้างชำระ': 'pending',
-    'pending': 'pending',
-    'dashboard': 'dashboard',
-    'สรุป': 'dashboard',
-    'help': 'help',
-    'ช่วยเหลือ': 'help'
-  };
-  
-  if (simpleCommands[lower]) {
-    return { isCommand: true, command: simpleCommands[lower] };
-  }
-  
-  // Payment status update patterns
-  if (lower.includes('จ่ายแล้ว') && /\d+/.test(text)) {
-    return { isCommand: true, command: 'mark_paid' };
-  }
-  
-  if (lower.includes('เครดิต') && /\d+/.test(text) && !lower.includes('สั่ง')) {
-    return { isCommand: true, command: 'mark_credit' };
-  }
-  
-  if ((lower.includes('ส่งแล้ว') || lower.includes('ส่งเสร็จ')) && /\d+/.test(text)) {
-    return { isCommand: true, command: 'mark_delivered' };
-  }
-  
-  // If Gemini is available, use AI for complex detection
-  if (isGeminiAvailable()) {
-    try {
-      Logger.info('🤖 AI detecting command...');
-      
-      const schema = {
-        type: 'object',
-        properties: {
-          isCommand: { type: 'boolean' },
-          commandType: { 
-            type: 'string',
-            enum: ['order', 'query', 'update', 'system']
-          },
-          confidence: { type: 'number' }
-        },
-        required: ['isCommand', 'commandType', 'confidence']
-      };
-      
-      const prompt = `Analyze this Thai text and determine if it's a command or order:
-"${text}"
-
-Return JSON with:
-- isCommand: true if it's a system command (not an order)
-- commandType: order/query/update/system
-- confidence: 0-1`;
-      
-      const result = await generateWithGemini(prompt, schema, 0.1);
-      
-      if (result.isCommand && result.confidence > 0.7) {
-        return { isCommand: true, command: 'ai_detected', aiResult: result };
-      }
-    } catch (error) {
-      Logger.warn('AI command detection failed, using fallback', error);
-    }
-  }
-  
-  return { isCommand: false };
-}
-
-// ============================================================================
-// MAIN MESSAGE HANDLER
-// ============================================================================
 
 async function handleTextMessage(text, userId) {
   if (!userId) {
@@ -279,11 +205,8 @@ async function handleTextMessage(text, userId) {
 
   const lower = text.toLowerCase().replace(/\s+/g, '');
   const isAdmin = AccessControl.isAdmin(userId);
+  const commandCheck = await detectAndExecuteCommand(text, userId);
 
-  // ============================================================================
-  // SYSTEM COMMANDS
-  // ============================================================================
-  
   if (lower === 'ข้อมูลของฉัน' || lower === 'whoami') {
     return AccessControl.getUserInfoText(userId);
   }
@@ -314,8 +237,7 @@ async function handleTextMessage(text, userId) {
     pending.orders.forEach(order => {
       const statusIcon = order.paymentStatus === 'เครดิต' ? '📖' : '⏳';
       message += `${statusIcon} #${order.orderNo} - ${order.customer}\n`;
-      message += `   ${order.item} x${order.qty}\n`;
-      message += `   ${order.total.toLocaleString()}฿ | ${order.paymentStatus}\n\n`;
+      message += `   ${order.totalAmount.toLocaleString()}฿ | ${order.paymentStatus}\n\n`;
     });
     
     message += `${'='.repeat(30)}\n💵 รวม: ${pending.totalAmount.toLocaleString()}฿`;
@@ -339,9 +261,8 @@ async function handleTextMessage(text, userId) {
     
     orders.forEach(order => {
       message += `#${order.orderNo} - ${order.customer}\n`;
-      message += `📦 ${order.item} x${order.qty}\n`;
-      message += `💰 ${order.total.toLocaleString()}฿\n\n`;
-      totalSales += order.total;
+      message += `💰 ${order.totalAmount.toLocaleString()}฿\n\n`;
+      totalSales += order.totalAmount;
     });
     
     message += `${'='.repeat(30)}\n💵 ยอดรวม: ${totalSales.toLocaleString()}฿`;
@@ -356,7 +277,6 @@ async function handleTextMessage(text, userId) {
     return await generateDashboard();
   }
 
-  // Payment updates
   if (lower.includes('จ่ายแล้ว') && /\d+/.test(text)) {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.UPDATE_PAYMENT)) {
       return AccessControl.getAccessDeniedMessage(PERMISSIONS.UPDATE_PAYMENT);
@@ -370,7 +290,7 @@ async function handleTextMessage(text, userId) {
     return `✅ อัปเดตการชำระเงินสำเร็จ!\n\n` +
       `📋 #${result.orderNo}\n` +
       `👤 ${result.customer}\n` +
-      `💰 ${result.total}฿\n` +
+      `💰 ${result.totalAmount}฿\n` +
       `🔄 ${result.oldStatus} → ${result.newStatus}`;
   }
   
@@ -387,7 +307,7 @@ async function handleTextMessage(text, userId) {
     return `📖 เปลี่ยนเป็นเครดิตแล้ว!\n\n` +
       `📋 #${result.orderNo}\n` +
       `👤 ${result.customer}\n` +
-      `💰 ${result.total}฿`;
+      `💰 ${result.totalAmount}฿`;
   }
 
   if ((lower.includes('ส่งแล้ว') || lower.includes('ส่งเสร็จ')) && /\d+/.test(text)) {
@@ -410,25 +330,18 @@ async function handleTextMessage(text, userId) {
     return getHelpMessage(isAdmin);
   }
 
-  // ============================================================================
-  // ORDER PROCESSING
-  // ============================================================================
-  
   if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
     return AccessControl.getAccessDeniedMessage(PERMISSIONS.PLACE_ORDER);
   }
 
   try {
     await loadStockCache();
-    
-    // Parse order
     const parsed = await parseOrder(text);
 
     if (!parsed.success) {
       return parsed.error + (parsed.warning ? '\n\n' + parsed.warning : '');
     }
 
-    // Handle add stock
     if (parsed.action === 'add_stock') {
       if (!AccessControl.canPerformAction(userId, PERMISSIONS.ADD_STOCK)) {
         return AccessControl.getAccessDeniedMessage(PERMISSIONS.ADD_STOCK);
@@ -449,26 +362,19 @@ async function handleTextMessage(text, userId) {
              `📊 สต็อกใหม่: ${newStock} ${parsed.stockItem.unit}`;
     }
 
-    // ============================================================================
-    // NORMALIZE TO MULTI-ITEM FORMAT
-    // ============================================================================
-    
-    // If parser returned single item, convert to array
     let items = [];
     if (parsed.items && Array.isArray(parsed.items)) {
-      items = parsed.items; // Already multi-item
+      items = parsed.items;
     } else if (parsed.stockItem) {
-      items = [{ stockItem: parsed.stockItem, quantity: parsed.quantity }]; // Single item
+      items = [{ stockItem: parsed.stockItem, quantity: parsed.quantity }];
     } else {
-      throw new Error('INVALID_PARSE_RESULT: No items found');
+      throw new Error('INVALID_PARSE_RESULT');
     }
     
     Logger.info(`📦 Processing ${items.length} item(s) for ${parsed.customer}`);
     
-    const isCredit = (parsed.paymentStatus === 'credit') || 
-                     text.toLowerCase().includes('เครดิต');
+    const isCredit = (parsed.paymentStatus === 'credit') || text.toLowerCase().includes('เครดิต');
     
-    // Validate stock
     let hasStockError = false;
     let stockErrors = [];
 
@@ -503,7 +409,6 @@ async function handleTextMessage(text, userId) {
       return errorMsg;
     }
 
-    // Create orders
     const orderResults = [];
     let totalAmount = 0;
 
@@ -513,18 +418,14 @@ async function handleTextMessage(text, userId) {
 
       const result = await createOrder({
         customer: parsed.customer,
-        item: stockItem.item,
-        quantity: quantity,
+        items: [{ stockItem, quantity }],
         deliveryPerson: parsed.deliveryPerson || '',
-        isCredit: isCredit,
-        totalAmount: itemTotal
+        paymentStatus: isCredit ? 'credit' : 'unpaid'
       });
 
-      const newStock = stockItem.stock - quantity;
-      const stockUpdated = await updateStock(stockItem.item, stockItem.unit, newStock);
-      
-      if (!stockUpdated) {
-        await notifyAdmin(`❌ CRITICAL: Order #${result.orderNo} created but stock update FAILED!\nItem: ${stockItem.item}`);
+      if (!result.success) {
+        await notifyAdmin(`❌ Order creation failed: ${result.error}`);
+        return '❌ เกิดข้อผิดพลาด กรุณาลองใหม่';
       }
 
       orderResults.push({
@@ -534,7 +435,7 @@ async function handleTextMessage(text, userId) {
         unit: stockItem.unit,
         price: stockItem.price,
         total: itemTotal,
-        newStock: newStock
+        newStock: result.stockUpdates[0].newStock
       });
 
       Logger.success(`✅ Order #${result.orderNo}: ${stockItem.item} x${quantity}`);
@@ -542,7 +443,6 @@ async function handleTextMessage(text, userId) {
 
     await loadStockCache(true);
 
-    // Build response
     let response = isAdmin 
       ? `✅ บันทึกคำสั่งซื้อสำเร็จ! (${items.length} รายการ)\n`
       : `✅ รับคำสั่งซื้อเรียบร้อยค่ะ!\n`;
@@ -592,7 +492,6 @@ async function handleTextMessage(text, userId) {
       response += `\n\n${parsed.warning}`;
     }
 
-    // Notify admin
     await notifyAdminMultiItemOrder({
       customer: parsed.customer,
       items: orderResults,
@@ -602,7 +501,6 @@ async function handleTextMessage(text, userId) {
       userId: isAdmin ? `${userId.substring(0, 12)}... (ADMIN)` : userId.substring(0, 12) + '...'
     });
 
-    // Check low stock
     for (const order of orderResults) {
       if (order.newStock < CONFIG.LOW_STOCK_THRESHOLD) {
         await pushLowStockAlert(order.item, order.newStock, order.unit);
@@ -746,11 +644,10 @@ async function generateDashboard() {
   let creditAmount = 0;
   
   orders.forEach(order => {
-    totalSales += order.total;
-    totalProfit += (order.total - order.cost);
+    totalSales += order.totalAmount;
     if (order.paymentStatus === 'ยังไม่จ่าย' || order.paymentStatus === 'เครดิต') {
       creditOrders++;
-      creditAmount += order.total;
+      creditAmount += order.totalAmount;
     }
   });
   
@@ -759,8 +656,7 @@ async function generateDashboard() {
   let message = `📊 Dashboard วันนี้\n${'='.repeat(30)}\n\n`;
   message += `📈 ยอดขาย\n`;
   message += `• คำสั่งซื้อ: ${orders.length} รายการ\n`;
-  message += `• ยอดขายรวม: ${totalSales.toLocaleString()}฿\n`;
-  message += `• กำไรรวม: ${totalProfit.toLocaleString()}฿\n\n`;
+  message += `• ยอดขายรวม: ${totalSales.toLocaleString()}฿\n\n`;
   message += `💳 เครดิต\n`;
   message += `• ค้างชำระ: ${creditOrders} รายการ\n`;
   message += `• ยอดเงิน: ${creditAmount.toLocaleString()}฿\n\n`;
@@ -779,11 +675,18 @@ async function generateDashboard() {
 }
 
 // ============================================================================
-// WEBHOOK
+// 🔒 WEBHOOK - WITH SIGNATURE VALIDATION
 // ============================================================================
 
 app.post('/webhook', async (req, res) => {
   try {
+    // 🔒 SECURITY: Validate LINE signature
+    const signature = req.headers['x-line-signature'];
+    if (!validateLineSignature(req.body, signature)) {
+      Logger.warn(`⚠️ Rejected unauthorized webhook from IP: ${req.ip}`);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
     res.status(200).send('OK');
     
     const events = req.body.events || [];
@@ -818,10 +721,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ============================================================================
-// HEALTH CHECK
-// ============================================================================
-
 app.get('/health', (req, res) => {
   const { stockVectorStore, customerVectorStore } = require('./vectorStore');
   const { getStockCache, getCustomerCache } = require('./cacheManager');
@@ -843,10 +742,6 @@ app.get('/health', (req, res) => {
     }
   });
 });
-
-// ============================================================================
-// START SERVER
-// ============================================================================
 
 const PORT = process.env.PORT || 3000;
 

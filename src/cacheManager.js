@@ -5,7 +5,6 @@ const { Logger, PerformanceMonitor } = require('./logger');
 const { normalizeText, generateSKU } = require('./utils');
 const { getSheetData, appendSheetData, batchUpdateSheet } = require('./googleServices');
 const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-const { SAMPLE_STOCK_DATA, SAMPLE_CUSTOMERS, ITEM_ALIASES } = require('./constants');
 
 // ============================================================================
 // CACHE STATE
@@ -35,13 +34,9 @@ async function loadStockCache(forceReload = false) {
 
     // Initialize sample data if empty
     if (rows.length <= 1) {
-      Logger.warn('No stock data found → generating sample items');
-      const sampleWithSKU = SAMPLE_STOCK_DATA.map(row => [
-        ...row,
-        generateSKU(row[0], row[3])
-      ]);
-      await appendSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G', sampleWithSKU);
-      rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
+      Logger.warn('⚠️ No stock data found');
+      stockCache = [];
+      return stockCache;
     }
 
     // Parse rows into structured data
@@ -165,13 +160,11 @@ async function loadCustomerCache(forceReload = false) {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'ลูกค้า!A:D');
     
     // Initialize sample data if empty
-    if (rows.length <= 1) {
-      Logger.info('No customers found, creating sample data...');
-      await appendSheetData(CONFIG.SHEET_ID, 'ลูกค้า!A:D', SAMPLE_CUSTOMERS);
-      const newRows = await getSheetData(CONFIG.SHEET_ID, 'ลูกค้า!A:D');
-      rows.push(...newRows);
+      if (rows.length <= 1) {
+      Logger.warn('⚠️ No customer data found');
+      customerCache = [];
+      return customerCache;
     }
-
     customerCache = rows.slice(1)
       .map(row => ({
         name: (row[0] || '').trim(),

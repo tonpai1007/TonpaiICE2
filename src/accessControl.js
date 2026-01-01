@@ -73,16 +73,23 @@ class UserStore {
   }
 
   initializeDefaultUsers() {
-    // Add admin from environment
-    if (CONFIG.ADMIN_USER_ID) {
-      this.users.set(CONFIG.ADMIN_USER_ID, {
-        userId: CONFIG.ADMIN_USER_ID,
+    // ✅ FIXED: Use ADMIN_USER_IDS array
+    const adminIds = CONFIG.ADMIN_USER_IDS || [];
+    
+    if (adminIds.length === 0) {
+      Logger.warn('⚠️ No admin users configured');
+      return;
+    }
+    
+    adminIds.forEach(adminId => {
+      this.users.set(adminId, {
+        userId: adminId,
         role: ROLES.ADMIN,
         name: 'Admin',
         createdAt: new Date().toISOString()
       });
-      Logger.success(`Admin user initialized: ${CONFIG.ADMIN_USER_ID}`);
-    }
+      Logger.success(`Admin user initialized: ${adminId}`);
+    });
   }
 
   addUser(userId, role = ROLES.USER, name = null) {
