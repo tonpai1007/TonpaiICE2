@@ -103,8 +103,7 @@ class ConfigManager {
       'SHEET_ID',
       'LINE_TOKEN',
       'LINE_SECRET',
-      'GEMINI_API_KEY',
-      'ASSEMBLYAI_API_KEY',
+      'GROQ_API_KEY',
       'GOOGLE_APPLICATION_CREDENTIALS_BASE64'
     ];
     

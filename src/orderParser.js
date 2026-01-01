@@ -100,7 +100,61 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
 // ============================================================================
 // TRANSACTIONAL ORDER CREATION
 // ============================================================================
+function findBestCustomer(searchTerm, customerCache) {
+  if (!searchTerm || !customerCache || customerCache.length === 0) {
+    return null;
+  }
 
+  const normalized = normalizeText(searchTerm);
+  Logger.info(`Searching customer: "${searchTerm}"`);
+
+  // PHASE 1: Exact match
+  for (const customer of customerCache) {
+    if (customer.normalized === normalized) {
+      Logger.success(`Exact customer match: "${customer.name}"`);
+      return { customer, confidence: 1.0, method: 'exact' };
+    }
+  }
+
+  // PHASE 2: Substring match
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const customer of customerCache) {
+    if (normalized.includes(customer.normalized)) {
+      const score = 0.9;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = customer;
+      }
+    }
+  }
+
+  // ✅ FIX 4: USE CUSTOMER VECTOR STORE
+  if (bestScore < 0.7) {
+    Logger.info('Using customer RAG vector search...');
+    const { customerVectorStore } = require('./vectorStore');
+    const ragResults = customerVectorStore.search(searchTerm, 3, 0.3);
+    
+    if (ragResults.length > 0) {
+      const topResult = ragResults[0];
+      const ragCustomer = customerCache[topResult.metadata.index];
+      
+      if (ragCustomer && topResult.similarity > bestScore) {
+        bestScore = topResult.similarity * 0.9;
+        bestMatch = ragCustomer;
+        Logger.success(`Customer found via RAG: "${ragCustomer.name}" (${(bestScore * 100).toFixed(1)}%)`);
+      }
+    }
+  }
+
+  if (!bestMatch || bestScore < 0.5) {
+    Logger.warn(`No customer match for "${searchTerm}"`);
+    return null;
+  }
+
+  return { customer: bestMatch, confidence: bestScore, method: 'fuzzy' };
+}
 async function createOrderTransaction(orderData) {
   const { customer, items, deliveryPerson = '', paymentStatus = 'unpaid' } = orderData;
   
