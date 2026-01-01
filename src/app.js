@@ -17,6 +17,7 @@ const { initializeAIServices, generateWithGemini, isGeminiAvailable } = require(
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { getThaiDateTimeString, getThaiDateString } = require('./utils');
 const { parseOrder } = require('./orderParser');
+const { scheduleDailyDashboard } = require('./dashboardService');
 const { 
   createOrder, 
   getOrders, 
@@ -74,6 +75,13 @@ async function initializeApp() {
     
     Logger.info('Loading customer cache...');
     await loadCustomerCache(true);
+    
+    Logger.info('Starting cleanup scheduler...');
+    scheduleCleanup();
+    
+    // ✅ FIX 5: START DASHBOARD SCHEDULER
+    Logger.info('Starting dashboard scheduler...');
+    scheduleDailyDashboard();
     
     const admins = configManager.get('ADMIN_USER_IDS', []);
     if (admins.length > 0) {
@@ -197,6 +205,7 @@ async function handleTextMessage(text, userId) {
 
   const lower = text.toLowerCase().replace(/\s+/g, '');
   const isAdmin = AccessControl.isAdmin(userId);
+  const commandCheck = await detectAndExecuteCommand(text, userId);
 
   if (lower === 'ข้อมูลของฉัน' || lower === 'whoami') {
     return AccessControl.getUserInfoText(userId);

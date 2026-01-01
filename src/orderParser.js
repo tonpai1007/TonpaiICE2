@@ -15,10 +15,33 @@ const PAYMENT_STATUS_MAP = {
 // 🔒 OPTIMISTIC LOCKING: Stock Version Control
 // ============================================================================
 
+
+
+function isSimpleOrder(text) {
+  // Simple pattern: [customer] [action] [product] [quantity]
+  // Examples: "คุณสมชาย สั่งน้ำแข็ง 2 ถุง"
+  
+  const hasNumber = /\d+/.test(text);
+  const hasComma = /[,،]/.test(text);
+  const wordCount = text.trim().split(/\s+/).length;
+  
+  // Simple if: has number, no commas, 3-8 words
+  return hasNumber && !hasComma && wordCount >= 3 && wordCount <= 8;
+}
+
+function isComplexOrder(text) {
+  // Complex if: multiple items (commas) or very long
+  const hasComma = /[,،]/.test(text);
+  const wordCount = text.trim().split(/\s+/).length;
+  
+  return hasComma || wordCount > 8;
+}
+
+
 async function updateStockWithOptimisticLocking(itemName, unit, newStock, expectedOldStock, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+      const rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
       const key = itemName.toLowerCase().trim();
 
       for (let i = 1; i < rows.length; i++) {
@@ -34,7 +57,7 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
             throw new Error('STOCK_VERSION_CONFLICT');
           }
 
-          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
+          await updateSheetData(CONFIG.SHEET_ID, `รายการสินค้า!E${i + 1}`, [[newStock]]);
           Logger.success(`📦 Stock updated: ${itemName} = ${newStock} (attempt ${attempt})`);
           return true;
         }

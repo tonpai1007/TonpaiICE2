@@ -1,7 +1,6 @@
 // aiServices.js - Resilient AI Service Layer with Health Checks
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { AssemblyAI } = require('assemblyai');
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 
@@ -10,10 +9,8 @@ const { Logger } = require('./logger');
 // ============================================================================
 
 let genAI = null;
-let assemblyClient = null;
 let serviceHealth = {
   gemini: false,
-  assemblyAI: false,
   lastCheck: null
 };
 
@@ -38,20 +35,6 @@ function initializeAIServices() {
       serviceHealth.gemini = false;
     }
 
-    // Initialize AssemblyAI with validation
-    if (CONFIG.ASSEMBLYAI_API_KEY && CONFIG.ASSEMBLYAI_API_KEY.length > 20) {
-      try {
-        assemblyClient = new AssemblyAI({ apiKey: CONFIG.ASSEMBLYAI_API_KEY });
-        serviceHealth.assemblyAI = true;
-        Logger.success('✅ AssemblyAI initialized and validated');
-      } catch (assemblyError) {
-        Logger.error('❌ AssemblyAI initialization failed', assemblyError);
-        serviceHealth.assemblyAI = false;
-      }
-    } else {
-      Logger.warn('⚠️ AssemblyAI API key invalid or missing - voice disabled');
-      serviceHealth.assemblyAI = false;
-    }
 
     serviceHealth.lastCheck = new Date().toISOString();
     
