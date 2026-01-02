@@ -13,7 +13,7 @@ try {
 }
 
 const { initializeGoogleServices } = require('./googleServices');
-const { initializeAIServices, generateWithGemini, isGeminiAvailable } = require('./aiServices');
+const { initializeAIServices } = require('./aiServices');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { getThaiDateTimeString, getThaiDateString } = require('./utils');
 const { parseOrder } = require('./orderParser');
@@ -724,12 +724,14 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (req, res) => {
   const { stockVectorStore, customerVectorStore } = require('./vectorStore');
   const { getStockCache, getCustomerCache } = require('./cacheManager');
-  const { getServiceHealth } = require('./aiServices');
   
+  // 🔴 ของเดิม: เรียก getGemini(), getAssembly() ซึ่งไม่มีแล้ว -> จะ Error
+  // 🟢 ของใหม่: เรียก getGroq() จาก aiServices
+  const { getGroq } = require('./aiServices');
+
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    services: getServiceHealth(),
     caches: {
       stock: {
         size: getStockCache().length,
@@ -739,6 +741,10 @@ app.get('/health', (req, res) => {
         size: getCustomerCache().length,
         ragVectors: customerVectorStore.size()
       }
+    },
+    services: {
+      groq: !!getGroq(),       // เช็คว่า Groq พร้อมไหม
+      googleSheets: true       // Google Sheets เราใช้ตลอด
     }
   });
 });
