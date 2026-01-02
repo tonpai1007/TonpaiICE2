@@ -18,7 +18,8 @@ const PAYMENT_STATUS_MAP = {
 async function updateStockWithOptimisticLocking(itemName, unit, newStock, expectedOldStock, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
+      // ✅ FIXED: Changed from 'รายการสินค้า' to 'สต็อก'
+      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
       const key = itemName.toLowerCase().trim();
 
       for (let i = 1; i < rows.length; i++) {
@@ -34,7 +35,8 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
             throw new Error('STOCK_VERSION_CONFLICT');
           }
 
-          await updateSheetData(CONFIG.SHEET_ID, `รายการสินค้า!E${i + 1}`, [[newStock]]);
+          // ✅ FIXED: Changed to 'สต็อก'
+          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
           Logger.success(`📦 Stock updated: ${itemName} = ${newStock} (attempt ${attempt})`);
           return true;
         }
@@ -57,7 +59,7 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
         );
         if (freshItem) {
           expectedOldStock = freshItem.stock;
-          newStock = expectedOldStock - (expectedOldStock - newStock); // Recalculate delta
+          newStock = expectedOldStock - (expectedOldStock - newStock);
         }
         continue;
       }
