@@ -30,16 +30,15 @@ async function loadStockCache(forceReload = false) {
     PerformanceMonitor.start('loadStockCache');
     Logger.info('Loading stock from Google Sheets...');
 
-    let rows = await getSheetData(CONFIG.SHEET_ID, 'รายการสินค้า!A:G');
+    // ✅ FIXED: Changed from 'รายการสินค้า' to 'สต็อก'
+    let rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
 
-    // Initialize sample data if empty
     if (rows.length <= 1) {
       Logger.warn('⚠️ No stock data found');
       stockCache = [];
       return stockCache;
     }
 
-    // Parse rows into structured data
     stockCache = rows.slice(1).map(row => ({
       item: (row[0] || '').trim(),
       cost: parseFloat(row[1] || 0),
@@ -61,7 +60,8 @@ async function loadStockCache(forceReload = false) {
           const newSKU = generateSKU(it.item, it.unit);
           it.sku = newSKU;
           batchUpdates.push({
-            range: `รายการสินค้า!G${idx + 2}`,
+            // ✅ FIXED: Changed to 'สต็อก'
+            range: `สต็อก!G${idx + 2}`,
             values: [[newSKU]]
           });
         }
@@ -73,8 +73,6 @@ async function loadStockCache(forceReload = false) {
     }
 
     lastStockLoadTime = now;
-
-    // Build RAG vector store
     rebuildStockVectorStore();
 
     Logger.success(`STOCK CACHE LOADED: ${stockCache.length} items`);
@@ -90,7 +88,6 @@ async function loadStockCache(forceReload = false) {
     throw error;
   }
 }
-
 
 function rebuildStockVectorStore() {
   stockVectorStore.rebuild(
@@ -131,17 +128,24 @@ function extractKeywords(name) {
     if (norm.length >= 2) keywords.add(norm);
   });
   
-  // Add aliases
-  for (const [key, aliases] of Object.entries(ITEM_ALIASES)) {
+  // ✅ FIXED: Simple common variations instead of ITEM_ALIASES
+  const commonVariations = {
+    'น้ำแข็ง': ['น้ำ', 'แข็ง'],
+    'เบียร์': ['เบีย', 'beer'],
+    'โค้ก': ['โคก', 'coke'],
+    'น้ำดื่ม': ['น้ำ', 'ดื่ม'],
+    'น้ำอัดลม': ['น้ำ', 'อัดลม']
+  };
+  
+  for (const [key, variations] of Object.entries(commonVariations)) {
     if (normalized.includes(normalizeText(key))) {
       keywords.add(normalizeText(key));
-      aliases.forEach(a => keywords.add(normalizeText(a)));
+      variations.forEach(v => keywords.add(normalizeText(v)));
     }
   }
   
   return Array.from(keywords);
 }
-
 // ============================================================================
 // CUSTOMER CACHE
 // ============================================================================
