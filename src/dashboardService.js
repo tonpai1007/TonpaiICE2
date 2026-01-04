@@ -1,4 +1,4 @@
-// dashboardService.js - FIXED: Correct schema mapping
+// dashboardService.js - FIXED: Read from JSON column
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateString } = require('./utils');
@@ -9,7 +9,10 @@ async function calculateDailyMetrics(targetDate = null) {
     const date = targetDate || getThaiDateString();
     Logger.info(`📊 Calculating dashboard metrics for ${date}...`);
 
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 1: Get orders (with embedded line items in JSON)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     
     if (orderRows.length <= 1) {
       Logger.warn('No orders found');
@@ -33,36 +36,46 @@ async function calculateDailyMetrics(targetDate = null) {
       };
     }
 
-    const lineItemRows = await getSheetData(CONFIG.SHEET_ID, 'รายละเอียดคำสั่งซื้อ!A:G');
-    const orderNumbers = todayOrders.map(order => order[0]);
-    const todayLineItems = lineItemRows.slice(1).filter(row => orderNumbers.includes(row[0]));
-
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 2: Parse line items from JSON column
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const orderCount = todayOrders.length;
     let totalSales = 0;
     let totalCost = 0;
-    
-    todayLineItems.forEach(line => {
-      const quantity = parseInt(line[2] || 0);
-      const unitPrice = parseFloat(line[4] || 0);
-      const unitCost = parseFloat(line[5] || 0);
+    const productSales = {};
+
+    for (const order of todayOrders) {
+      const lineItemsJson = order[7] || '[]';  // Column H (รายการสินค้า)
       
-      totalSales += (quantity * unitPrice);
-      totalCost += (quantity * unitCost);
-    });
+      try {
+        const lineItems = JSON.parse(lineItemsJson);
+        
+        lineItems.forEach(line => {
+          const quantity = parseInt(line.quantity || 0);
+          const price = parseFloat(line.price || 0);
+          const cost = parseFloat(line.cost || 0);
+          
+          totalSales += (quantity * price);
+          totalCost += (quantity * cost);
+          
+          // Track product sales
+          const productName = line.item;
+          if (!productSales[productName]) {
+            productSales[productName] = 0;
+          }
+          productSales[productName] += quantity;
+        });
+        
+      } catch (parseError) {
+        Logger.error(`Failed to parse line items for order #${order[0]}`, parseError);
+      }
+    }
     
     const totalProfit = totalSales - totalCost;
 
-    const productSales = {};
-    todayLineItems.forEach(line => {
-      const productName = line[1];
-      const quantity = parseInt(line[2] || 0);
-      
-      if (!productSales[productName]) {
-        productSales[productName] = 0;
-      }
-      productSales[productName] += quantity;
-    });
-    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 3: Calculate top products
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const topProducts = Object.entries(productSales)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
@@ -103,7 +116,6 @@ async function persistDashboardMetrics(metrics) {
       return false;
     }
 
-    // FIXED: Match new schema (วันที่, จำนวนออเดอร์, ต้นทุน, ยอดขาย, กำไร, Top5)
     const row = [
       metrics.date,
       metrics.orderCount,
@@ -171,8 +183,8 @@ function scheduleDailyDashboard() {
       try {
         const result = await runDailySummaryJob();
         if (result.success) {
-          const { notifyAdmin } = require('./app');
-          await notifyAdmin(result.summary);
+          const { pushToAdmin } = require('./app');
+          await pushToAdmin(result.summary);
         }
       } catch (error) {
         Logger.error('Scheduled job failed', error);

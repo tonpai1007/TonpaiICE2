@@ -1,4 +1,4 @@
-// orderService.js - FIXED: Optimistic Locking for Stock Updates
+// orderService.js - FIXED: Denormalized Order Storage
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString, getThaiDateString, convertThaiDateToGregorian } = require('./utils');
@@ -18,7 +18,6 @@ const PAYMENT_STATUS_MAP = {
 async function updateStockWithOptimisticLocking(itemName, unit, newStock, expectedOldStock, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // ✅ FIXED: Changed from 'รายการสินค้า' to 'สต็อก'
       const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
       const key = itemName.toLowerCase().trim();
 
@@ -31,11 +30,10 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
         if (rowName === key && rowUnit === unit.toLowerCase()) {
           // 🔒 OPTIMISTIC LOCK: Verify stock hasn't changed
           if (currentStock !== expectedOldStock) {
-            Logger.warn(`⚠️ Stock changed: ${itemName} (expected ${expectedOldStock}, got ${currentStock})`);
+            Logger.warn(`⚠️ Stock version conflict: ${itemName} (expected ${expectedOldStock}, got ${currentStock})`);
             throw new Error('STOCK_VERSION_CONFLICT');
           }
 
-          // ✅ FIXED: Changed to 'สต็อก'
           await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
           Logger.success(`📦 Stock updated: ${itemName} = ${newStock} (attempt ${attempt})`);
           return true;
@@ -52,7 +50,7 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
         await new Promise(resolve => setTimeout(resolve, delay));
         
         // Re-fetch expected stock for next attempt
-        const freshCache = await getStockCache();
+        const freshCache = getStockCache();
         const freshItem = freshCache.find(item => 
           item.item.toLowerCase() === itemName.toLowerCase() && 
           item.unit.toLowerCase() === unit.toLowerCase()
@@ -77,7 +75,7 @@ async function updateStockWithOptimisticLocking(itemName, unit, newStock, expect
 }
 
 // ============================================================================
-// TRANSACTIONAL ORDER CREATION
+// ✅ CLEANED TRANSACTIONAL ORDER CREATION
 // ============================================================================
 
 async function createOrderTransaction(orderData) {
@@ -90,73 +88,65 @@ async function createOrderTransaction(orderData) {
     };
   }
 
-  Logger.info(`📝 Starting transaction: ${customer} (${items.length} items)`);
+  Logger.info(`📝 Starting CLEANED transaction: ${customer} (${items.length} items)`);
   
   let orderNo = null;
-  let createdLineItems = [];
   let stockUpdates = [];
   
   try {
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 1: Generate Order Number
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     orderNo = orderRows.length || 1;
     
-    const totalAmount = items.reduce((sum, item) => {
-      return sum + (item.quantity * item.stockItem.price);
-    }, 0);
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 2: Prepare Line Items (JSON)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const lineItems = [];
+    let totalAmount = 0;
+    let totalCost = 0;
+    
+    for (const item of items) {
+      const subtotal = item.quantity * item.stockItem.price;
+      const costTotal = item.quantity * item.stockItem.cost;
+      
+      lineItems.push({
+        item: item.stockItem.item,
+        quantity: item.quantity,
+        unit: item.stockItem.unit,
+        price: item.stockItem.price,
+        cost: item.stockItem.cost,
+        subtotal: subtotal
+      });
+      
+      totalAmount += subtotal;
+      totalCost += costTotal;
+    }
     
     const thaiPaymentStatus = PAYMENT_STATUS_MAP[paymentStatus] || 'ยังไม่จ่าย';
     
-    const orderHeaderRow = [
-      orderNo,
-      getThaiDateTimeString(),
-      customer,
-      deliveryPerson,
-      'รอดำเนินการ',
-      thaiPaymentStatus,
-      totalAmount,
-      ''
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 3: Write Order (Single Row with JSON)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const orderRow = [
+      orderNo,                          // รหัสคำสั่ง
+      getThaiDateTimeString(),          // วันที่
+      customer,                         // ลูกค้า
+      deliveryPerson,                   // ผู้ส่ง
+      'รอดำเนินการ',                    // สถานะการจัดส่ง
+      thaiPaymentStatus,                // สถานะการชำระ
+      totalAmount,                      // ยอดรวม
+      JSON.stringify(lineItems),        // รายการสินค้า (JSON)
+      ''                                // หมายเหตุ
     ];
     
-    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H', [orderHeaderRow]);
-    Logger.success(`✅ Phase 1: Order header #${orderNo} created`);
+    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I', [orderRow]);
+    Logger.success(`✅ Phase 1: Order #${orderNo} created (denormalized)`);
     
-    const lineItemRows = items.map(item => {
-      const lineTotal = item.quantity * item.stockItem.price;
-      
-      createdLineItems.push({
-        orderNo,
-        productName: item.stockItem.item,
-        quantity: item.quantity,
-        unit: item.stockItem.unit,
-        unitPrice: item.stockItem.price,
-        unitCost: item.stockItem.cost,
-        lineTotal
-      });
-      
-      return [
-        orderNo,
-        item.stockItem.item,
-        item.quantity,
-        item.stockItem.unit,
-        item.stockItem.price,
-        item.stockItem.cost,
-        lineTotal
-      ];
-    });
-    
-    try {
-      await appendSheetData(CONFIG.SHEET_ID, 'รายละเอียดคำสั่งซื้อ!A:G', lineItemRows);
-      Logger.success(`✅ Phase 2: ${lineItemRows.length} line items created`);
-    } catch (lineItemError) {
-      Logger.error('❌ Phase 2 FAILED', lineItemError);
-      await rollbackOrderHeader(orderNo);
-      return {
-        success: false,
-        error: 'Failed to create line items (rolled back)',
-        details: lineItemError.message
-      };
-    }
-    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 4: Update Stock (Atomic Operations)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     for (const item of items) {
       const newStock = item.stockItem.stock - item.quantity;
       const expectedOldStock = item.stockItem.stock;
@@ -184,10 +174,9 @@ async function createOrderTransaction(orderData) {
         Logger.success(`✅ Stock updated: ${item.stockItem.item} (${item.stockItem.stock} → ${newStock})`);
         
       } catch (stockError) {
-        Logger.error(`❌ Phase 3 FAILED: ${item.stockItem.item}`, stockError);
+        Logger.error(`❌ Phase 2 FAILED: ${item.stockItem.item}`, stockError);
+        await rollbackOrder(orderNo);
         await rollbackStockUpdates(stockUpdates);
-        await rollbackLineItems(orderNo);
-        await rollbackOrderHeader(orderNo);
         
         return {
           success: false,
@@ -197,6 +186,9 @@ async function createOrderTransaction(orderData) {
       }
     }
     
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // SUCCESS: Transaction Committed
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Logger.success(`✅ TRANSACTION COMMITTED: Order #${orderNo}`);
     
     return {
@@ -204,7 +196,9 @@ async function createOrderTransaction(orderData) {
       orderNo,
       customer,
       totalAmount,
-      items: createdLineItems.map((lineItem, idx) => ({
+      totalCost,
+      profit: totalAmount - totalCost,
+      items: lineItems.map((lineItem, idx) => ({
         ...lineItem,
         newStock: stockUpdates[idx].newStock
       })),
@@ -215,9 +209,8 @@ async function createOrderTransaction(orderData) {
     Logger.error('❌ CRITICAL TRANSACTION FAILURE', criticalError);
     
     if (orderNo) {
+      await rollbackOrder(orderNo);
       await rollbackStockUpdates(stockUpdates);
-      await rollbackLineItems(orderNo);
-      await rollbackOrderHeader(orderNo);
     }
     
     return {
@@ -228,39 +221,25 @@ async function createOrderTransaction(orderData) {
   }
 }
 
-async function rollbackOrderHeader(orderNo) {
-  try {
-    Logger.warn(`🔄 Rolling back order header #${orderNo}...`);
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
-    const filteredRows = rows.filter((row, idx) => {
-      if (idx === 0) return true;
-      return row[0] != orderNo;
-    });
-    await batchUpdateSheet(CONFIG.SHEET_ID, [{
-      range: 'คำสั่งซื้อ!A:H',
-      values: filteredRows
-    }]);
-    Logger.success(`✅ Order header #${orderNo} rolled back`);
-  } catch (error) {
-    Logger.error('Failed to rollback order header', error);
-  }
-}
+// ============================================================================
+// ROLLBACK HANDLERS
+// ============================================================================
 
-async function rollbackLineItems(orderNo) {
+async function rollbackOrder(orderNo) {
   try {
-    Logger.warn(`🔄 Rolling back line items for order #${orderNo}...`);
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'รายละเอียดคำสั่งซื้อ!A:G');
+    Logger.warn(`🔄 Rolling back order #${orderNo}...`);
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     const filteredRows = rows.filter((row, idx) => {
       if (idx === 0) return true;
       return row[0] != orderNo;
     });
     await batchUpdateSheet(CONFIG.SHEET_ID, [{
-      range: 'รายละเอียดคำสั่งซื้อ!A:G',
+      range: 'คำสั่งซื้อ!A:I',
       values: filteredRows
     }]);
-    Logger.success(`✅ Line items for #${orderNo} rolled back`);
+    Logger.success(`✅ Order #${orderNo} rolled back`);
   } catch (error) {
-    Logger.error('Failed to rollback line items', error);
+    Logger.error('Failed to rollback order', error);
   }
 }
 
@@ -277,26 +256,14 @@ async function rollbackStockUpdates(stockUpdates) {
   }
 }
 
-// Legacy wrapper
-async function updateStock(itemName, unit, newStock) {
-  const stockCache = getStockCache();
-  const item = stockCache.find(i => 
-    i.item.toLowerCase() === itemName.toLowerCase() && 
-    i.unit.toLowerCase() === unit.toLowerCase()
-  );
-  
-  if (!item) {
-    Logger.error(`Item not found in cache: ${itemName}`);
-    return false;
-  }
-  
-  return await updateStockWithOptimisticLocking(itemName, unit, newStock, item.stock, 3);
-}
+// ============================================================================
+// QUERY FUNCTIONS
+// ============================================================================
 
 async function getOrders(filters = {}) {
   try {
     const { customer, date, orderNo, paymentStatus } = filters;
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     
     if (rows.length <= 1) return [];
     
@@ -329,7 +296,8 @@ async function getOrders(filters = {}) {
       deliveryStatus: row[4],
       paymentStatus: row[5],
       totalAmount: parseFloat(row[6] || 0),
-      notes: row[7] || ''
+      lineItems: JSON.parse(row[7] || '[]'),  // Parse JSON
+      notes: row[8] || ''
     }));
   } catch (error) {
     Logger.error('getOrders failed', error);
@@ -339,7 +307,7 @@ async function getOrders(filters = {}) {
 
 async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     let rowIndex = -1;
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] == orderNo) {
@@ -381,7 +349,7 @@ async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล
 
 async function updateOrderDeliveryStatus(orderNo, newStatus = 'ส่งเสร็จแล้ว') {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     let rowIndex = -1;
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] == orderNo) {
@@ -447,6 +415,22 @@ async function getPendingPayments() {
     Logger.error('getPendingPayments failed', error);
     throw error;
   }
+}
+
+// Legacy wrapper
+async function updateStock(itemName, unit, newStock) {
+  const stockCache = getStockCache();
+  const item = stockCache.find(i => 
+    i.item.toLowerCase() === itemName.toLowerCase() && 
+    i.unit.toLowerCase() === unit.toLowerCase()
+  );
+  
+  if (!item) {
+    Logger.error(`Item not found in cache: ${itemName}`);
+    return false;
+  }
+  
+  return await updateStockWithOptimisticLocking(itemName, unit, newStock, item.stock, 3);
 }
 
 module.exports = {

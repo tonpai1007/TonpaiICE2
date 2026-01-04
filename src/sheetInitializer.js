@@ -1,78 +1,148 @@
-// sheetInitializer.js - Auto-create Google Sheets structure
+// sheetInitializer.js - FIXED: Single Source of Truth Architecture
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getSheetsList, createSheet, appendSheetData } = require('./googleServices');
 
 // ============================================================================
-// REQUIRED SHEETS DEFINITION
+// ✅ CLEANED ARCHITECTURE - Two Sources of Truth
 // ============================================================================
 
 const REQUIRED_SHEETS = [
-  // 1. คำสั่งซื้อ (Orders) - Cleaned data for analysis
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 📦 SOURCE OF TRUTH #1: ORDER MANAGEMENT
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   { 
     name: 'คำสั่งซื้อ', 
-    headers: ['รหัสคำสั่ง', 'วันที่', 'ลูกค้า', 'ผู้ส่ง', 'สถานะการจัดส่ง', 'สถานะการชำระ', 'ยอดรวม', 'หมายเหตุ'],
-    purpose: 'Cleaned order data - only confirmed orders for analysis'
+    headers: [
+      'รหัสคำสั่ง',        // Order ID (PK)
+      'วันที่',            // Timestamp
+      'ลูกค้า',            // Customer name
+      'ผู้ส่ง',            // Delivery person
+      'สถานะการจัดส่ง',    // Delivery status
+      'สถานะการชำระ',      // Payment status
+      'ยอดรวม',            // Total amount
+      'รายการสินค้า',      // JSON: [{item, qty, unit, price, cost, subtotal}]
+      'หมายเหตุ'           // Notes
+    ],
+    purpose: 'Single source of truth for all orders - denormalized for performance',
+    indexes: ['รหัสคำสั่ง', 'วันที่', 'ลูกค้า']
   },
-  
-  // 2. รายละเอียดคำสั่งซื้อ (Order Details) - Line items
-  { 
-    name: 'รายละเอียดคำสั่งซื้อ', 
-    headers: ['รหัสคำสั่ง', 'สินค้า', 'จำนวน', 'หน่วย', 'ราคาขาย', 'ต้นทุน', 'ยอดรวม'],
-    purpose: 'Order line items - for detailed reporting'
-  },
-  
-  // 3. สต็อก (Stock) - Inventory
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 📊 SOURCE OF TRUTH #2: INVENTORY MANAGEMENT
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   { 
     name: 'สต็อก', 
-    headers: ['สินค้า', 'ต้นทุน', 'ราคาขาย', 'หน่วย', 'จำนวนคงเหลือ', 'หมวดหมู่', 'SKU'],
-    purpose: 'Current inventory - RAG uses this for product matching'
+    headers: [
+      'สินค้า',            // Product name (PK)
+      'ต้นทุน',            // Cost price
+      'ราคาขาย',           // Selling price
+      'หน่วย',             // Unit
+      'จำนวนคงเหลือ',      // Current stock
+      'หมวดหมู่',          // Category
+      'SKU'                // Stock keeping unit
+    ],
+    purpose: 'Single source of truth for inventory - updated by orders & adjustments',
+    indexes: ['สินค้า', 'SKU']
   },
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 🗂️ SUPPORTING DATA (NOT SOURCES OF TRUTH)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   
-  // 4. ลูกค้า (Customers) - Customer database
+  // Customer master data
   {
     name: 'ลูกค้า',
     headers: ['ชื่อลูกค้า', 'เบอร์โทร', 'ที่อยู่', 'หมายเหตุ'],
-    purpose: 'Customer database - RAG uses this for customer matching'
+    purpose: 'Customer master data for RAG matching'
   },
   
-  // 5. Dashboard - Daily metrics
+  // Daily aggregated metrics (derived from orders)
   { 
     name: 'Dashboard', 
     headers: ['วันที่', 'จำนวนออเดอร์', 'ต้นทุน', 'ยอดขาย', 'กำไร', 'Top5'],
-    purpose: 'Daily aggregated metrics'
+    purpose: 'Materialized view - aggregated daily metrics'
   },
   
-  // 6. เครดิต (Credit) - Credit tracking
+  // Credit tracking (derived from orders)
   {
     name: 'เครดิต',
     headers: ['วันที่', 'ลูกค้า', 'รหัสคำสั่ง', 'ยอดเงิน', 'สถานะ', 'วันครบกำหนด', 'หมายเหตุ'],
-    purpose: 'Credit/debt tracking'
+    purpose: 'Credit ledger - filtered view of unpaid orders'
   },
   
-  // 7. Inbox - Raw data from voice/text input
+  // Raw input log (audit trail)
   {
     name: 'Inbox',
     headers: ['วันที่', 'UserID', 'ประเภท', 'ข้อความ', 'Metadata', 'สถานะ', 'หมายเหตุ'],
-    purpose: 'Raw input data - every voice/text message is logged here'
+    purpose: 'Audit trail - all voice/text inputs'
   },
   
-  // 8. VarianceLog - Stock adjustment tracking
+  // Stock adjustment log (audit trail)
   {
     name: 'VarianceLog',
     headers: ['วันที่', 'สินค้า', 'สต็อกเก่า', 'สต็อกใหม่', 'ส่วนต่าง', 'เหตุผล'],
-    purpose: 'Stock adjustment history - tracks all inventory changes'
+    purpose: 'Audit trail - all stock adjustments'
   }
 ];
 
 // ============================================================================
-// INITIALIZE SHEETS
+// MIGRATION STRATEGY
+// ============================================================================
+
+async function migrateOldStructure() {
+  try {
+    Logger.info('🔄 Starting migration: Old → New architecture...');
+    
+    const existingSheets = await getSheetsList(CONFIG.SHEET_ID);
+    
+    // Check if old sheets exist
+    const hasOldStructure = 
+      existingSheets.includes('รายการสินค้า') || 
+      existingSheets.includes('รายละเอียดคำสั่งซื้อ');
+    
+    if (!hasOldStructure) {
+      Logger.info('✅ No old structure detected - clean installation');
+      return { migrated: false, reason: 'Clean installation' };
+    }
+
+    Logger.warn('⚠️ Old structure detected - migration required');
+    Logger.info('📋 Migration plan:');
+    Logger.info('  1. Backup old data');
+    Logger.info('  2. Merge รายละเอียดคำสั่งซื้อ → คำสั่งซื้อ (JSON column)');
+    Logger.info('  3. Delete redundant sheets');
+    Logger.info('  4. Validate data integrity');
+
+    // TODO: Implement actual migration logic if needed
+    Logger.warn('⚠️ Manual migration required - see migration guide');
+    
+    return {
+      migrated: false,
+      reason: 'Manual intervention required',
+      oldSheets: ['รายการสินค้า', 'รายละเอียดคำสั่งซื้อ'],
+      action: 'Review and approve migration'
+    };
+
+  } catch (error) {
+    Logger.error('❌ Migration analysis failed', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// INITIALIZE CLEANED STRUCTURE
 // ============================================================================
 
 async function initializeSheets() {
   try {
-    Logger.info('🔍 Checking Google Sheets structure...');
+    Logger.info('🔍 Initializing CLEANED architecture...');
     
+    // Run migration check
+    const migrationStatus = await migrateOldStructure();
+    if (migrationStatus.action === 'Review and approve migration') {
+      Logger.warn('⚠️ Migration pending - system will use new structure for new data');
+    }
+
     const existingSheets = await getSheetsList(CONFIG.SHEET_ID);
     const missingSheets = REQUIRED_SHEETS.filter(
       required => !existingSheets.includes(required.name)
@@ -93,7 +163,7 @@ async function initializeSheets() {
         await createSheet(CONFIG.SHEET_ID, sheet.name);
         await appendSheetData(CONFIG.SHEET_ID, `${sheet.name}!A1`, [sheet.headers]);
         created.push(sheet.name);
-        Logger.success(`✅ Created: ${sheet.name} (${sheet.headers.length} columns)`);
+        Logger.success(`✅ Created: ${sheet.name}`);
       } catch (error) {
         if (error.message.includes('already exists')) {
           Logger.warn(`⚠️ Sheet already exists: ${sheet.name}`);
@@ -117,29 +187,42 @@ async function initializeSheets() {
 }
 
 // ============================================================================
-// VALIDATE SHEETS STRUCTURE
+// VALIDATION
 // ============================================================================
 
 async function validateSheetsStructure() {
   try {
-    Logger.info('🔍 Validating sheets structure...');
+    Logger.info('🔍 Validating architecture integrity...');
     
     const existingSheets = await getSheetsList(CONFIG.SHEET_ID);
     const issues = [];
 
+    // Check required sheets
     for (const required of REQUIRED_SHEETS) {
       if (!existingSheets.includes(required.name)) {
-        issues.push(`Missing sheet: ${required.name}`);
+        issues.push(`❌ Missing critical sheet: ${required.name}`);
       }
     }
 
+    // Check for deprecated sheets
+    const deprecatedSheets = [
+      'รายการสินค้า',
+      'รายละเอียดคำสั่งซื้อ'
+    ];
+
+    deprecatedSheets.forEach(deprecated => {
+      if (existingSheets.includes(deprecated)) {
+        issues.push(`⚠️ Deprecated sheet detected: ${deprecated} (should be removed)`);
+      }
+    });
+
     if (issues.length > 0) {
-      Logger.warn(`⚠️ Found ${issues.length} issues:`);
-      issues.forEach(issue => Logger.warn(`  - ${issue}`));
+      Logger.warn(`⚠️ Found ${issues.length} architecture issues:`);
+      issues.forEach(issue => Logger.warn(`  ${issue}`));
       return { valid: false, issues };
     }
 
-    Logger.success('✅ All sheets are valid');
+    Logger.success('✅ Architecture is clean and valid');
     return { valid: true, issues: [] };
 
   } catch (error) {
@@ -153,17 +236,26 @@ async function validateSheetsStructure() {
 // ============================================================================
 
 function logSheetStructure(existingSheets) {
-  Logger.info('\n📊 Sheet Structure:');
-  Logger.info('━'.repeat(50));
+  Logger.info('\n📊 CLEANED ARCHITECTURE STRUCTURE:');
+  Logger.info('━'.repeat(60));
   
-  REQUIRED_SHEETS.forEach(sheet => {
+  Logger.info('\n🎯 SOURCES OF TRUTH:');
+  REQUIRED_SHEETS.slice(0, 2).forEach(sheet => {
     const exists = existingSheets.includes(sheet.name);
     const icon = exists ? '✅' : '❌';
-    Logger.info(`${icon} ${sheet.name} (${sheet.headers.length} columns)`);
+    Logger.info(`${icon} ${sheet.name}`);
+    Logger.info(`   └─ ${sheet.purpose}`);
+  });
+
+  Logger.info('\n📋 SUPPORTING DATA:');
+  REQUIRED_SHEETS.slice(2).forEach(sheet => {
+    const exists = existingSheets.includes(sheet.name);
+    const icon = exists ? '✅' : '❌';
+    Logger.info(`${icon} ${sheet.name}`);
     Logger.info(`   └─ ${sheet.purpose}`);
   });
   
-  Logger.info('━'.repeat(50));
+  Logger.info('━'.repeat(60));
 }
 
 function getRequiredSheets() {
@@ -182,6 +274,7 @@ function getSheetPurpose(sheetName) {
 module.exports = {
   initializeSheets,
   validateSheetsStructure,
+  migrateOldStructure,
   getRequiredSheets,
   getSheetPurpose,
   REQUIRED_SHEETS

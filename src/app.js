@@ -19,7 +19,9 @@ const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressi
 
 const app = express();
 app.use(express.json());
-
+const { verifyLineSignature, basicRateLimit } = require('./middleware/webhook-security');
+app.use('/webhook', basicRateLimit);
+app.use('/webhook', verifyLineSignature);
 // ============================================================================
 // INITIALIZATION
 // ============================================================================

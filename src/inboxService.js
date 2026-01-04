@@ -1,8 +1,8 @@
-// inboxService.js - Inbox & Cancel Logic
+// inboxService.js - FIXED: Cancel reads JSON line items
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
-const { appendSheetData, getSheetData, updateSheetData, batchUpdateSheet } = require('./googleServices');
+const { appendSheetData, getSheetData, updateSheetData } = require('./googleServices');
 const { updateStock } = require('./orderService');
 
 // ============================================================================
@@ -31,15 +31,17 @@ async function saveToInbox(userId, text, type = 'voice', metadata = {}) {
 }
 
 // ============================================================================
-// CANCEL: ยกเลิกออเดอร์ + คืนสต็อก
+// CANCEL: ยกเลิกออเดอร์ + คืนสต็อก (FIXED: Read JSON)
 // ============================================================================
 
 async function cancelOrder(orderNo) {
   try {
     Logger.info(`🔄 Cancelling order #${orderNo}...`);
 
-    // 1. Get order details
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:H');
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 1: Get order with embedded line items
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     let orderIndex = -1;
     let orderData = null;
 
@@ -49,7 +51,8 @@ async function cancelOrder(orderNo) {
         orderData = {
           orderNo: orderRows[i][0],
           customer: orderRows[i][2],
-          paymentStatus: orderRows[i][5]
+          paymentStatus: orderRows[i][5],
+          lineItemsJson: orderRows[i][7] || '[]'  // Column H
         };
         break;
       }
@@ -59,20 +62,30 @@ async function cancelOrder(orderNo) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
 
-    // 2. Get line items
-    const lineRows = await getSheetData(CONFIG.SHEET_ID, 'รายละเอียดคำสั่งซื้อ!A:G');
-    const lineItems = lineRows.slice(1).filter(row => row[0] == orderNo);
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 2: Parse line items from JSON
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    let lineItems = [];
+    try {
+      lineItems = JSON.parse(orderData.lineItemsJson);
+    } catch (parseError) {
+      Logger.error('Failed to parse line items JSON', parseError);
+      return { success: false, error: 'Invalid order data format' };
+    }
 
     if (lineItems.length === 0) {
       return { success: false, error: 'ไม่พบรายการสินค้า' };
     }
 
-    // 3. Restore stock
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 3: Restore stock
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const stockRestored = [];
+    
     for (const line of lineItems) {
-      const productName = line[1];
-      const quantity = parseInt(line[2] || 0);
-      const unit = line[3];
+      const productName = line.item;
+      const quantity = parseInt(line.quantity || 0);
+      const unit = line.unit;
 
       // Get current stock
       const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
@@ -92,9 +105,11 @@ async function cancelOrder(orderNo) {
       }
     }
 
-    // 4. Update order status
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 4: Mark order as cancelled
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${orderIndex}`, [['ยกเลิก']]);
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!H${orderIndex}`, [['[ยกเลิกโดยระบบ]']]);
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${orderIndex}`, [['[ยกเลิกโดยระบบ]']]);
 
     Logger.success(`✅ Cancelled order #${orderNo}`);
 
