@@ -564,7 +564,7 @@ async function notifyAdminMultiItemOrder(data) {
   }
 }
 
-sync function handleVoiceMessage(messageId, replyToken, userId) {
+async function handleVoiceMessage(messageId, replyToken, userId) {
   try {
     const buffer = await fetchAudioFromLine(messageId);
     const { success, text } = await processVoiceMessage(buffer);
