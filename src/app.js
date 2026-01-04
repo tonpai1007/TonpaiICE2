@@ -210,6 +210,18 @@ async function handleTextMessage(text, userId) {
   if (lower === 'ข้อมูลของฉัน' || lower === 'whoami') {
     return AccessControl.getUserInfoText(userId);
   }
+  const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/);
+  if (cancelMatch) {
+    const orderNo = cancelMatch[1];
+    const result = await cancelOrder(orderNo);
+    if (result.success) {
+      await replyToLine(replyToken, `✅ ยกเลิก #${orderNo} และคืนสต็อกแล้ว`);
+      await sendLineNotify(`🚨 Cancel #${orderNo} by User`);
+    } else {
+      await replyToLine(replyToken, `❌ ยกเลิกไม่ได้: ${result.error}`);
+    }
+    return;
+  }
 
   if (lower === 'รีเฟรsh' || lower === 'refresh' || lower === 'โหลดใหม่') {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.REFRESH_CACHE)) {
@@ -554,55 +566,44 @@ async function notifyAdminMultiItemOrder(data) {
 
 async function handleVoiceMessage(messageId, replyToken, userId) {
   try {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
-      await replyToLine(replyToken, '🔒 ระบบปิดการรับคำสั่งซื้อชั่วคราว');
-      return;
-    }
+    const buffer = await fetchAudioFromLine(messageId);
+    const { success, text } = await processVoiceMessage(buffer);
     
-    Logger.info('🎤 Processing voice message:', messageId);
-    
-    const audioBuffer = await fetchAudioFromLine(messageId);
-    const voiceResult = await processVoiceMessage(audioBuffer);
-    
-    if (!voiceResult.success) {
-      await replyToLine(replyToken, voiceResult.error);
-      return;
-    }
+    if (!success) return replyToLine(replyToken, '❌ ฟังไม่ออกค่ะ');
 
-    Logger.success(`✅ Voice: "${voiceResult.text}"`);
+    const parsed = await parseOrder(text);
     
-    let finalResponse = `🎤 ได้ยิน: "${voiceResult.text}"\n\n`;
-    
-    try {
-      const orderResult = await handleTextMessage(voiceResult.text, userId);
-      finalResponse += orderResult;
-      await replyToLine(replyToken, finalResponse);
-    } catch (orderError) {
-      Logger.error('Order processing error after voice', orderError);
-      finalResponse += '❌ เกิดข้อผิดพลาด ลองใหม่ค่ะ';
-      await replyToLine(replyToken, finalResponse);
-    }
+    // Logic ตัดสินใจ: Auto หรือ Inbox?
+    const isConfident = parsed.success && parsed.confidence === 'high' && parsed.items.length > 0 && parsed.action === 'order';
 
-  } catch (error) {
-    Logger.error('❌ handleVoiceMessage error', error);
-    
-    let errorMsg = '❌ เกิดข้อผิดพลาดค่ะ ';
-    
-    if (error.message?.includes('LINE audio')) {
-      errorMsg += 'ไม่สามารถโหลดไฟล์เสียงได้';
-    } else if (error.message?.includes('quota') || error.message?.includes('429')) {
-      errorMsg += 'ระบบยุ่ง รอสักครู่นะคะ';
+    if (isConfident) {
+      // ✅ Auto-Pilot
+      const result = await createOrderTransaction({
+        customer: parsed.customer,
+        items: parsed.items,
+        paymentStatus: 'unpaid'
+      });
+
+      if (result.success) {
+        await saveToInbox(userId, text, 'voice_auto', { orderNo: result.orderNo });
+        const summary = parsed.items.map(i => `${i.stockItem.item} x${i.quantity}`).join('\n');
+        await replyToLine(replyToken, `✅ บิล #${result.orderNo}\n${summary}\n(ผิดพิมพ์ "ยกเลิก #${result.orderNo}")`);
+        await sendLineNotify(`🤖 Auto #${result.orderNo}: ${text}`);
+      } else {
+        await saveToInbox(userId, text, 'voice_error', { error: result.error });
+        await replyToLine(replyToken, `⚠️ ระบบขัดข้อง: ${result.error}`);
+      }
     } else {
-      errorMsg += 'ลองพิมพ์แทนนะคะ';
+      // 📝 Inbox (Safe Mode)
+      const guess = parsed.items && parsed.items.length > 0 ? parsed.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ') : '-';
+      await saveToInbox(userId, text, 'voice_pending', { summary: guess });
+      await replyToLine(replyToken, `📝 รับยอด (Inbox): "${text}"\nเดาว่า: ${guess}`);
+      await sendLineNotify(`📥 Inbox: ${text}`);
     }
-    
-    try {
-      await replyToLine(replyToken, errorMsg);
-    } catch (replyError) {
-      Logger.error('Failed to send error reply', replyError);
-    }
-    
-    await notifyAdmin(`❌ Voice Error\nUser: ${userId}\nError: ${error.message}`);
+
+  } catch (e) {
+    Logger.error('Handler Error', e);
+    await replyToLine(replyToken, '❌ ระบบรวน (บันทึกเสียงแล้ว)');
   }
 }
 
@@ -680,75 +681,73 @@ async function generateDashboard() {
 
 app.post('/webhook', async (req, res) => {
   try {
-    // 🔒 SECURITY: Validate LINE signature
-    const signature = req.headers['x-line-signature'];
-    if (!validateLineSignature(req.body, signature)) {
-      Logger.warn(`⚠️ Rejected unauthorized webhook from IP: ${req.ip}`);
-      return res.status(401).json({ error: 'Unauthorized' });
+    const events = req.body.events;
+    if (!events || events.length === 0) {
+      return res.sendStatus(200);
     }
-    
-    res.status(200).send('OK');
-    
-    const events = req.body.events || [];
-    
+
     for (const event of events) {
-      try {
-        if (event.type === 'message') {
-          const userId = event.source.userId;
-          
-          if (event.message.type === 'text') {
-            const reply = await handleTextMessage(event.message.text, userId);
-            await replyToLine(event.replyToken, reply);
-            
-          } else if (event.message.type === 'audio') {
-            await handleVoiceMessage(event.message.id, event.replyToken, userId);
-          }
-        }
-      } catch (eventError) {
-        Logger.error('❌ Event processing error', eventError);
-        try {
-          await replyToLine(event.replyToken, '❌ เกิดข้อผิดพลาด กรุณาลองใหม่');
-          await notifyAdmin(`❌ Webhook Error\n${eventError.message}`);
-        } catch (replyError) {
-          Logger.error('❌ Failed to send error reply', replyError);
+      // Log event เพื่อ Debug
+      // Logger.debug('Event received', event);
+
+      if (event.type === 'message') {
+        const userId = event.source.userId;
+        const replyToken = event.replyToken;
+
+        if (event.message.type === 'audio') {
+          // 🎤 เสียง -> เข้า Hybrid Flow
+          await handleVoiceMessage(event.message.id, replyToken, userId);
+        } 
+        else if (event.message.type === 'text') {
+          // 💬 ข้อความ -> เช็ค Undo Logic หรือคำสั่งอื่นๆ
+          await handleTextMessage(event.message.text, replyToken, userId);
         }
       }
     }
     
-  } catch (webhookError) {
-    Logger.error('❌ Webhook error', webhookError);
-    res.status(200).send('OK');
+    res.sendStatus(200);
+  } catch (error) {
+    Logger.error('Webhook Error', error);
+    res.sendStatus(500);
   }
 });
 
+// Health Check (สำหรับ Render เช็คว่าตายไหม)
 app.get('/health', (req, res) => {
-  const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-  const { getStockCache, getCustomerCache } = require('./cacheManager');
-  
-  // 🔴 ของเดิม: เรียก getGemini(), getAssembly() ซึ่งไม่มีแล้ว -> จะ Error
-  // 🟢 ของใหม่: เรียก getGroq() จาก aiServices
   const { getGroq } = require('./aiServices');
-
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    caches: {
-      stock: {
-        size: getStockCache().length,
-        ragVectors: stockVectorStore.size()
-      },
-      customer: {
-        size: getCustomerCache().length,
-        ragVectors: customerVectorStore.size()
-      }
-    },
-    services: {
-      groq: !!getGroq(),       // เช็คว่า Groq พร้อมไหม
-      googleSheets: true       // Google Sheets เราใช้ตลอด
-    }
+  res.json({ 
+    status: 'ok', 
+    groq: !!getGroq(), // เช็คว่า AI พร้อมไหม
+    timestamp: new Date().toISOString() 
   });
 });
 
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+
+async function startServer() {
+  try {
+    // 1. ตรวจสอบ Config
+    validateConfig();
+    
+    // 2. เริ่มต้น AI System
+    initializeAIServices();
+    
+    // 3. เปิด Port
+    app.listen(PORT, () => {
+      Logger.success(`🚀 Server running on port ${PORT}`);
+      Logger.info('✅ System Ready: Hybrid Automation Mode');
+    });
+
+  } catch (error) {
+    Logger.error('❌ Server failed to start', error);
+    process.exit(1);
+  }
+}
+
+startServer();
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
