@@ -564,57 +564,46 @@ async function notifyAdminMultiItemOrder(data) {
   }
 }
 
-async function handleVoiceMessage(messageId, replyToken, userId) {
+sync function handleVoiceMessage(messageId, replyToken, userId) {
   try {
-    if (!AccessControl.canPerformAction(userId, PERMISSIONS.PLACE_ORDER)) {
-      await replyToLine(replyToken, '🔒 ระบบปิดการรับคำสั่งซื้อชั่วคราว');
-      return;
-    }
+    const buffer = await fetchAudioFromLine(messageId);
+    const { success, text } = await processVoiceMessage(buffer);
     
-    Logger.info('🎤 Processing voice message:', messageId);
-    
-    const audioBuffer = await fetchAudioFromLine(messageId);
-    const voiceResult = await processVoiceMessage(audioBuffer);
-    
-    if (!voiceResult.success) {
-      await replyToLine(replyToken, voiceResult.error);
-      return;
-    }
+    if (!success) return replyToLine(replyToken, '❌ ฟังไม่ออกค่ะ');
 
-    Logger.success(`✅ Voice: "${voiceResult.text}"`);
+    const parsed = await parseOrder(text);
     
-    let finalResponse = `🎤 ได้ยิน: "${voiceResult.text}"\n\n`;
-    
-    try {
-      const orderResult = await handleTextMessage(voiceResult.text, userId);
-      finalResponse += orderResult;
-      await replyToLine(replyToken, finalResponse);
-    } catch (orderError) {
-      Logger.error('Order processing error after voice', orderError);
-      finalResponse += '❌ เกิดข้อผิดพลาด ลองใหม่ค่ะ';
-      await replyToLine(replyToken, finalResponse);
-    }
+    // Logic ตัดสินใจ: Auto หรือ Inbox?
+    const isConfident = parsed.success && parsed.confidence === 'high' && parsed.items.length > 0 && parsed.action === 'order';
 
-  } catch (error) {
-    Logger.error('❌ handleVoiceMessage error', error);
-    
-    let errorMsg = '❌ เกิดข้อผิดพลาดค่ะ ';
-    
-    if (error.message?.includes('LINE audio')) {
-      errorMsg += 'ไม่สามารถโหลดไฟล์เสียงได้';
-    } else if (error.message?.includes('quota') || error.message?.includes('429')) {
-      errorMsg += 'ระบบยุ่ง รอสักครู่นะคะ';
+    if (isConfident) {
+      // ✅ Auto-Pilot
+      const result = await createOrderTransaction({
+        customer: parsed.customer,
+        items: parsed.items,
+        paymentStatus: 'unpaid'
+      });
+
+      if (result.success) {
+        await saveToInbox(userId, text, 'voice_auto', { orderNo: result.orderNo });
+        const summary = parsed.items.map(i => `${i.stockItem.item} x${i.quantity}`).join('\n');
+        await replyToLine(replyToken, `✅ บิล #${result.orderNo}\n${summary}\n(ผิดพิมพ์ "ยกเลิก #${result.orderNo}")`);
+        await sendLineNotify(`🤖 Auto #${result.orderNo}: ${text}`);
+      } else {
+        await saveToInbox(userId, text, 'voice_error', { error: result.error });
+        await replyToLine(replyToken, `⚠️ ระบบขัดข้อง: ${result.error}`);
+      }
     } else {
-      errorMsg += 'ลองพิมพ์แทนนะคะ';
+      // 📝 Inbox (Safe Mode)
+      const guess = parsed.items && parsed.items.length > 0 ? parsed.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ') : '-';
+      await saveToInbox(userId, text, 'voice_pending', { summary: guess });
+      await replyToLine(replyToken, `📝 รับยอด (Inbox): "${text}"\nเดาว่า: ${guess}`);
+      await sendLineNotify(`📥 Inbox: ${text}`);
     }
-    
-    try {
-      await replyToLine(replyToken, errorMsg);
-    } catch (replyError) {
-      Logger.error('Failed to send error reply', replyError);
-    }
-    
-    await notifyAdmin(`❌ Voice Error\nUser: ${userId}\nError: ${error.message}`);
+
+  } catch (e) {
+    Logger.error('Handler Error', e);
+    await replyToLine(replyToken, '❌ ระบบรวน (บันทึกเสียงแล้ว)');
   }
 }
 
