@@ -1,5 +1,4 @@
-// cacheManager.js - Manages stock and customer caching with RAG integration
-
+// cacheManager.js - RAG-powered cache with customer matching
 const { CONFIG } = require('./config');
 const { Logger, PerformanceMonitor } = require('./logger');
 const { normalizeText, generateSKU } = require('./utils');
@@ -16,43 +15,44 @@ let lastStockLoadTime = 0;
 let lastCustomerLoadTime = 0;
 
 // ============================================================================
-// STOCK CACHE
+// STOCK CACHE - Uses 'สต็อก' sheet
 // ============================================================================
 
 async function loadStockCache(forceReload = false) {
   try {
     const now = Date.now();
     if (!forceReload && stockCache.length > 0 && (now - lastStockLoadTime) < CONFIG.CACHE_DURATION) {
-      Logger.info('Using cached stock data');
+      Logger.info('📦 Using cached stock data');
       return stockCache;
     }
 
     PerformanceMonitor.start('loadStockCache');
-    Logger.info('Loading stock from Google Sheets...');
+    Logger.info('📦 Loading stock from Google Sheets...');
 
-    // ✅ FIXED: Changed from 'รายการสินค้า' to 'สต็อก'
-    let rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
 
     if (rows.length <= 1) {
-      Logger.warn('⚠️ No stock data found');
+      Logger.warn('⚠️ No stock data found - sheet may be empty');
       stockCache = [];
       return stockCache;
     }
 
-    stockCache = rows.slice(1).map(row => ({
-      item: (row[0] || '').trim(),
-      cost: parseFloat(row[1] || 0),
-      price: parseFloat(row[2] || 0),
-      unit: (row[3] || '').trim(),
-      stock: parseInt(row[4] || 0),
-      category: (row[5] || '').trim(),
-      sku: (row[6] || '').trim()
-    }));
+    stockCache = rows.slice(1)
+      .filter(row => row[0]) // Filter out empty rows
+      .map(row => ({
+        item: (row[0] || '').trim(),
+        cost: parseFloat(row[1] || 0),
+        price: parseFloat(row[2] || 0),
+        unit: (row[3] || '').trim(),
+        stock: parseInt(row[4] || 0),
+        category: (row[5] || '').trim(),
+        sku: (row[6] || '').trim()
+      }));
 
     // Generate missing SKUs
     const missingSkuItems = stockCache.filter(it => !it.sku);
     if (missingSkuItems.length > 0) {
-      Logger.info(`Generating SKUs for ${missingSkuItems.length} items...`);
+      Logger.info(`🔧 Generating SKUs for ${missingSkuItems.length} items...`);
       const batchUpdates = [];
       
       stockCache.forEach((it, idx) => {
@@ -60,7 +60,6 @@ async function loadStockCache(forceReload = false) {
           const newSKU = generateSKU(it.item, it.unit);
           it.sku = newSKU;
           batchUpdates.push({
-            // ✅ FIXED: Changed to 'สต็อก'
             range: `สต็อก!G${idx + 2}`,
             values: [[newSKU]]
           });
@@ -69,20 +68,23 @@ async function loadStockCache(forceReload = false) {
 
       if (batchUpdates.length > 0) {
         await batchUpdateSheet(CONFIG.SHEET_ID, batchUpdates);
+        Logger.success(`✅ Generated ${batchUpdates.length} SKUs`);
       }
     }
 
     lastStockLoadTime = now;
+    
+    // Build RAG vector store
     rebuildStockVectorStore();
 
-    Logger.success(`STOCK CACHE LOADED: ${stockCache.length} items`);
+    Logger.success(`✅ STOCK LOADED: ${stockCache.length} items`);
     PerformanceMonitor.end('loadStockCache');
 
     return stockCache;
   } catch (error) {
-    Logger.error('loadStockCache error', error);
+    Logger.error('❌ loadStockCache error', error);
     if (error.message.includes('Quota exceeded') && stockCache.length > 0) {
-      Logger.warn('Using stale cache due to quota limit');
+      Logger.warn('⚠️ Using stale cache due to quota limit');
       return stockCache;
     }
     throw error;
@@ -94,7 +96,7 @@ function rebuildStockVectorStore() {
     stockCache,
     // Text extractor
     (item) => {
-      const keywords = extractKeywords(item.item);
+      const keywords = extractStockKeywords(item.item);
       return [
         item.item,
         item.category,
@@ -109,15 +111,18 @@ function rebuildStockVectorStore() {
       index,
       item: item.item,
       price: item.price,
+      cost: item.cost,
       unit: item.unit,
       stock: item.stock,
       category: item.category,
       sku: item.sku
     })
   );
+  
+  Logger.success(`🔍 Stock Vector Store: ${stockVectorStore.size()} items indexed`);
 }
 
-function extractKeywords(name) {
+function extractStockKeywords(name) {
   const normalized = normalizeText(name);
   const keywords = new Set([normalized]);
   
@@ -128,13 +133,16 @@ function extractKeywords(name) {
     if (norm.length >= 2) keywords.add(norm);
   });
   
-  // ✅ FIXED: Simple common variations instead of ITEM_ALIASES
+  // Common variations for Thai products
   const commonVariations = {
-    'น้ำแข็ง': ['น้ำ', 'แข็ง'],
+    'น้ำแข็ง': ['น้ำ', 'แข็ง', 'ice'],
     'เบียร์': ['เบีย', 'beer'],
-    'โค้ก': ['โคก', 'coke'],
-    'น้ำดื่ม': ['น้ำ', 'ดื่ม'],
-    'น้ำอัดลม': ['น้ำ', 'อัดลม']
+    'โค้ก': ['โคก', 'coke', 'coca'],
+    'น้ำดื่ม': ['น้ำ', 'ดื่ม', 'water'],
+    'น้ำอัดลม': ['น้ำ', 'อัดลม', 'soda'],
+    'น้ำส้ม': ['น้ำ', 'ส้ม', 'orange'],
+    'กาแฟ': ['coffee'],
+    'ชา': ['tea']
   };
   
   for (const [key, variations] of Object.entries(commonVariations)) {
@@ -146,30 +154,32 @@ function extractKeywords(name) {
   
   return Array.from(keywords);
 }
+
 // ============================================================================
-// CUSTOMER CACHE
+// CUSTOMER CACHE - Uses 'ลูกค้า' sheet
 // ============================================================================
 
 async function loadCustomerCache(forceReload = false) {
   try {
     const now = Date.now();
     if (!forceReload && customerCache.length > 0 && (now - lastCustomerLoadTime) < CONFIG.CACHE_DURATION) {
-      Logger.info('Using cached customer data');
+      Logger.info('👤 Using cached customer data');
       return customerCache;
     }
 
     PerformanceMonitor.start('loadCustomerCache');
-    Logger.info('Loading customers from Google Sheets...');
+    Logger.info('👤 Loading customers from Google Sheets...');
 
     const rows = await getSheetData(CONFIG.SHEET_ID, 'ลูกค้า!A:D');
     
-    // Initialize sample data if empty
-      if (rows.length <= 1) {
-      Logger.warn('⚠️ No customer data found');
+    if (rows.length <= 1) {
+      Logger.warn('⚠️ No customer data found - sheet may be empty');
       customerCache = [];
       return customerCache;
     }
+
     customerCache = rows.slice(1)
+      .filter(row => row[0]) // Filter out empty rows
       .map(row => ({
         name: (row[0] || '').trim(),
         phone: (row[1] || '').trim(),
@@ -177,21 +187,21 @@ async function loadCustomerCache(forceReload = false) {
         notes: (row[3] || '').trim(),
         normalized: normalizeText(row[0] || '')
       }))
-      .filter(c => c.name.length >= 2);
+      .filter(c => c.name.length >= 2); // Remove invalid entries
 
     lastCustomerLoadTime = now;
 
     // Build RAG vector store
     rebuildCustomerVectorStore();
 
-    Logger.success(`CUSTOMER CACHE LOADED: ${customerCache.length} customers`);
+    Logger.success(`✅ CUSTOMERS LOADED: ${customerCache.length} customers`);
     PerformanceMonitor.end('loadCustomerCache');
 
     return customerCache;
   } catch (error) {
-    Logger.error('loadCustomerCache error', error);
+    Logger.error('❌ loadCustomerCache error', error);
     if (error.message.includes('Quota exceeded') && customerCache.length > 0) {
-      Logger.warn('Using stale customer cache due to quota limit');
+      Logger.warn('⚠️ Using stale customer cache due to quota limit');
       return customerCache;
     }
     throw error;
@@ -202,13 +212,17 @@ function rebuildCustomerVectorStore() {
   customerVectorStore.rebuild(
     customerCache,
     // Text extractor
-    (customer) => [
-      customer.name,
-      customer.phone,
-      customer.address,
-      customer.normalized,
-      ...customer.name.split(/\s+/)
-    ].filter(Boolean).join(' '),
+    (customer) => {
+      const tokens = customer.name.split(/\s+/);
+      return [
+        customer.name,
+        customer.phone,
+        customer.address,
+        customer.normalized,
+        ...tokens,
+        ...extractCustomerKeywords(customer.name)
+      ].filter(Boolean).join(' ');
+    },
     // Metadata extractor
     (customer, index) => ({
       index,
@@ -218,6 +232,34 @@ function rebuildCustomerVectorStore() {
       notes: customer.notes
     })
   );
+  
+  Logger.success(`🔍 Customer Vector Store: ${customerVectorStore.size()} customers indexed`);
+}
+
+function extractCustomerKeywords(name) {
+  const keywords = new Set();
+  
+  // Common Thai prefixes
+  const prefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ป้า', 'ลุง', 'อา', 'ร้าน'];
+  
+  prefixes.forEach(prefix => {
+    if (name.includes(prefix)) {
+      const withoutPrefix = name.replace(prefix, '').trim();
+      if (withoutPrefix) {
+        keywords.add(normalizeText(withoutPrefix));
+      }
+    }
+  });
+  
+  // Location keywords
+  const locations = ['ตลาด', 'หน้าปาก', 'ซอย', 'ข้าง', 'หลัง'];
+  locations.forEach(loc => {
+    if (name.includes(loc)) {
+      keywords.add(normalizeText(loc));
+    }
+  });
+  
+  return Array.from(keywords);
 }
 
 // ============================================================================
