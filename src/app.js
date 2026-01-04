@@ -680,75 +680,74 @@ async function generateDashboard() {
 
 app.post('/webhook', async (req, res) => {
   try {
-    // 🔒 SECURITY: Validate LINE signature
-    const signature = req.headers['x-line-signature'];
-    if (!validateLineSignature(req.body, signature)) {
-      Logger.warn(`⚠️ Rejected unauthorized webhook from IP: ${req.ip}`);
-      return res.status(401).json({ error: 'Unauthorized' });
+    const events = req.body.events;
+    if (!events || events.length === 0) {
+      return res.sendStatus(200);
     }
-    
-    res.status(200).send('OK');
-    
-    const events = req.body.events || [];
-    
+
     for (const event of events) {
-      try {
-        if (event.type === 'message') {
-          const userId = event.source.userId;
-          
-          if (event.message.type === 'text') {
-            const reply = await handleTextMessage(event.message.text, userId);
-            await replyToLine(event.replyToken, reply);
-            
-          } else if (event.message.type === 'audio') {
-            await handleVoiceMessage(event.message.id, event.replyToken, userId);
-          }
-        }
-      } catch (eventError) {
-        Logger.error('❌ Event processing error', eventError);
-        try {
-          await replyToLine(event.replyToken, '❌ เกิดข้อผิดพลาด กรุณาลองใหม่');
-          await notifyAdmin(`❌ Webhook Error\n${eventError.message}`);
-        } catch (replyError) {
-          Logger.error('❌ Failed to send error reply', replyError);
+      // Log event เพื่อ Debug
+      // Logger.debug('Event received', event);
+
+      if (event.type === 'message') {
+        const userId = event.source.userId;
+        const replyToken = event.replyToken;
+
+        if (event.message.type === 'audio') {
+          // 🎤 เสียง -> เข้า Hybrid Flow
+          await handleVoiceMessage(event.message.id, replyToken, userId);
+        } 
+        else if (event.message.type === 'text') {
+          // 💬 ข้อความ -> เช็ค Undo Logic หรือคำสั่งอื่นๆ
+          await handleTextMessage(event.message.text, replyToken, userId);
         }
       }
     }
     
-  } catch (webhookError) {
-    Logger.error('❌ Webhook error', webhookError);
-    res.status(200).send('OK');
+    res.sendStatus(200);
+  } catch (error) {
+    Logger.error('Webhook Error', error);
+    res.sendStatus(500);
   }
 });
 
+// Health Check (สำหรับ Render เช็คว่าตายไหม)
 app.get('/health', (req, res) => {
-  const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-  const { getStockCache, getCustomerCache } = require('./cacheManager');
-  
-  // 🔴 ของเดิม: เรียก getGemini(), getAssembly() ซึ่งไม่มีแล้ว -> จะ Error
-  // 🟢 ของใหม่: เรียก getGroq() จาก aiServices
   const { getGroq } = require('./aiServices');
-
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    caches: {
-      stock: {
-        size: getStockCache().length,
-        ragVectors: stockVectorStore.size()
-      },
-      customer: {
-        size: getCustomerCache().length,
-        ragVectors: customerVectorStore.size()
-      }
-    },
-    services: {
-      groq: !!getGroq(),       // เช็คว่า Groq พร้อมไหม
-      googleSheets: true       // Google Sheets เราใช้ตลอด
-    }
+  res.json({ 
+    status: 'ok', 
+    groq: !!getGroq(), // เช็คว่า AI พร้อมไหม
+    timestamp: new Date().toISOString() 
   });
 });
 
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+const PORT = process.env.PORT || 3000;
+
+async function startServer() {
+  try {
+    // 1. ตรวจสอบ Config
+    validateConfig();
+    
+    // 2. เริ่มต้น AI System
+    initializeAIServices();
+    
+    // 3. เปิด Port
+    app.listen(PORT, () => {
+      Logger.success(`🚀 Server running on port ${PORT}`);
+      Logger.info('✅ System Ready: Hybrid Automation Mode');
+    });
+
+  } catch (error) {
+    Logger.error('❌ Server failed to start', error);
+    process.exit(1);
+  }
+}
+
+startServer();
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
