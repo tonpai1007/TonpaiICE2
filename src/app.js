@@ -13,7 +13,6 @@ const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction } = require('./orderService');
 const { saveToInbox, cancelOrder } = require('./inboxService');
-const { sendLineNotify } = require('./lineNotify');
 const { adjustStock, parseAdjustmentCommand, generateVarianceReport } = require('./stockAdjustment');
 const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressiveAutoConfig');
 
