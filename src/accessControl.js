@@ -72,14 +72,9 @@ class UserStore {
     this.initializeDefaultUsers();
   }
 
-  initializeDefaultUsers() {
-    // ✅ FIXED: Use ADMIN_USER_IDS array
+ initializeDefaultUsers() {
+    // Fix: Change ADMIN_USER_ID to ADMIN_USER_IDS
     const adminIds = CONFIG.ADMIN_USER_IDS || [];
-    
-    if (adminIds.length === 0) {
-      Logger.warn('⚠️ No admin users configured');
-      return;
-    }
     
     adminIds.forEach(adminId => {
       this.users.set(adminId, {

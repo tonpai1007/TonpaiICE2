@@ -11,8 +11,7 @@ class ConfigManager {
       LINE_SECRET: process.env.LINE_SECRET,
       
       // AI Services
-      GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-      ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY,
+      GROQ_API_KEY: process.env.GROQ_API_KEY,
       
       // Google Drive
       VOICE_FOLDER_ID: process.env.VOICE_FOLDER_ID,
@@ -103,8 +102,7 @@ class ConfigManager {
       'SHEET_ID',
       'LINE_TOKEN',
       'LINE_SECRET',
-      'GEMINI_API_KEY',
-      'ASSEMBLYAI_API_KEY',
+      'GROQ_API_KEY',
       'GOOGLE_APPLICATION_CREDENTIALS_BASE64'
     ];
     

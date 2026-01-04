@@ -105,7 +105,70 @@ class VectorStore {
     Logger.success(`${this.name} rebuilt with ${this.size()} items`);
   }
 }
-
+class ImprovedVectorStore extends VectorStore {
+  
+  // Better Thai text tokenization
+  tokenize(text) {
+    const normalized = normalizeText(text);
+    
+    // Character bigrams for Thai
+    const bigrams = [];
+    for (let i = 0; i < normalized.length - 1; i++) {
+      bigrams.push(normalized.substring(i, i + 2));
+    }
+    
+    // Word tokens
+    const words = text.split(/\s+/).map(normalizeText);
+    
+    // Combine both
+    return [...new Set([...bigrams, ...words])].filter(t => t.length >= 2);
+  }
+  
+  vectorize(text) {
+    const tokens = this.tokenize(text);
+    const vector = {};
+    
+    tokens.forEach(token => {
+      vector[token] = (vector[token] || 0) + 1;
+    });
+    
+    // TF-IDF normalization
+    const magnitude = Math.sqrt(
+      Object.values(vector).reduce((sum, val) => sum + val * val, 0)
+    );
+    
+    Object.keys(vector).forEach(key => {
+      vector[key] /= magnitude || 1;
+    });
+    
+    return vector;
+  }
+  
+  // Enhanced search with context
+  search(query, topK = 5, minThreshold = 0.5) {
+    const queryVector = this.vectorize(query);
+    const results = [];
+    
+    this.vectors.forEach((vector, id) => {
+      const similarity = this.cosineSimilarity(queryVector, vector);
+      
+      // Apply dynamic threshold based on query length
+      const adaptiveThreshold = query.length < 10 ? 0.4 : minThreshold;
+      
+      if (similarity >= adaptiveThreshold) {
+        results.push({
+          id,
+          similarity,
+          metadata: this.metadata.get(id)
+        });
+      }
+    });
+    
+    return results
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, topK);
+  }
+}
 // ============================================================================
 // GLOBAL INSTANCES
 // ============================================================================
