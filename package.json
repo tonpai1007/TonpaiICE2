@@ -1,22 +1,34 @@
 {
-  "name": "ice-shop-line-bot",
-  "version": "2.0.0",
+  "name": "line-order-bot",
+  "version": "3.9.8",
+  "description": "LINE Bot for order management with Google Sheets",
   "main": "src/app.js",
-  "license": "UNLICENSED",
-  "private": true,
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "node src/app.js"
+    "test": "echo \"No tests specified\" && exit 0"
   },
   "dependencies": {
-    "@google-cloud/speech": "^6.3.0",
-    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "googleapis": "^118.0.0",
-    "openai": "^4.104.0"
+    "dotenv": "^16.3.1",
+    "googleapis": "^128.0.0",
+    "groq-sdk": "^0.3.0",
+    "axios": "^1.6.0",
+    "openai": "^4.28.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "line-bot",
+    "order-management",
+    "google-sheets",
+    "groq",
+    "whisper"
+  ],
+  "author": "Pongpun Teppanom",
+  "license": "ISC"
 }

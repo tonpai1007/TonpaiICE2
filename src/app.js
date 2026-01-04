@@ -722,32 +722,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ============================================================================
-// START SERVER
-// ============================================================================
-
-
-async function startServer() {
-  try {
-    // 1. ตรวจสอบ Config
-    validateConfig();
-    
-    // 2. เริ่มต้น AI System
-    initializeAIServices();
-    
-    // 3. เปิด Port
-    app.listen(PORT, () => {
-      Logger.success(`🚀 Server running on port ${PORT}`);
-      Logger.info('✅ System Ready: Hybrid Automation Mode');
-    });
-
-  } catch (error) {
-    Logger.error('❌ Server failed to start', error);
-    process.exit(1);
-  }
-}
-
-startServer();
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
