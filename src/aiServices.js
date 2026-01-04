@@ -1,240 +1,80 @@
-// aiServices.js - Resilient AI Service Layer with Health Checks
-
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+// aiServices.js - Groq-powered AI (Whisper + Llama3)
+const OpenAI = require('openai');
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 
-// ============================================================================
-// SERVICE STATE MANAGEMENT
-// ============================================================================
-
-let genAI = null;
-let serviceHealth = {
-  gemini: false,
-  lastCheck: null
-};
-
-// ============================================================================
-// INITIALIZATION WITH VALIDATION
-// ============================================================================
+let groq = null;
 
 function initializeAIServices() {
   try {
-    // Initialize Gemini with validation
-    if (CONFIG.GEMINI_API_KEY && CONFIG.GEMINI_API_KEY.length > 20) {
-      try {
-        genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
-        serviceHealth.gemini = true;
-        Logger.success('✅ Gemini initialized and validated');
-      } catch (geminiError) {
-        Logger.error('❌ Gemini initialization failed', geminiError);
-        serviceHealth.gemini = false;
-      }
-    } else {
-      Logger.warn('⚠️ Gemini API key invalid or missing - RAG fallback only');
-      serviceHealth.gemini = false;
+    if (!CONFIG.GROQ_API_KEY) {
+      throw new Error('Missing GROQ_API_KEY');
     }
 
+    groq = new OpenAI({
+      apiKey: CONFIG.GROQ_API_KEY,
+      baseURL: 'https://api.groq.com/openai/v1'
+    });
 
-    serviceHealth.lastCheck = new Date().toISOString();
-    
-    // System Status Report
-    Logger.info('🔍 AI Services Health Check:');
-    Logger.info(`   Gemini: ${serviceHealth.gemini ? '✅ Ready' : '❌ Unavailable'}`);
-    Logger.info(`   AssemblyAI: ${serviceHealth.assemblyAI ? '✅ Ready' : '❌ Unavailable'}`);
-    
-    return { genAI, assemblyClient, serviceHealth };
+    Logger.success('✅ Groq AI initialized');
+    return { groq };
   } catch (error) {
-    Logger.error('❌ CRITICAL: AI Services initialization failed', error);
+    Logger.error('❌ AI init failed', error);
     throw error;
   }
 }
 
-// ============================================================================
-// HEALTH CHECK API
-// ============================================================================
-
-function getServiceHealth() {
-  return {
-    ...serviceHealth,
-    timestamp: new Date().toISOString(),
-    geminiAvailable: genAI !== null && serviceHealth.gemini,
-    assemblyAvailable: assemblyClient !== null && serviceHealth.assemblyAI
-  };
-}
-
-function isGeminiAvailable() {
-  return genAI !== null && serviceHealth.gemini;
-}
-
-function isAssemblyAvailable() {
-  return assemblyClient !== null && serviceHealth.assemblyAI;
-}
-
-// ============================================================================
-// GEMINI OPERATIONS - WITH RESILIENCE
-// ============================================================================
-
-async function generateWithGemini(prompt, schema = null, temperature = 0.1) {
-  // Pre-flight check
-  if (!isGeminiAvailable()) {
-    const error = new Error('GEMINI_UNAVAILABLE: Service not initialized or API key invalid');
-    error.code = 'SERVICE_UNAVAILABLE';
-    throw error;
-  }
+async function generateWithGroq(prompt, jsonMode = false) {
+  if (!groq) throw new Error('Groq not initialized');
 
   try {
-    const config = {
-      model: 'gemini-2.5-flash',
-      generationConfig: {
-        temperature,
-        topP: 0.9,
-        topK: 40,
-      }
-    };
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      response_format: jsonMode ? { type: 'json_object' } : undefined
+    });
 
-    if (schema) {
-      config.generationConfig.responseMimeType = 'application/json';
-      config.generationConfig.responseSchema = schema;
-    }
-
-    const model = genAI.getGenerativeModel(config);
-    
-    // Add timeout
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('GEMINI_TIMEOUT: Request exceeded 30s')), 30000)
-    );
-    
-    const generationPromise = model.generateContent(prompt);
-    
-    const result = await Promise.race([generationPromise, timeoutPromise]);
-    const responseText = result.response.text().trim();
-
-    if (schema) {
-      try {
-        return JSON.parse(responseText);
-      } catch (parseError) {
-        Logger.error('❌ Gemini JSON parse failed', parseError);
-        Logger.debug('Raw response:', responseText);
-        throw new Error('GEMINI_PARSE_ERROR: Invalid JSON response');
-      }
-    }
-
-    return responseText;
+    const content = response.choices[0].message.content.trim();
+    return jsonMode ? JSON.parse(content) : content;
   } catch (error) {
-    Logger.error('❌ Gemini generation failed', error);
-    
-    // Enhanced error context
-    if (error.message?.includes('quota') || error.message?.includes('429')) {
-      error.code = 'QUOTA_EXCEEDED';
-      error.retryable = true;
-    } else if (error.message?.includes('timeout') || error.code === 'GEMINI_TIMEOUT') {
-      error.code = 'TIMEOUT';
-      error.retryable = true;
-    } else {
-      error.code = 'UNKNOWN_ERROR';
-      error.retryable = false;
-    }
-    
+    Logger.error('Groq generation failed', error);
     throw error;
   }
 }
 
-// ============================================================================
-// ASSEMBLYAI OPERATIONS - WITH RESILIENCE
-// ============================================================================
-
-async function transcribeAudio(audioBuffer, boostWords = []) {
-  // Pre-flight check
-  if (!isAssemblyAvailable()) {
-    const error = new Error('ASSEMBLY_UNAVAILABLE: Service not initialized or API key invalid');
-    error.code = 'SERVICE_UNAVAILABLE';
-    throw error;
-  }
+async function transcribeAudio(audioBuffer) {
+  if (!groq) throw new Error('Groq not initialized');
 
   try {
     Logger.info(`🎤 Transcribing audio (${(audioBuffer.length / 1024).toFixed(1)}KB)`);
 
-    const transcript = await assemblyClient.transcripts.transcribe({
-      audio: audioBuffer,
-      language_code: 'th',
-      speech_model: 'best',
-      punctuate: true,
-      format_text: true,
-      word_boost: boostWords,
-      boost_param: 'high',
-      dual_channel: false,
-      speaker_labels: false,
-      language_detection: false
+    const file = new File([audioBuffer], 'audio.m4a', { type: 'audio/m4a' });
+    
+    const transcription = await groq.audio.transcriptions.create({
+      file: file,
+      model: 'whisper-large-v3',
+      language: 'th',
+      temperature: 0.0
     });
 
-    if (transcript.status === 'error') {
-      throw new Error(`ASSEMBLY_ERROR: ${transcript.error}`);
-    }
+    const text = transcription.text.trim();
+    Logger.success(`✅ Transcribed: "${text}"`);
 
-    const transcribed = transcript.text || '';
-    const confidence = transcript.confidence || 0;
-
-    Logger.info(`✅ Transcribed: "${transcribed}" (${(confidence * 100).toFixed(1)}%)`);
-
-    return {
-      text: transcribed,
-      confidence
-    };
+    return { success: true, text };
   } catch (error) {
-    Logger.error('❌ AssemblyAI transcription failed', error);
-    
-    if (error.message?.includes('quota') || error.message?.includes('429')) {
-      error.code = 'QUOTA_EXCEEDED';
-      error.retryable = true;
-    }
-    
-    throw error;
+    Logger.error('Transcription failed', error);
+    return { success: false, error: 'ฟังไม่ออก' };
   }
 }
 
-// ============================================================================
-// GRACEFUL DEGRADATION HELPERS
-// ============================================================================
-
-function shouldUseGemini() {
-  return isGeminiAvailable();
+function getGroq() {
+  return groq;
 }
-
-function shouldUseAssembly() {
-  return isAssemblyAvailable();
-}
-
-function getServiceStatus() {
-  return {
-    gemini: {
-      available: isGeminiAvailable(),
-      status: serviceHealth.gemini ? 'operational' : 'degraded'
-    },
-    assembly: {
-      available: isAssemblyAvailable(),
-      status: serviceHealth.assemblyAI ? 'operational' : 'degraded'
-    },
-    mode: isGeminiAvailable() ? 'AI-Enhanced' : 'RAG-Only'
-  };
-}
-
-// ============================================================================
-// EXPORTS
-// ============================================================================
 
 module.exports = {
   initializeAIServices,
-  getGemini: () => genAI,
-  getAssembly: () => assemblyClient,
-  generateWithGemini,
+  generateWithGroq,
   transcribeAudio,
-  
-  // Health Check API
-  getServiceHealth,
-  isGeminiAvailable,
-  isAssemblyAvailable,
-  shouldUseGemini,
-  shouldUseAssembly,
-  getServiceStatus
+  getGroq
 };
