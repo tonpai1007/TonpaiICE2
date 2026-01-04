@@ -210,6 +210,18 @@ async function handleTextMessage(text, userId) {
   if (lower === 'ข้อมูลของฉัน' || lower === 'whoami') {
     return AccessControl.getUserInfoText(userId);
   }
+  const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/);
+  if (cancelMatch) {
+    const orderNo = cancelMatch[1];
+    const result = await cancelOrder(orderNo);
+    if (result.success) {
+      await replyToLine(replyToken, `✅ ยกเลิก #${orderNo} และคืนสต็อกแล้ว`);
+      await sendLineNotify(`🚨 Cancel #${orderNo} by User`);
+    } else {
+      await replyToLine(replyToken, `❌ ยกเลิกไม่ได้: ${result.error}`);
+    }
+    return;
+  }
 
   if (lower === 'รีเฟรsh' || lower === 'refresh' || lower === 'โหลดใหม่') {
     if (!AccessControl.canPerformAction(userId, PERMISSIONS.REFRESH_CACHE)) {
