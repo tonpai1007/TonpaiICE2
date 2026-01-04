@@ -1,86 +1,57 @@
-// orderParser.js - Simple order parsing with RAG fallback
 const { Logger } = require('./logger');
-const { getStockCache, getCustomerCache } = require('./cacheManager');
-const { stockVectorStore, customerVectorStore } = require('./vectorStore');
-const { normalizeText, extractDigits } = require('./utils');
+const { generateWithGroq, getGroq } = require('./aiServices');
+const { stockVectorStore } = require('./vectorStore');
+const { getStockCache } = require('./cacheManager');
 
-async function parseOrder(text) {
+async function parseOrder(userInput) {
+  const stockCache = getStockCache();
+  if (stockCache.length === 0) return { success: false, error: 'No stock' };
+
   try {
-    Logger.info(`📝 Parsing: "${text}"`);
+    if (!getGroq()) return { success: false, confidence: 'low', items: [] };
+
+    // 1. RAG
+    const ragResults = stockVectorStore.search(userInput, 20);
+    const relevantStock = ragResults.length > 0 
+      ? [...new Set(ragResults.map(r => stockCache[r.metadata.index]))] 
+      : stockCache;
     
-    // 1. Find customer using RAG
-    const customerResults = customerVectorStore.search(text, 3, 0.3);
-    let customer = 'ลูกค้า';
-    
-    if (customerResults.length > 0) {
-      customer = customerResults[0].metadata.name;
-      Logger.info(`👤 Found customer: ${customer}`);
-    } else {
-      // Extract first word as customer name
-      const words = text.trim().split(/\s+/);
-      if (words.length > 0) {
-        customer = words[0];
+    const stockCatalog = relevantStock.map((item, idx) => `[ID:${idx}] ${item.item}`).join('\n');
+
+    // 2. Prompt for Multi-Item
+    const prompt = `
+      Task: Extract Thai Order.
+      Stock: ${stockCatalog}
+      Input: "${userInput}"
+      Rules: Extract items, map ID. JSON Only.
+      Output: { "items": [{ "stockId": 0, "quantity": 1 }], "customer": "name", "action": "order", "confidence": "high"|"low" }
+    `;
+
+    const result = await generateWithGroq(prompt, true);
+
+    // 3. Map
+    const mappedItems = [];
+    if (result.items) {
+      for (const item of result.items) {
+        if (item.stockId >= 0 && item.stockId < relevantStock.length) {
+          mappedItems.push({
+            stockItem: relevantStock[item.stockId],
+            quantity: item.quantity || 1
+          });
+        }
       }
     }
-    
-    // 2. Find product using RAG from 'สต็อก' sheet
-    const stockResults = stockVectorStore.search(text, 5, 0.3);
-    
-    if (stockResults.length === 0) {
-      return {
-        success: false,
-        error: '❌ ไม่พบสินค้าที่ต้องการ\nกรุณาตรวจสอบชื่อสินค้าอีกครั้ง'
-      };
-    }
-    
-    const stockItem = stockResults[0].metadata;
-    Logger.info(`📦 Found item: ${stockItem.item}`);
-    
-    // 3. Extract quantity
-    const digits = extractDigits(text);
-    
-    if (!digits) {
-      return {
-        success: false,
-        error: '❌ กรุณาระบุจำนวนสินค้า\nเช่น: "สมชาย สั่งน้ำแข็ง 2 ถุง"'
-      };
-    }
-    
-    const quantity = parseInt(digits);
-    
-    if (quantity <= 0 || quantity > 10000) {
-      return {
-        success: false,
-        error: '❌ จำนวนไม่ถูกต้อง (1-10000)'
-      };
-    }
-    
-    // 4. Check for delivery person
-    let deliveryPerson = '';
-    const deliveryMatch = text.match(/ส่ง(?:โดย)?[\s:]*([^\s,]+)/i);
-    if (deliveryMatch) {
-      deliveryPerson = deliveryMatch[1];
-    }
-    
-    // 5. Check for credit/payment status
-    const isCredit = text.toLowerCase().includes('เครดิต');
-    
-    Logger.success(`✅ Parsed: ${customer} orders ${quantity} ${stockItem.unit} of ${stockItem.item}`);
-    
+
     return {
       success: true,
-      customer,
-      items: [{ stockItem, quantity }],
-      deliveryPerson,
-      paymentStatus: isCredit ? 'credit' : 'unpaid'
+      items: mappedItems,
+      customer: result.customer || 'ไม่ระบุ',
+      action: result.action || 'order',
+      confidence: mappedItems.length > 0 ? result.confidence : 'low'
     };
-    
   } catch (error) {
-    Logger.error('parseOrder failed', error);
-    return {
-      success: false,
-      error: '❌ ไม่สามารถประมวลผลคำสั่งได้\nกรุณาลองใหม่อีกครั้ง'
-    };
+    Logger.error('Parse Error', error);
+    return { success: false, confidence: 'low', items: [] };
   }
 }
 
