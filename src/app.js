@@ -28,21 +28,7 @@ app.use(express.json());
 // INBOX: บันทึกทุก Input ที่เข้ามา (FIXED: Simple 2-column format)
 // ============================================================================
 
-async function saveToInbox(userId, text, type = 'voice', metadata = {}) {
-  try {
-    const row = [
-      getThaiDateTimeString(),
-      text
-    ];
 
-    await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A:B', [row]);
-    Logger.success(`📥 Saved to Inbox: ${text.substring(0, 30)}...`);
-    return true;
-  } catch (error) {
-    Logger.error('saveToInbox failed', error);
-    return false;
-  }
-}
 
 // 1. Stock Monitor
 function checkStockWarnings(items) {
