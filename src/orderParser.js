@@ -1,4 +1,4 @@
-// orderParser.js - Smart Auto Parser with Confidence Boosting
+// orderParser.js - Smart Auto Parser with Confidence Boosting (Fixed)
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
@@ -23,9 +23,8 @@ async function parseOrder(userInput) {
 
     const customerList = customerCache.slice(0, 50).map(c => c.name).join(', ');
 
-    // 2. Enhanced prompt with confidence rules
-    const prompt = `
-You are an expert Thai order parser. Extract order details with HIGH confidence.
+    // 2. Enhanced prompt
+    const prompt = `You are an expert Thai order parser. Extract order details with HIGH confidence.
 
 STOCK CATALOG:
 ${stockList}
@@ -35,19 +34,26 @@ KNOWN CUSTOMERS: ${customerList}
 USER INPUT: "${userInput}"
 
 CONFIDENCE RULES (return "high" if ALL true):
-1. Customer name is clearly mentioned OR matches known customer
+1. Customer name is clearly mentioned (even if not in known customers list)
 2. Item name matches stock catalog clearly (fuzzy match OK)
 3. Quantity is explicitly stated with number
 4. No ambiguous words like "บางที", "คิดว่า", "อาจจะ"
 
+CUSTOMER MATCHING RULES:
+- If customer name is mentioned at the start → USE IT (even if not in known customers)
+- Examples: "แฟน", "พี่ใหม่", "คุณสมชาย", "ร้านป้าไก่"
+- ONLY use "ไม่ระบุ" if absolutely NO customer name is mentioned
+- Names can be Thai nicknames, common names, or shop names
+
 FUZZY MATCHING:
-- "น้ำแข็ง" = "น้ำแข็งหลอด", "น้ำแข็งก้อน"
-- "เบียร์" = "เบียร์ลีโอ", "เบียร์ช้าง", "เบียร์สิงห์"
-- Numbers: "ห้า"=5, "สิบ"=10, "สองสิบ"=20
+- "น้ำแข็ง" matches "น้ำแข็งหลอด", "น้ำแข็งก้อน"
+- "เบียร์" matches "เบียร์ลีโอ", "เบียร์ช้าง"
+- "โค้ก" matches "โค้ก(ลัง)", "โค้ก(ขวด)"
+- Numbers: "ห้า"=5, "สิบ"=10
 
 OUTPUT JSON:
 {
-  "customer": "ชื่อลูกค้า or ไม่ระบุ",
+  "customer": "ชื่อลูกค้าที่พูดมา หรือ ไม่ระบุ ถ้าไม่มีเลย",
   "items": [
     {
       "stockId": 0,
@@ -61,15 +67,17 @@ OUTPUT JSON:
 }
 
 EXAMPLES:
-Input: "สมชาย สั่งน้ำแข็ง 5 ถุง"
-→ confidence: "high" (clear customer, clear item, clear quantity)
+Input: "แฟน น้ำแข็ง 2 ถุง โค้ก 1 ลัง"
+Output: {"customer": "แฟน", "items": [...], "confidence": "high", "reasoning": "ชื่อลูกค้าชัดเจน สินค้าตรง จำนวนชัดเจน"}
 
-Input: "เอาเบียร์ 3"
-→ confidence: "medium" (no customer, item needs clarification)
+Input: "สมชาย สั่งน้ำแข็ง 5 ถุง"
+Output: {"customer": "สมชาย", "items": [...], "confidence": "high"}
+
+Input: "เอาเบียร์ 3 ขวด"
+Output: {"customer": "ไม่ระบุ", "items": [...], "confidence": "medium", "reasoning": "ไม่มีชื่อลูกค้า"}
 
 Input: "คุณแดง บอกว่าอาจจะเอาโค้กสักหน่อย"
-→ confidence: "low" (ambiguous: "อาจจะ", "สักหน่อย")
-`;
+Output: {"customer": "คุณแดง", "items": [...], "confidence": "low", "reasoning": "มีคำคลุมเครือ อาจจะ สักหน่อย"}`;
 
     const result = await generateWithGroq(prompt, true);
 
@@ -87,7 +95,7 @@ Input: "คุณแดง บอกว่าอาจจะเอาโค้�
       }
     }
 
-    // 4. CONFIDENCE BOOSTING: Check additional signals
+    // 4. CONFIDENCE BOOSTING
     const boostedConfidence = boostConfidence(result, mappedItems, userInput, customerCache);
 
     Logger.info(
@@ -118,7 +126,7 @@ Input: "คุณแดง บอกว่าอาจจะเอาโค้�
 }
 
 // ============================================================================
-// CONFIDENCE BOOSTING LOGIC
+// CONFIDENCE BOOSTING LOGIC (FIXED)
 // ============================================================================
 
 function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
@@ -133,12 +141,18 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
     boostReasons.push('exact_match');
   }
 
-  // Check 2: Customer is in database
-  const customerExists = customerCache.some(c => 
-    c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
-  );
-  if (customerExists && aiResult.customer !== 'ไม่ระบุ') {
-    boostReasons.push('known_customer');
+  // Check 2: Customer is mentioned (even if not in database)
+  const customerMentioned = aiResult.customer && aiResult.customer !== 'ไม่ระบุ';
+  if (customerMentioned) {
+    boostReasons.push('customer_mentioned');
+    
+    // Extra boost if customer is in database
+    const customerExists = customerCache.some(c => 
+      c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
+    );
+    if (customerExists) {
+      boostReasons.push('known_customer');
+    }
   }
 
   // Check 3: Stock is available for all items

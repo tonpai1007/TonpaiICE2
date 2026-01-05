@@ -16,6 +16,7 @@ const { createOrderTransaction } = require('./orderService');
 const { saveToInbox, cancelOrder } = require('./inboxService');
 const { adjustStock, parseAdjustmentCommand, generateVarianceReport, viewCurrentStock } = require('./stockadjustment');
 const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressiveAutoConfig');
+const { autoAddCustomer } = require('./customerService');
 
 const app = express();
 app.use(express.json());
@@ -150,6 +151,12 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
 
     if (decision.shouldAuto) {
       // ✅ AUTO MODE: Create order immediately
+      
+      // Auto-add new customer if not in database
+      if (corrected.customer && corrected.customer !== 'ไม่ระบุ') {
+        await autoAddCustomer(corrected.customer);
+      }
+      
       const result = await createOrderTransaction({
         customer: corrected.customer,
         items: corrected.items,
