@@ -19,9 +19,7 @@ const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressi
 
 const app = express();
 app.use(express.json());
-const { verifyLineSignature, basicRateLimit } = require('./middleware/webhook-security');
-app.use('/webhook', basicRateLimit);
-app.use('/webhook', verifyLineSignature);
+
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
@@ -168,9 +166,11 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
         });
 
         // Reply to admin
-        const summary = result.items.map(i => 
-          `• ${i.productName} x${i.quantity} (${i.newStock} เหลือ)`
-        ).join('\n');
+        const summary = result.items.map(i => {
+          const itemName = i.productName || i.stockItem?.item || 'สินค้า';
+          const newStock = i.newStock !== undefined ? i.newStock : i.stockItem?.stock || 0;
+          return `• ${itemName} x${i.quantity} (${newStock} เหลือ)`;
+        }).join('\n');
         
         await replyToLine(replyToken, 
           `✅ บันทึกออเดอร์สำเร็จ!\n\n` +
