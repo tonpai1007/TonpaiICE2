@@ -30,6 +30,7 @@ async function parseAdjustmentCommand(text) {
     },
     
     // Pattern 4: ...เหลือ (Set exact value - short form)
+    // ✅ FIXED: รองรับ "แข็งเหลือ 50" โดยไม่ต้องมี "น้ำ" ข้างหน้า
     { 
       regex: /(.+?)\s*เหลือ\s*(\d+)/i, 
       operation: 'set' 
@@ -45,9 +46,16 @@ async function parseAdjustmentCommand(text) {
   for (const pattern of patterns) {
     const match = text.match(pattern.regex);
     if (match) {
+      let itemName = match[1].trim();
+      
+      // ✅ FIXED: Auto-complete "แข็ง" → "น้ำแข็ง"
+      if (itemName === 'แข็ง' || itemName === 'เเข็ง') {
+        itemName = 'น้ำแข็ง';
+      }
+      
       return {
         isAdjustment: true,
-        item: match[1].trim(),
+        item: itemName,
         value: parseInt(match[2]),
         operation: pattern.operation,
         originalText: text
@@ -66,16 +74,45 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
   try {
     Logger.info(`🔧 Stock adjustment: ${itemName} ${operation} ${value}`);
 
-    // Find item in cache
+    // Find item in cache with fuzzy matching
     const stockCache = getStockCache();
-    const item = stockCache.find(i => 
-      i.item.toLowerCase().includes(itemName.toLowerCase())
+    
+    // ✅ FIXED: Better fuzzy search
+    const searchTerm = itemName.toLowerCase().trim();
+    let item = stockCache.find(i => 
+      i.item.toLowerCase() === searchTerm
     );
+    
+    // If exact match not found, try partial match
+    if (!item) {
+      item = stockCache.find(i => 
+        i.item.toLowerCase().includes(searchTerm) ||
+        searchTerm.includes(i.item.toLowerCase())
+      );
+    }
+    
+    // Try without special characters
+    if (!item) {
+      const normalized = searchTerm.replace(/[^\u0E00-\u0E7F0-9a-z]/g, '');
+      item = stockCache.find(i => {
+        const itemNormalized = i.item.toLowerCase().replace(/[^\u0E00-\u0E7F0-9a-z]/g, '');
+        return itemNormalized.includes(normalized) || normalized.includes(itemNormalized);
+      });
+    }
 
     if (!item) {
+      // Show available items for debugging
+      const suggestions = stockCache
+        .filter(i => i.item.toLowerCase().includes(searchTerm.substring(0, 3)))
+        .slice(0, 5)
+        .map(i => i.item)
+        .join(', ');
+      
       return { 
         success: false, 
-        error: `❌ ไม่พบสินค้า: "${itemName}"\n\n💡 ลองพิมพ์ชื่อให้ถูกต้อง หรือพิมพ์ "สต็อก" เพื่อดูรายการ` 
+        error: `❌ ไม่พบสินค้า: "${itemName}"\n\n` +
+               (suggestions ? `💡 สินค้าที่คล้ายกัน: ${suggestions}\n\n` : '') +
+               `พิมพ์ "สต็อก" เพื่อดูรายการทั้งหมด`
       };
     }
 
@@ -124,7 +161,7 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
     // Auto-log to VarianceLog
     await logVariance(item.item, oldStock, newStock, difference, reason, operation);
 
-    // Reload cache
+    // ✅ CRITICAL: Reload cache immediately after stock change
     await loadStockCache(true);
 
     Logger.success(`✅ Stock adjusted: ${item.item} (${oldStock} → ${newStock}, ${difference >= 0 ? '+' : ''}${difference})`);

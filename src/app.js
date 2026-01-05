@@ -128,7 +128,47 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
       timestamp: new Date().toISOString()
     });
 
-    // Step 4: Parse with RAG context
+    // Step 3.5: 🔧 Check if this is stock adjustment command FIRST
+    const adjCommand = await parseAdjustmentCommand(text);
+    if (adjCommand.isAdjustment) {
+      Logger.info(`🔧 Detected stock adjustment command`);
+      
+      const result = await adjustStock(
+        adjCommand.item, 
+        adjCommand.value, 
+        adjCommand.operation,
+        'voice_adjustment'
+      );
+
+      if (result.success) {
+        const icon = result.difference === 0 ? '➖' : result.difference > 0 ? '📈' : '📉';
+        
+        await replyToLine(replyToken,
+          `✅ ปรับสต็อกสำเร็จ\n\n` +
+          `📦 ${result.item}\n` +
+          `━━━━━━━━━━━━━━\n` +
+          `เดิม: ${result.oldStock} ${result.unit}\n` +
+          `ใหม่: ${result.newStock} ${result.unit}\n` +
+          `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n` +
+          `💡 ${result.operationText}\n` +
+          `📊 บันทึก VarianceLog แล้ว`
+        );
+
+        await saveToInbox(userId, text, 'stock_adjusted', { 
+          item: result.item,
+          oldStock: result.oldStock,
+          newStock: result.newStock,
+          operation: result.operation
+        });
+
+        Logger.success(`✅ Stock adjusted via voice: ${result.item} (${result.operation})`);
+      } else {
+        await replyToLine(replyToken, result.error);
+      }
+      return; // ✅ Exit early - don't parse as order
+    }
+
+    // Step 4: Parse as order (only if not stock adjustment)
     const parsed = await parseOrder(text);
     parsed.rawInput = text;
 
