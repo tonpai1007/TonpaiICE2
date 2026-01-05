@@ -14,7 +14,7 @@ const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction, updateOrderPaymentStatus } = require('./orderService');
 const { saveToInbox, cancelOrder } = require('./inboxService');
-const { adjustStock, parseAdjustmentCommand, generateVarianceReport, viewCurrentStock } = require('./stockadjustment');
+const { adjustStock, parseAdjustmentCommand, generateVarianceReport, viewCurrentStock } = require('./stockAdjustment');
 const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressiveAutoConfig');
 const { autoAddCustomer } = require('./customerService');
 
