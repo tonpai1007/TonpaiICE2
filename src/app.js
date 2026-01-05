@@ -1,4 +1,4 @@
-// app.js - Context-Aware Order Bot with RAG
+// app.js - FULLY INTEGRATED with UX Enhancements
 const express = require('express');
 const axios = require('axios');
 
@@ -12,14 +12,241 @@ const { initializeAIServices, transcribeAudio } = require('./aiServices');
 const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { parseOrder } = require('./orderParser');
-const { createOrderTransaction } = require('./orderService');
+const { createOrderTransaction, updateOrderPaymentStatus } = require('./orderService');
 const { saveToInbox, cancelOrder } = require('./inboxService');
 const { adjustStock, parseAdjustmentCommand, generateVarianceReport, viewCurrentStock } = require('./stockadjustment');
 const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressiveAutoConfig');
 const { autoAddCustomer } = require('./customerService');
 
+// ✨ UX ENHANCEMENTS - Inline Implementation
+// No external module needed
+
 const app = express();
 app.use(express.json());
+
+// ============================================================================
+// UX HELPER FUNCTIONS - Inline Implementation
+// ============================================================================
+
+// 1. Stock Monitor
+function checkStockWarnings(items) {
+  const warnings = [];
+  const criticalItems = [];
+  
+  items.forEach(item => {
+    const remaining = item.stockItem.stock - item.quantity;
+    
+    if (remaining < 0) {
+      warnings.push({
+        level: 'critical',
+        icon: '🔴',
+        message: `⚠️ สต็อกไม่พอ!\n${item.stockItem.item}: มี ${item.stockItem.stock} เหลือ (สั่ง ${item.quantity})`,
+        canProceed: false,
+        item: item.stockItem.item
+      });
+      criticalItems.push(item.stockItem.item);
+    } else if (remaining <= 3) {
+      warnings.push({
+        level: 'critical',
+        icon: '🔴',
+        message: `⚠️ สต็อกเหลือน้อยมาก!\n${item.stockItem.item}: จะเหลือ ${remaining} ${item.stockItem.unit}`,
+        canProceed: true
+      });
+    } else if (remaining <= 10) {
+      warnings.push({
+        level: 'warning',
+        icon: '🟡',
+        message: `💡 สต็อกใกล้หมด\n${item.stockItem.item}: จะเหลือ ${remaining} ${item.stockItem.unit}`,
+        canProceed: true
+      });
+    }
+  });
+  
+  return {
+    hasWarnings: warnings.length > 0,
+    hasCritical: criticalItems.length > 0,
+    warnings,
+    criticalItems
+  };
+}
+
+function formatStockWarnings(checkResult) {
+  if (!checkResult.hasWarnings) return null;
+  
+  if (checkResult.hasCritical) {
+    return '🔴 สต็อกไม่พอ!\n\n' + 
+           checkResult.warnings
+             .filter(w => !w.canProceed)
+             .map(w => w.message)
+             .join('\n\n') +
+           '\n\n❌ ไม่สามารถสร้างออเดอร์ได้';
+  }
+  
+  return checkResult.warnings.map(w => w.message).join('\n');
+}
+
+// 2. Quick Actions Formatter
+function formatOrderSuccess(orderNo, customer, items, totalAmount, confidence) {
+  const summary = items.map(i => {
+    const itemName = i.productName || i.stockItem?.item || 'สินค้า';
+    const newStock = i.newStock !== undefined ? i.newStock : 0;
+    
+    let stockIcon = '✅';
+    if (newStock <= 3) stockIcon = '🔴';
+    else if (newStock <= 10) stockIcon = '🟡';
+    
+    return `${stockIcon} ${itemName} x${i.quantity} (${newStock} เหลือ)`;
+  }).join('\n');
+  
+  return `✅ บันทึกออเดอร์สำเร็จ!\n\n` +
+         `📋 คำสั่งซื้อ #${orderNo}\n` +
+         `👤 ${customer}\n\n` +
+         `${summary}\n\n` +
+         `💰 รวม: ${totalAmount.toLocaleString()}฿\n` +
+         `🎯 ความมั่นใจ: ${confidence}\n\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `⚡ Quick Actions:\n` +
+         `• "จ่าย #${orderNo}" - จ่ายเงิน\n` +
+         `• "ส่ง #${orderNo}" - อัปเดตการจัดส่ง\n` +
+         `• "ยกเลิก #${orderNo}" - ยกเลิกออเดอร์`;
+}
+
+function formatPaymentSuccess(orderNo, customer, totalAmount) {
+  return `✅ อัปเดตการชำระเงินสำเร็จ\n\n` +
+         `📋 #${orderNo} | ${customer}\n` +
+         `💰 ${totalAmount.toLocaleString()}฿\n\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `⚡ Next Actions:\n` +
+         `• "ส่ง #${orderNo}" - อัปเดตการจัดส่ง\n` +
+         `• "รายงานสต็อก" - ดูสต็อกวันนี้`;
+}
+
+function formatCancelSuccess(orderNo, customer, stockRestored) {
+  const restoredList = stockRestored
+    .map(s => `• ${s.item} +${s.restored} (${s.newStock} เหลือ)`)
+    .join('\n');
+  
+  return `✅ ยกเลิกออเดอร์สำเร็จ\n\n` +
+         `📋 #${orderNo} | ${customer}\n\n` +
+         `📦 คืนสต็อก:\n${restoredList}\n\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `💡 สต็อกถูกคืนกลับแล้ว`;
+}
+
+// 3. Delivery Tracker
+async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
+  try {
+    const validStatuses = {
+      'รอดำเนินการ': '⏳',
+      'กำลังเตรียม': '📦',
+      'กำลังจัดส่ง': '🚚',
+      'ส่งเสร็จแล้ว': '✅',
+      'ยกเลิก': '❌'
+    };
+    
+    if (!validStatuses[status]) {
+      return { success: false, error: 'สถานะไม่ถูกต้อง' };
+    }
+    
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
+    let rowIndex = -1;
+    let orderData = null;
+    
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][0] == orderNo) {
+        rowIndex = i + 1;
+        orderData = {
+          customer: rows[i][2],
+          items: rows[i][3],
+          currentStatus: rows[i][4]
+        };
+        break;
+      }
+    }
+    
+    if (!orderData) {
+      return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
+    }
+    
+    const { updateSheetData } = require('./googleServices');
+    
+    // Update delivery status
+    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${rowIndex}`, [[status]]);
+    
+    // Update delivery person if provided
+    if (deliveryPerson) {
+      await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!D${rowIndex}`, [[deliveryPerson]]);
+    }
+    
+    const icon = validStatuses[status];
+    
+    return {
+      success: true,
+      orderNo,
+      customer: orderData.customer,
+      oldStatus: orderData.currentStatus,
+      newStatus: status,
+      icon,
+      deliveryPerson
+    };
+    
+  } catch (error) {
+    Logger.error('updateDeliveryStatus failed', error);
+    return { success: false, error: error.message };
+  }
+}
+
+function formatDeliveryStatus(result) {
+  let msg = `${result.icon} อัปเดตสถานะการจัดส่ง\n\n`;
+  msg += `📋 ออเดอร์ #${result.orderNo}\n`;
+  msg += `👤 ${result.customer}\n\n`;
+  msg += `สถานะ: ${result.oldStatus} → ${result.newStatus}\n`;
+  
+  if (result.deliveryPerson) {
+    msg += `🚚 คนส่ง: ${result.deliveryPerson}\n`;
+  }
+  
+  if (result.newStatus === 'ส่งเสร็จแล้ว') {
+    msg += `\n💡 พิมพ์ "จ่าย #${result.orderNo}" เพื่ออัปเดตการชำระเงิน`;
+  }
+  
+  return msg;
+}
+
+// 4. Smart Error Messages
+function formatError(errorType, details = {}) {
+  const errors = {
+    'order_not_found': `❌ ไม่พบออเดอร์ #${details.orderNo}\n\n` +
+                       `━━━━━━━━━━━━━━━━━━━━\n` +
+                       `💡 แก้ไข:\n` +
+                       `• ตรวจสอบเลขออเดอร์\n` +
+                       `• ออเดอร์อาจถูกยกเลิกไปแล้ว`,
+    
+    'parse_failed': `❌ ไม่เข้าใจคำสั่ง\n\n` +
+                    `"${details.input}"\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `💡 ตัวอย่างที่ถูกต้อง:\n` +
+                    `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง" (สั่งซื้อ)\n` +
+                    `• "จ่าย #123" (ชำระเงิน)\n` +
+                    `• "เติมน้ำแข็ง 20" (ปรับสต็อก)\n\n` +
+                    `พิมพ์ "help" เพื่อดูคำสั่งทั้งหมด`
+  };
+  
+  return errors[errorType] || `❌ เกิดข้อผิดพลาด\n\n${details.message || 'Unknown error'}`;
+}
+
+// 5. Contextual Help
+function getContextualHelp(context) {
+  const helps = {
+    'stock_low': `⚠️ สต็อกเหลือน้อย!\n\n` +
+                 `📝 ควรทำ:\n` +
+                 `• "เติมน้ำแข็ง 50" - เติมสต็อก\n` +
+                 `• "สต็อก" - ดูรายการที่เหลือน้อย\n` +
+                 `• "รายงานสต็อก" - ดูการใช้วันนี้`
+  };
+  
+  return helps[context] || '';
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -27,19 +254,16 @@ app.use(express.json());
 
 async function initializeApp() {
   try {
-    Logger.info('🚀 Starting Context-Aware Order Bot...');
+    Logger.info('🚀 Starting Enhanced Order Bot...');
     
     initializeGoogleServices();
     initializeAIServices();
     
-    // Initialize sheets structure
     await initializeSheets();
-    
-    // Load caches with RAG
     await loadStockCache(true);
     await loadCustomerCache(true);
     
-    Logger.success('✅ System Ready: RAG-Powered Admin Mode 🎯');
+    Logger.success('✅ System Ready with UX Enhancements 🎯');
   } catch (error) {
     Logger.error('❌ Init failed', error);
     process.exit(1);
@@ -102,97 +326,275 @@ async function fetchAudioFromLine(messageId) {
 }
 
 // ============================================================================
-// VOICE HANDLER - RAG + AUTO PROCESSING
+// TEXT HANDLER - ENHANCED with UX Features
 // ============================================================================
 
-async function handleVoiceMessage(messageId, replyToken, userId) {
+async function handleTextMessage(text, replyToken, userId) {
   try {
-    // Step 1: Save raw audio input to Inbox
-    await saveToInbox(userId, '[🎤 Voice Input]', 'voice_raw', { messageId });
+    const lower = text.toLowerCase().trim();
 
-    // Step 2: Fetch and transcribe audio
-    const audioBuffer = await fetchAudioFromLine(messageId);
-    const { success, text } = await transcribeAudio(audioBuffer);
-    
-    if (!success || !text) {
-      await saveToInbox(userId, '[ฟังไม่ออก]', 'voice_error');
-      await replyToLine(replyToken, '❌ ฟังไม่ออกค่ะ ลองใหม่หรือพิมพ์ข้อความมาค่ะ');
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 💰 PAYMENT COMMAND: "จ่าย #123"
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
+    if (paymentMatch) {
+      const orderNo = paymentMatch[1];
+      const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
+
+      if (result.success) {
+        const msg = formatPaymentSuccess(
+          orderNo,
+          result.customer,
+          result.totalAmount
+        );
+        
+        await replyToLine(replyToken, msg);
+        await saveToInbox(userId, text, 'payment_updated', { orderNo });
+        Logger.success(`✅ Payment updated #${orderNo}`);
+      } else {
+        const errorMsg = formatError('order_not_found', { orderNo });
+        await replyToLine(replyToken, errorMsg);
+      }
       return;
     }
 
-    Logger.info(`📝 Transcribed: "${text}"`);
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🚚 DELIVERY COMMAND: "ส่ง #123" or "ส่ง #123 พี่แดง"
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const deliveryMatch = text.match(/ส่ง\s*#?(\d+)(?:\s+(.+))?/i);
+    if (deliveryMatch) {
+      const orderNo = deliveryMatch[1];
+      const deliveryPerson = deliveryMatch[2]?.trim() || null;
+      
+      const result = await updateDeliveryStatus(
+        orderNo,
+        'กำลังจัดส่ง',
+        deliveryPerson
+      );
 
-    // Step 3: Save transcribed text to Inbox (raw data)
-    await saveToInbox(userId, text, 'voice_transcribed', { 
-      transcription: text,
-      timestamp: new Date().toISOString()
-    });
+      if (result.success) {
+        const msg = formatDeliveryStatus(result);
+        await replyToLine(replyToken, msg);
+        await saveToInbox(userId, text, 'delivery_updated', { orderNo });
+        Logger.success(`✅ Delivery updated #${orderNo}`);
+      } else {
+        const errorMsg = formatError('order_not_found', { orderNo });
+        await replyToLine(replyToken, errorMsg);
+      }
+      return;
+    }
 
-    // Step 3.5: 🔧 Check if this is stock adjustment command FIRST
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🚫 CANCEL ORDER: "ยกเลิก #123"
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/i);
+    if (cancelMatch) {
+      const orderNo = cancelMatch[1];
+      const result = await cancelOrder(orderNo);
+
+      if (result.success) {
+        const msg = formatCancelSuccess(
+          orderNo,
+          result.customer,
+          result.stockRestored
+        );
+        
+        await replyToLine(replyToken, msg);
+        await saveToInbox(userId, text, 'cancel_success', { orderNo });
+        monitor.recordCancellation(orderNo, true);
+        Logger.success(`✅ Cancelled order #${orderNo}`);
+      } else {
+        const errorMsg = formatError('order_not_found', { orderNo });
+        await replyToLine(replyToken, errorMsg);
+      }
+      return;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🔧 STOCK ADJUSTMENT
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const adjCommand = await parseAdjustmentCommand(text);
     if (adjCommand.isAdjustment) {
-      Logger.info(`🔧 Detected stock adjustment command`);
-      
       const result = await adjustStock(
-        adjCommand.item, 
-        adjCommand.value, 
+        adjCommand.item,
+        adjCommand.value,
         adjCommand.operation,
-        'voice_adjustment'
+        'text_adjustment'
       );
 
       if (result.success) {
         const icon = result.difference === 0 ? '➖' : result.difference > 0 ? '📈' : '📉';
         
-        await replyToLine(replyToken,
-          `✅ ปรับสต็อกสำเร็จ\n\n` +
-          `📦 ${result.item}\n` +
-          `━━━━━━━━━━━━━━\n` +
-          `เดิม: ${result.oldStock} ${result.unit}\n` +
-          `ใหม่: ${result.newStock} ${result.unit}\n` +
-          `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n` +
-          `💡 ${result.operationText}\n` +
-          `📊 บันทึก VarianceLog แล้ว`
-        );
-
+        let msg = `✅ ปรับสต็อกสำเร็จ\n\n`;
+        msg += `📦 ${result.item}\n`;
+        msg += `━━━━━━━━━━━━━━\n`;
+        msg += `เดิม: ${result.oldStock} ${result.unit}\n`;
+        msg += `ใหม่: ${result.newStock} ${result.unit}\n`;
+        msg += `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n`;
+        msg += `💡 ${result.operationText}`;
+        
+        // ✨ Add contextual help if stock is low
+        if (result.newStock <= 10) {
+          msg += '\n\n' + getContextualHelp('stock_low');
+        }
+        
+        await replyToLine(replyToken, msg);
         await saveToInbox(userId, text, 'stock_adjusted', { 
           item: result.item,
           oldStock: result.oldStock,
-          newStock: result.newStock,
-          operation: result.operation
+          newStock: result.newStock
         });
-
-        Logger.success(`✅ Stock adjusted via voice: ${result.item} (${result.operation})`);
       } else {
         await replyToLine(replyToken, result.error);
       }
-      return; // ✅ Exit early - don't parse as order
-    }
-
-    // Step 4: Parse as order (only if not stock adjustment)
-    const parsed = await parseOrder(text);
-    parsed.rawInput = text;
-
-    if (!parsed.success) {
-      await saveToInbox(userId, text, 'parse_failed', { error: parsed.error });
-      await replyToLine(replyToken, `❌ ${parsed.error}\n\nลองพูดใหม่หรือพิมพ์ "help" ดูวิธีใช้ค่ะ`);
       return;
     }
 
-    // Step 5: Apply smart corrections
-    const corrected = applySmartCorrection(parsed);
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ❓ HELP
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (lower === 'help' || lower === 'ช่วยเหลือ') {
+      await replyToLine(replyToken, 
+        `🤖 คำสั่งที่ใช้ได้\n` +
+        `${'='.repeat(30)}\n\n` +
+        `📦 รับออเดอร์:\n` +
+        `• กดไมค์พูดสั่งซื้อ (แนะนำ)\n` +
+        `• พิมพ์: "น้ำแข็ง 5 ถุง ร้านเจ๊แดง"\n\n` +
+        `💰 จัดการการเงิน:\n` +
+        `• "จ่าย #123" - อัปเดตการชำระเงิน\n\n` +
+        `🚚 จัดการการส่ง:\n` +
+        `• "ส่ง #123" - อัปเดตสถานะจัดส่ง\n` +
+        `• "ส่ง #123 พี่แดง" - ระบุคนส่ง\n\n` +
+        `🔧 จัดการสต็อก:\n` +
+        `• "เติมน้ำแข็ง 20" - เพิ่มสต็อก\n` +
+        `• "ลดน้ำแข็ง 10" - ลดสต็อก\n` +
+        `• "น้ำแข็งเหลือ 50" - ตั้งค่าเป๊ะ\n` +
+        `• "สต็อก" - ดูสต็อกทั้งหมด\n\n` +
+        `📊 รายงาน:\n` +
+        `• "รายงานสต็อก" - ดูการปรับสต็อก\n` +
+        `• "สถิติ" - ดู automation stats\n\n` +
+        `⚙️ อื่นๆ:\n` +
+        `• "ยกเลิก #123" - ยกเลิกออเดอร์\n` +
+        `• "รีเฟรช" - โหลดข้อมูลใหม่\n\n` +
+        `💡 Tip: ใช้เสียงจะแม่นและเร็วกว่า!`
+      );
+      return;
+    }
 
-    // Step 6: Calculate order value
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 📦 VIEW STOCK
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (lower.includes('สต็อก') && !lower.includes('รายงาน')) {
+      const searchTerm = text.replace(/สต็อก|ดู/gi, '').trim();
+      const stockList = await viewCurrentStock(searchTerm || null);
+      await replyToLine(replyToken, stockList);
+      return;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 📊 VARIANCE REPORT
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (lower.includes('รายงานสต็อก')) {
+      const report = await generateVarianceReport('today');
+      await replyToLine(replyToken, report);
+      return;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🔄 REFRESH CACHE
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (lower === 'รีเฟรช' || lower === 'refresh') {
+      await loadStockCache(true);
+      await loadCustomerCache(true);
+      await replyToLine(replyToken, '✅ รีเฟรชข้อมูลสำเร็จ\n\nโหลดสต็อกและลูกค้าใหม่แล้ว');
+      return;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // DEFAULT: Unknown command
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    await saveToInbox(userId, text, 'unknown_command');
+    
+    const errorMsg = formatError('parse_failed', { input: text });
+    await replyToLine(replyToken, errorMsg);
+
+  } catch (error) {
+    Logger.error('Text handler error', error);
+    await saveToInbox(userId, text, 'text_error', { error: error.message });
+    await replyToLine(replyToken, '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง');
+  }
+}
+
+// ============================================================================
+// VOICE HANDLER - ENHANCED with Stock Warnings
+// ============================================================================
+
+async function handleVoiceMessage(messageId, replyToken, userId) {
+  try {
+    await saveToInbox(userId, '[🎤 Voice Input]', 'voice_raw', { messageId });
+
+    const audioBuffer = await fetchAudioFromLine(messageId);
+    const { success, text } = await transcribeAudio(audioBuffer);
+    
+    if (!success || !text) {
+      await saveToInbox(userId, '[ฟังไม่ออก]', 'voice_error');
+      await replyToLine(replyToken, '❌ ฟังไม่ออก ลองใหม่หรือพิมพ์ข้อความมา');
+      return;
+    }
+
+    Logger.info(`📝 Transcribed: "${text}"`);
+    await saveToInbox(userId, text, 'voice_transcribed', { 
+      transcription: text,
+      timestamp: new Date().toISOString()
+    });
+
+    // Check for payment command
+    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
+    if (paymentMatch) {
+      await handleTextMessage(text, replyToken, userId);
+      return;
+    }
+
+    // Check for stock adjustment
+    const adjCommand = await parseAdjustmentCommand(text);
+    if (adjCommand.isAdjustment) {
+      await handleTextMessage(text, replyToken, userId);
+      return;
+    }
+
+    // Parse as order
+    const parsed = await parseOrder(text);
+    parsed.rawInput = text;
+
+    if (!parsed.success || !parsed.items || parsed.items.length === 0) {
+      await saveToInbox(userId, text, 'parse_failed', { error: parsed.error });
+      const errorMsg = formatError('parse_failed', { input: text });
+      await replyToLine(replyToken, errorMsg);
+      return;
+    }
+
+    const corrected = applySmartCorrection(parsed);
+    
+    // ✨ CHECK STOCK WARNINGS BEFORE PROCESSING
+    const stockCheck = checkStockWarnings(corrected.items);
+    
+    if (stockCheck.hasCritical) {
+      const warningMsg = formatStockWarnings(stockCheck);
+      await replyToLine(replyToken, warningMsg);
+      await saveToInbox(userId, text, 'insufficient_stock', { 
+        items: stockCheck.criticalItems 
+      });
+      return;
+    }
+
     const orderValue = corrected.items.reduce((sum, item) => 
       sum + (item.quantity * item.stockItem.price), 0
     );
 
-    // Step 7: Decision Engine - Should we auto-process?
     const decision = shouldAutoProcess(corrected, orderValue);
 
     if (decision.shouldAuto) {
-      // ✅ AUTO MODE: Create order immediately
-      
-      // Auto-add new customer if not in database
+      // Auto-add customer
       if (corrected.customer && corrected.customer !== 'ไม่ระบุ') {
         await autoAddCustomer(corrected.customer);
       }
@@ -204,55 +606,59 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
       });
 
       if (result.success) {
-        // Save success to Inbox for tracking
         await saveToInbox(userId, text, 'order_auto_success', { 
           orderNo: result.orderNo,
           customer: result.customer,
-          totalAmount: result.totalAmount,
-          confidence: corrected.confidence
+          totalAmount: result.totalAmount
         });
 
-        // Reply to admin
-        const summary = result.items.map(i => {
-          const itemName = i.productName || i.stockItem?.item || 'สินค้า';
-          const newStock = i.newStock !== undefined ? i.newStock : i.stockItem?.stock || 0;
-          return `• ${itemName} x${i.quantity} (${newStock} เหลือ)`;
-        }).join('\n');
-        
-        await replyToLine(replyToken, 
-          `✅ บันทึกออเดอร์สำเร็จ!\n\n` +
-          `📋 คำสั่งซื้อ #${result.orderNo}\n` +
-          `👤 ${result.customer}\n\n` +
-          `${summary}\n\n` +
-          `💰 รวม: ${result.totalAmount.toLocaleString()}฿\n` +
-          `🎯 ความมั่นใจ: ${corrected.confidence}\n\n` +
-          `💡 ยกเลิกได้ด้วย: "ยกเลิก #${result.orderNo}"`
+        // ✨ USE ENHANCED SUCCESS MESSAGE
+        const msg = formatOrderSuccess(
+          result.orderNo,
+          result.customer,
+          result.items,
+          result.totalAmount,
+          corrected.confidence
         );
+        
+        // ✨ ADD STOCK WARNING IF ANY
+        if (stockCheck.hasWarnings) {
+          const warnings = stockCheck.warnings
+            .map(w => w.message)
+            .join('\n');
+          await replyToLine(replyToken, msg + '\n\n━━━━━━━━━━━━━━━━━━━━\n' + warnings);
+        } else {
+          await replyToLine(replyToken, msg);
+        }
 
         monitor.recordDecision(decision, result.orderNo);
-        Logger.success(`✅ Auto-order #${result.orderNo} created (${corrected.confidence})`);
+        
+        // ✨ Notify admin if stock is critical
+        if (stockCheck.warnings.some(w => w.level === 'critical')) {
+          await pushToAdmin(`⚠️ สต็อกเหลือน้อยมาก!\n\n${formatStockWarnings(stockCheck)}`);
+        }
+        
       } else {
-        // Auto failed - save error to Inbox
         await saveToInbox(userId, text, 'order_auto_failed', { 
-          error: result.error,
-          confidence: corrected.confidence
+          error: result.error
         });
         
-        await replyToLine(replyToken, `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}`);
-        Logger.error(`❌ Auto-order failed: ${result.error}`);
+        await replyToLine(replyToken, 
+          `❌ ไม่สามารถสร้างออเดอร์ได้\n\n` +
+          `${result.error}\n\n` +
+          `💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
+        );
       }
     } else {
-      // 📝 MANUAL REVIEW MODE: Save to Inbox for admin review
-      const guess = corrected.items && corrected.items.length > 0 
-        ? corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ')
-        : '-';
+      // Manual review mode
+      const guess = corrected.items.map(i => 
+        `${i.stockItem.item} x${i.quantity}`
+      ).join(', ');
 
       await saveToInbox(userId, text, 'pending_review', { 
         summary: guess,
         customer: corrected.customer,
-        confidence: corrected.confidence,
-        blockReason: decision.reason,
-        orderValue: orderValue
+        blockReason: decision.reason
       });
 
       await replyToLine(replyToken, 
@@ -263,177 +669,16 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
         `• สินค้า: ${guess}\n` +
         `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n` +
         `⚠️ เหตุผล: ${decision.reason}\n` +
-        `📊 Confidence: ${corrected.confidence}\n\n` +
-        `💡 แอดมินจะตรวจสอบและบันทึกให้ค่ะ`
+        `💡 แอดมินจะตรวจสอบและบันทึกให้`
       );
 
       monitor.recordDecision(decision, 'pending');
-      Logger.info(`📥 Pending review: "${text}" (${decision.reason})`);
     }
 
   } catch (error) {
     Logger.error('Voice handler error', error);
     await saveToInbox(userId, '[System Error]', 'voice_error', { error: error.message });
-    await replyToLine(replyToken, '❌ เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่อีกครั้งค่ะ');
-  }
-}
-
-// ============================================================================
-// TEXT HANDLER - COMMANDS
-// ============================================================================
-
-async function handleTextMessage(text, replyToken, userId) {
-  try {
-    const lower = text.toLowerCase().trim();
-
-    // 🚫 CANCEL ORDER: "ยกเลิก #123"
-    const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/i);
-    if (cancelMatch) {
-      const orderNo = cancelMatch[1];
-      const result = await cancelOrder(orderNo);
-
-      if (result.success) {
-        const restoredList = result.stockRestored
-          .map(s => `• ${s.item} +${s.restored} (${s.newStock} เหลือ)`)
-          .join('\n');
-
-        await replyToLine(replyToken, 
-          `✅ ยกเลิกออเดอร์สำเร็จ\n\n` +
-          `📋 คำสั่งซื้อ #${orderNo}\n` +
-          `👤 ${result.customer}\n\n` +
-          `📦 คืนสต็อก:\n${restoredList}`
-        );
-
-        await saveToInbox(userId, text, 'cancel_success', { orderNo });
-        monitor.recordCancellation(orderNo, true);
-        Logger.success(`✅ Cancelled order #${orderNo}`);
-      } else {
-        await replyToLine(replyToken, `❌ ยกเลิกไม่สำเร็จ: ${result.error}`);
-      }
-      return;
-    }
-
-    // 🔧 STOCK ADJUSTMENT: Enhanced with +/-
-    const adjCommand = await parseAdjustmentCommand(text);
-    if (adjCommand.isAdjustment) {
-      const result = await adjustStock(
-        adjCommand.item, 
-        adjCommand.value, 
-        adjCommand.operation,
-        'voice_adjustment'
-      );
-
-      if (result.success) {
-        const icon = result.difference === 0 ? '➖' : result.difference > 0 ? '📈' : '📉';
-        
-        await replyToLine(replyToken,
-          `✅ ปรับสต็อกสำเร็จ\n\n` +
-          `📦 ${result.item}\n` +
-          `━━━━━━━━━━━━━━\n` +
-          `เดิม: ${result.oldStock} ${result.unit}\n` +
-          `ใหม่: ${result.newStock} ${result.unit}\n` +
-          `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n` +
-          `💡 ${result.operationText}\n` +
-          `📊 บันทึก VarianceLog แล้ว`
-        );
-
-        await saveToInbox(userId, text, 'stock_adjusted', { 
-          item: result.item,
-          oldStock: result.oldStock,
-          newStock: result.newStock,
-          operation: result.operation
-        });
-
-        Logger.success(`✅ Stock adjusted: ${result.item} (${result.operation})`);
-      } else {
-        await replyToLine(replyToken, result.error);
-      }
-      return;
-    }
-
-    // 📊 AUTOMATION STATS: "สถิติ"
-    if (lower.includes('สถิติ') || lower === 'stats') {
-      const report = monitor.getReport();
-      await replyToLine(replyToken, report);
-      return;
-    }
-
-    // 📦 VIEW STOCK: "สต็อก" or "ดูสต็อก"
-    if (lower.includes('สต็อก') && !lower.includes('รายงาน') && !lower.includes('ปรับ')) {
-      const searchTerm = text.replace(/สต็อก|ดู/gi, '').trim();
-      const stockList = await viewCurrentStock(searchTerm || null);
-      await replyToLine(replyToken, stockList);
-      return;
-    }
-
-    // 📊 VARIANCE REPORT: "รายงานสต็อก"
-    if (lower.includes('รายงานสต็อก') || lower.includes('variance')) {
-      const report = await generateVarianceReport('today');
-      await replyToLine(replyToken, report);
-      return;
-    }
-
-    // 🔄 REFRESH CACHE: "รีเฟรช"
-    if (lower === 'รีเฟรช' || lower === 'refresh') {
-      await loadStockCache(true);
-      await loadCustomerCache(true);
-      await replyToLine(replyToken, '✅ รีเฟรชข้อมูลสำเร็จ\n\nโหลดสต็อกและลูกค้าใหม่แล้วค่ะ');
-      return;
-    }
-
-    // ❓ HELP: "help"
-    if (lower === 'help' || lower === 'ช่วยเหลือ') {
-      await replyToLine(replyToken, 
-        `🤖 คำสั่งที่ใช้ได้\n` +
-        `${'='.repeat(30)}\n\n` +
-        `📦 รับออเดอร์:\n` +
-        `• กดไมค์พูดสั่งซื้อ (แนะนำ)\n` +
-        `• พิมพ์: "น้ำแข็ง 5 ถุง ร้านเจ๊แดง"\n\n` +
-        `🔧 จัดการสต็อก:\n` +
-        `• "เติมน้ำแข็ง 20" - เพิ่มสต็อก\n` +
-        `• "ลดน้ำแข็ง 10" - ลดสต็อก\n` +
-        `• "น้ำแข็งเหลือ 50" - ตั้งค่าเป๊ะ\n` +
-        `• "สต็อก" - ดูสต็อกทั้งหมด\n` +
-        `• "สต็อกน้ำแข็ง" - ดูเฉพาะสินค้า\n\n` +
-        `📊 รายงาน:\n` +
-        `• "รายงานสต็อก" - ดูการปรับสต็อกวันนี้\n` +
-        `• "สถิติ" - ดู automation stats\n\n` +
-        `⚙️ อื่นๆ:\n` +
-        `• "ยกเลิก #123" - ยกเลิกออเดอร์\n` +
-        `• "รีเฟรช" - โหลดข้อมูลใหม่\n\n` +
-        `💡 Tip: ใช้เสียงจะแม่นและเร็วกว่าค่ะ!`
-      );
-      return;
-    }
-
-    // DEFAULT: Try to parse as order (text input)
-    await saveToInbox(userId, text, 'text_input');
-    
-    const parsed = await parseOrder(text);
-    if (parsed.success) {
-      const summary = parsed.items.map(i => 
-        `${i.stockItem.item} x${i.quantity}`
-      ).join(', ');
-      
-      await replyToLine(replyToken, 
-        `📝 เข้าใจแล้ว:\n` +
-        `👤 ${parsed.customer}\n` +
-        `📦 ${summary}\n\n` +
-        `💬 ยืนยันด้วย "ยืนยัน" หรือกดไมค์พูดใหม่ค่ะ`
-      );
-    } else {
-      await replyToLine(replyToken, 
-        `💡 ไม่เข้าใจคำสั่งค่ะ\n\n` +
-        `ลองใช้:\n` +
-        `• กดไมค์พูดสั่งซื้อ\n` +
-        `• พิมพ์ "help" ดูวิธีใช้`
-      );
-    }
-
-  } catch (error) {
-    Logger.error('Text handler error', error);
-    await saveToInbox(userId, text, 'text_error', { error: error.message });
-    await replyToLine(replyToken, '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้งค่ะ');
+    await replyToLine(replyToken, '❌ เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่อีกครั้ง');
   }
 }
 
@@ -465,11 +710,10 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    mode: 'rag-powered-admin',
+    mode: 'ux-enhanced',
     timestamp: new Date().toISOString() 
   });
 });
