@@ -1,17 +1,18 @@
-// dashboardService.js - FIXED: Read from JSON column
+// dashboardService.js - MERGED: Summary + Dashboard + All Features
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateString } = require('./utils');
 const { getSheetData, appendSheetData } = require('./googleServices');
 
+// ============================================================================
+// DAILY METRICS CALCULATION (from orders)
+// ============================================================================
+
 async function calculateDailyMetrics(targetDate = null) {
   try {
     const date = targetDate || getThaiDateString();
-    Logger.info(`📊 Calculating dashboard metrics for ${date}...`);
+    Logger.info(`📊 Calculating metrics for ${date}...`);
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 1: Get orders (with embedded line items in JSON)
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     
     if (orderRows.length <= 1) {
@@ -36,16 +37,13 @@ async function calculateDailyMetrics(targetDate = null) {
       };
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 2: Parse line items from JSON column
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const orderCount = todayOrders.length;
     let totalSales = 0;
     let totalCost = 0;
     const productSales = {};
 
+    // Parse line items from JSON column (Column H)
     for (const order of todayOrders) {
-      const lineItemsJson = order[7] || '[]';  // Column H (รายการสินค้า)
+      const lineItemsJson = order[7] || '[]';
       
       try {
         const lineItems = JSON.parse(lineItemsJson);
@@ -58,7 +56,6 @@ async function calculateDailyMetrics(targetDate = null) {
           totalSales += (quantity * price);
           totalCost += (quantity * cost);
           
-          // Track product sales
           const productName = line.item;
           if (!productSales[productName]) {
             productSales[productName] = 0;
@@ -67,15 +64,12 @@ async function calculateDailyMetrics(targetDate = null) {
         });
         
       } catch (parseError) {
-        Logger.error(`Failed to parse line items for order #${order[0]}`, parseError);
+        Logger.error(`Failed to parse order #${order[0]}`, parseError);
       }
     }
     
     const totalProfit = totalSales - totalCost;
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 3: Calculate top products
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const topProducts = Object.entries(productSales)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
@@ -83,14 +77,14 @@ async function calculateDailyMetrics(targetDate = null) {
 
     const metrics = {
       date,
-      orderCount,
+      orderCount: todayOrders.length,
       totalCost,
       totalSales,
       totalProfit,
       topProducts
     };
 
-    Logger.success(`✅ Metrics: ${orderCount} orders, ${totalSales.toLocaleString()}฿ sales`);
+    Logger.success(`✅ Metrics: ${todayOrders.length} orders, ${totalSales.toLocaleString()}฿`);
     return metrics;
 
   } catch (error) {
@@ -98,6 +92,10 @@ async function calculateDailyMetrics(targetDate = null) {
     throw error;
   }
 }
+
+// ============================================================================
+// PERSIST TO DASHBOARD SHEET
+// ============================================================================
 
 async function persistDashboardMetrics(metrics) {
   try {
@@ -135,25 +133,9 @@ async function persistDashboardMetrics(metrics) {
   }
 }
 
-async function runDailySummaryJob() {
-  try {
-    Logger.info('🔄 Running daily summary job...');
-    const metrics = await calculateDailyMetrics();
-    
-    if (!metrics) {
-      Logger.info('No data to summarize');
-      return null;
-    }
-
-    await persistDashboardMetrics(metrics);
-    const summary = formatDailySummary(metrics);
-
-    return { success: true, metrics, summary };
-  } catch (error) {
-    Logger.error('runDailySummaryJob failed', error);
-    return { success: false, error: error.message };
-  }
-}
+// ============================================================================
+// FORMAT DAILY SUMMARY (Human-readable)
+// ============================================================================
 
 function formatDailySummary(metrics) {
   let msg = `📊 สรุปยอดขายประจำวัน\n${'='.repeat(40)}\n\n`;
@@ -171,53 +153,140 @@ function formatDailySummary(metrics) {
   return msg;
 }
 
-function scheduleDailyDashboard() {
-  const runScheduledJob = async () => {
+// ============================================================================
+// GENERATE AND SAVE DAILY SUMMARY (Main Function)
+// ============================================================================
+
+async function generateAndSaveDailySummary(targetDate = null) {
+  try {
+    const metrics = await calculateDailyMetrics(targetDate);
+    
+    if (!metrics) {
+      const date = targetDate || getThaiDateString();
+      return `📊 สรุปยอดขาย ${date}\n\n❌ ไม่มีข้อมูลออเดอร์`;
+    }
+
+    if (metrics.orderCount === 0) {
+      return `📊 สรุปยอดขาย ${metrics.date}\n\n❌ ไม่มีออเดอร์วันนี้`;
+    }
+
+    // Save to Dashboard sheet
+    try {
+      await persistDashboardMetrics(metrics);
+    } catch (dashError) {
+      Logger.error('Failed to save to Dashboard', dashError);
+      // Continue even if save fails
+    }
+
+    return formatDailySummary(metrics);
+
+  } catch (error) {
+    Logger.error('generateAndSaveDailySummary failed', error);
+    return `❌ ไม่สามารถสร้างรายงานได้: ${error.message}`;
+  }
+}
+
+// ============================================================================
+// INBOX SUMMARY
+// ============================================================================
+
+async function generateInboxSummary(limit = 15) {
+  try {
+    Logger.info(`📝 Generating inbox summary (last ${limit})...`);
+
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'Inbox!A:B');
+    
+    if (rows.length <= 1) {
+      return '📝 Inbox ว่างเปล่า\n\nยังไม่มีข้อความในระบบ';
+    }
+
+    const messages = rows.slice(1)
+      .slice(-limit)
+      .reverse();
+
+    let msg = `📝 Inbox (${messages.length} ข้อความล่าสุด)\n${'='.repeat(40)}\n\n`;
+    
+    messages.forEach((row, idx) => {
+      const timestamp = row[0] || '';
+      const text = row[1] || '';
+      
+      const time = timestamp.split(' ')[1] || timestamp;
+      
+      let icon = '📝';
+      if (text.includes('🎤')) icon = '🎤';
+      if (text.includes('✅')) icon = '✅';
+      
+      msg += `${idx + 1}. [${time}] ${icon} ${text.substring(0, 40)}\n`;
+      if (text.length > 40) msg += `   ...\n`;
+    });
+
+    return msg;
+
+  } catch (error) {
+    Logger.error('generateInboxSummary failed', error);
+    return `❌ ไม่สามารถดู Inbox ได้: ${error.message}`;
+  }
+}
+
+// ============================================================================
+// SCHEDULED DAILY SUMMARY (Auto-run at 23:59 BKK)
+// ============================================================================
+
+function scheduleDailySummary(pushToAdminFn) {
+  const runDailySummary = async () => {
     const now = new Date();
     const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
     const hour = bangkokTime.getHours();
     const minute = bangkokTime.getMinutes();
 
+    // Send summary at 23:59 BKK time
     if (hour === 23 && minute === 59) {
-      Logger.info('⏰ Scheduled dashboard job triggered');
+      Logger.info('⏰ Auto-sending daily summary...');
       try {
-        const result = await runDailySummaryJob();
-        if (result.success) {
-          const { pushToAdmin } = require('./app');
-          await pushToAdmin(result.summary);
-        }
+        const summary = await generateAndSaveDailySummary();
+        await pushToAdminFn(summary);
+        Logger.success('✅ Daily summary sent to admin');
       } catch (error) {
-        Logger.error('Scheduled job failed', error);
+        Logger.error('Failed to send daily summary', error);
       }
     }
   };
 
-  setInterval(runScheduledJob, 60 * 1000);
-  Logger.success('✅ Daily dashboard scheduler initialized (23:59 BKK)');
+  // Check every minute
+  setInterval(runDailySummary, 60 * 1000);
+  Logger.success('✅ Daily summary scheduler initialized (23:59 BKK)');
 }
+
+// ============================================================================
+// MANUAL DASHBOARD UPDATE (for testing/manual trigger)
+// ============================================================================
 
 async function triggerManualDashboardUpdate(date = null) {
   try {
     Logger.info('🔧 Manual dashboard update');
-    const metrics = await calculateDailyMetrics(date);
-    
-    if (!metrics) {
-      return '⚠️ No data found';
-    }
-
-    await persistDashboardMetrics(metrics);
-    return `✅ Dashboard Updated\n\n${formatDailySummary(metrics)}`;
+    const summary = await generateAndSaveDailySummary(date);
+    return summary;
   } catch (error) {
     Logger.error('Manual update failed', error);
     return `❌ Update failed: ${error.message}`;
   }
 }
 
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
 module.exports = {
+  // Main functions
+  generateAndSaveDailySummary,
+  generateInboxSummary,
+  
+  // Individual components (for testing)
   calculateDailyMetrics,
   persistDashboardMetrics,
-  runDailySummaryJob,
-  scheduleDailyDashboard,
-  triggerManualDashboardUpdate,
-  formatDailySummary
+  formatDailySummary,
+  
+  // Scheduler
+  scheduleDailySummary,
+  triggerManualDashboardUpdate
 };
