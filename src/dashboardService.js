@@ -1,4 +1,4 @@
-// dashboardService.js - FIXED: Simplified and working
+// dashboardService.js - FIXED DATE MATCHING
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateString } = require('./utils');
@@ -6,7 +6,7 @@ const { getSheetData, appendSheetData } = require('./googleServices');
 
 async function generateDailySummary(targetDate = null) {
   try {
-    const date = targetDate || getThaiDateString();
+    const date = targetDate || getThaiDateString(); // e.g. "2026-01-07"
     Logger.info(`📊 Generating summary for ${date}...`);
 
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
@@ -15,9 +15,22 @@ async function generateDailySummary(targetDate = null) {
       return `📊 สรุปยอดขาย ${date}\n\n❌ ไม่มีออเดอร์`;
     }
 
+    // 🔧 FIX: Better date matching
     const todayOrders = orderRows.slice(1).filter(row => {
-      const orderDate = (row[1] || '').split(' ')[0];
-      return orderDate === date;
+      const orderDateTime = row[1] || ''; // e.g. "07/01/2026 14:30:00" or "2026-01-07 14:30:00"
+      
+      // Handle both formats
+      if (orderDateTime.includes('/')) {
+        // Format: "07/01/2026 14:30:00" → extract "07/01/2026"
+        const orderDatePart = orderDateTime.split(' ')[0]; // "07/01/2026"
+        const [day, month, year] = orderDatePart.split('/');
+        const normalizedOrderDate = `${year}-${month}-${day}`; // "2026-01-07"
+        return normalizedOrderDate === date;
+      } else {
+        // Format: "2026-01-07 14:30:00" → extract "2026-01-07"
+        const orderDatePart = orderDateTime.split(' ')[0];
+        return orderDatePart === date;
+      }
     });
 
     if (todayOrders.length === 0) {
