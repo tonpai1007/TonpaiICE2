@@ -1,11 +1,20 @@
-// orderParser.js - Smart Auto Parser with Confidence Boosting (Fixed)
+// orderParser.js - FIXED: Add "มี" pattern support
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
 
-// ============================================================================
-// SMART PARSING WITH CONFIDENCE BOOSTING
-// ============================================================================
+// 🔧 NEW: Pre-process input to normalize "มี" pattern
+function normalizeOrderInput(text) {
+  // Transform "น้ำแข็งมี 5 ถุง" → "น้ำแข็ง 5 ถุง"
+  // Transform "น้ำแข็ง มี 5" → "น้ำแข็ง 5"
+  let normalized = text.replace(/\s*มี\s*/g, ' ').trim();
+  
+  // Remove extra spaces
+  normalized = normalized.replace(/\s+/g, ' ');
+  
+  Logger.info(`📝 Normalized: "${text}" → "${normalized}"`);
+  return normalized;
+}
 
 async function parseOrder(userInput) {
   const stockCache = getStockCache();
@@ -16,14 +25,15 @@ async function parseOrder(userInput) {
   }
 
   try {
-    // 1. Build enhanced context
+    // 🔧 APPLY NORMALIZATION
+    const normalizedInput = normalizeOrderInput(userInput);
+    
     const stockList = stockCache.map((item, idx) => 
       `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}`
     ).join('\n');
 
     const customerList = customerCache.slice(0, 50).map(c => c.name).join(', ');
 
-    // 2. Enhanced prompt
     const prompt = `You are an expert Thai order parser. Extract order details with HIGH confidence.
 
 STOCK CATALOG:
@@ -31,7 +41,12 @@ ${stockList}
 
 KNOWN CUSTOMERS: ${customerList}
 
-USER INPUT: "${userInput}"
+USER INPUT: "${normalizedInput}"
+
+IMPORTANT PATTERNS TO RECOGNIZE:
+- "น้ำแข็ง 2 ถุง" = ice 2 bags
+- "น้ำแข็งมี 5" = ice 5 (quantity)
+- "เอา 3 น้ำแข็ง" = take 3 ice
 
 CONFIDENCE RULES (return "high" if ALL true):
 1. Customer name is clearly mentioned (even if not in known customers list)
@@ -43,12 +58,10 @@ CUSTOMER MATCHING RULES:
 - If customer name is mentioned at the start → USE IT (even if not in known customers)
 - Examples: "แฟน", "พี่ใหม่", "คุณสมชาย", "ร้านป้าไก่"
 - ONLY use "ไม่ระบุ" if absolutely NO customer name is mentioned
-- Names can be Thai nicknames, common names, or shop names
 
 FUZZY MATCHING:
 - "น้ำแข็ง" matches "น้ำแข็งหลอด", "น้ำแข็งก้อน"
 - "เบียร์" matches "เบียร์ลีโอ", "เบียร์ช้าง"
-- "โค้ก" matches "โค้ก(ลัง)", "โค้ก(ขวด)"
 - Numbers: "ห้า"=5, "สิบ"=10
 
 OUTPUT JSON:
@@ -64,24 +77,10 @@ OUTPUT JSON:
   "paymentStatus": "unpaid or credit",
   "confidence": "high or medium or low",
   "reasoning": "why this confidence level"
-}
-
-EXAMPLES:
-Input: "แฟน น้ำแข็ง 2 ถุง โค้ก 1 ลัง"
-Output: {"customer": "แฟน", "items": [...], "confidence": "high", "reasoning": "ชื่อลูกค้าชัดเจน สินค้าตรง จำนวนชัดเจน"}
-
-Input: "สมชาย สั่งน้ำแข็ง 5 ถุง"
-Output: {"customer": "สมชาย", "items": [...], "confidence": "high"}
-
-Input: "เอาเบียร์ 3 ขวด"
-Output: {"customer": "ไม่ระบุ", "items": [...], "confidence": "medium", "reasoning": "ไม่มีชื่อลูกค้า"}
-
-Input: "คุณแดง บอกว่าอาจจะเอาโค้กสักหน่อย"
-Output: {"customer": "คุณแดง", "items": [...], "confidence": "low", "reasoning": "มีคำคลุมเครือ อาจจะ สักหน่อย"}`;
+}`;
 
     const result = await generateWithGroq(prompt, true);
 
-    // 3. Map stockId to actual items
     const mappedItems = [];
     if (result.items && Array.isArray(result.items)) {
       for (const item of result.items) {
@@ -95,8 +94,7 @@ Output: {"customer": "คุณแดง", "items": [...], "confidence": "low", 
       }
     }
 
-    // 4. CONFIDENCE BOOSTING
-    const boostedConfidence = boostConfidence(result, mappedItems, userInput, customerCache);
+    const boostedConfidence = boostConfidence(result, mappedItems, normalizedInput, customerCache);
 
     Logger.info(
       `📝 Parsed: ${mappedItems.length} items | ` +
@@ -125,15 +123,10 @@ Output: {"customer": "คุณแดง", "items": [...], "confidence": "low", 
   }
 }
 
-// ============================================================================
-// CONFIDENCE BOOSTING LOGIC (FIXED)
-// ============================================================================
-
 function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
   let confidence = aiResult.confidence || 'low';
   const boostReasons = [];
 
-  // Check 1: All items have exact matches
   const allExactMatch = mappedItems.every(item => 
     item.matchConfidence === 'exact'
   );
@@ -141,12 +134,10 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
     boostReasons.push('exact_match');
   }
 
-  // Check 2: Customer is mentioned (even if not in database)
   const customerMentioned = aiResult.customer && aiResult.customer !== 'ไม่ระบุ';
   if (customerMentioned) {
     boostReasons.push('customer_mentioned');
     
-    // Extra boost if customer is in database
     const customerExists = customerCache.some(c => 
       c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
     );
@@ -155,7 +146,6 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
     }
   }
 
-  // Check 3: Stock is available for all items
   const allInStock = mappedItems.every(item => 
     item.stockItem.stock >= item.quantity
   );
@@ -163,19 +153,16 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
     boostReasons.push('stock_available');
   }
 
-  // Check 4: Clear quantity words
   const hasQuantityWords = /\d+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ/.test(userInput);
   if (hasQuantityWords) {
     boostReasons.push('clear_quantity');
   }
 
-  // Check 5: No negative signals
   const negativeWords = ['บางที', 'คิดว่า', 'อาจจะ', 'ไม่แน่ใจ', 'หรือเปล่า'];
   const hasNegativeSignal = negativeWords.some(word => 
     userInput.toLowerCase().includes(word)
   );
 
-  // BOOST LOGIC
   if (confidence === 'medium' && boostReasons.length >= 3) {
     Logger.info(`🚀 Confidence boosted: medium → high (${boostReasons.join(', ')})`);
     return 'high';
@@ -186,7 +173,6 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
     return 'medium';
   }
 
-  // DOWNGRADE if negative signals
   if (hasNegativeSignal && confidence === 'high') {
     Logger.warn(`⚠️ Confidence downgraded: high → medium (negative words)`);
     return 'medium';
@@ -194,9 +180,5 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
 
   return confidence;
 }
-
-// ============================================================================
-// EXPORTS
-// ============================================================================
 
 module.exports = { parseOrder };
