@@ -1,12 +1,13 @@
-// dashboardService.js - FIXED DATE MATCHING
+// dashboardService.js - FIXED: Proper date matching
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-const { getThaiDateString } = require('./utils');
+const { getThaiDateString, extractGregorianDate } = require('./utils');
 const { getSheetData, appendSheetData } = require('./googleServices');
 
 async function generateDailySummary(targetDate = null) {
   try {
-    const date = targetDate || getThaiDateString(); // e.g. "2026-01-07"
+    // Use Gregorian format for comparison: "2026-01-07"
+    const date = targetDate || getThaiDateString();
     Logger.info(`📊 Generating summary for ${date}...`);
 
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
@@ -15,34 +16,27 @@ async function generateDailySummary(targetDate = null) {
       return `📊 สรุปยอดขาย ${date}\n\n❌ ไม่มีออเดอร์`;
     }
 
-    // 🔧 FIX: Better date matching
+    // Filter orders for target date
     const todayOrders = orderRows.slice(1).filter(row => {
-      const orderDateTime = row[1] || ''; // e.g. "07/01/2026 14:30:00" or "2026-01-07 14:30:00"
-      
-      // Handle both formats
-      if (orderDateTime.includes('/')) {
-        // Format: "07/01/2026 14:30:00" → extract "07/01/2026"
-        const orderDatePart = orderDateTime.split(' ')[0]; // "07/01/2026"
-        const [day, month, year] = orderDatePart.split('/');
-        const normalizedOrderDate = `${year}-${month}-${day}`; // "2026-01-07"
-        return normalizedOrderDate === date;
-      } else {
-        // Format: "2026-01-07 14:30:00" → extract "2026-01-07"
-        const orderDatePart = orderDateTime.split(' ')[0];
-        return orderDatePart === date;
-      }
+      const orderDateTime = row[1] || ''; // "07/01/2026 14:30:00" or "2026-01-07 14:30:00"
+      const orderDate = extractGregorianDate(orderDateTime); // → "2026-01-07"
+      return orderDate === date;
     });
 
     if (todayOrders.length === 0) {
-      return `📊 สรุปยอดขาย ${date}\n\n❌ ไม่มีออเดอร์วันนี้`;
+      return `📊 สรุปยอดขาย ${formatDateForDisplay(date)}\n\n❌ ไม่มีออเดอร์วันนี้`;
     }
 
     let totalSales = 0;
     let totalCost = 0;
     const productCount = {};
+    const customerOrders = {};
 
     for (const order of todayOrders) {
+      const customer = order[2] || 'ไม่ระบุ';
       const lineItemsJson = order[7] || '[]';
+      
+      customerOrders[customer] = (customerOrders[customer] || 0) + 1;
       
       try {
         const lineItems = JSON.parse(lineItemsJson);
@@ -65,24 +59,41 @@ async function generateDailySummary(targetDate = null) {
     }
     
     const totalProfit = totalSales - totalCost;
+    const profitMargin = totalSales > 0 ? ((totalProfit / totalSales) * 100).toFixed(1) : 0;
 
+    // Top products
     const topProducts = Object.entries(productCount)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
       .map(([name, qty]) => `${name} (${qty})`);
 
+    // Top customers
+    const topCustomers = Object.entries(customerOrders)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, count]) => `${name} (${count} ออเดอร์)`);
+
     let msg = `📊 สรุปยอดขายประจำวัน\n${'='.repeat(40)}\n\n`;
-    msg += `📅 วันที่: ${date}\n\n`;
+    msg += `📅 วันที่: ${formatDateForDisplay(date)}\n\n`;
     msg += `📦 จำนวนออเดอร์: ${todayOrders.length} รายการ\n\n`;
-    msg += `💰 ต้นทุน: ${totalCost.toLocaleString()}฿\n`;
-    msg += `💵 ยอดขาย: ${totalSales.toLocaleString()}฿\n`;
-    msg += `📈 กำไร: ${totalProfit.toLocaleString()}฿\n\n`;
+    msg += `💰 การเงิน:\n`;
+    msg += `   • ต้นทุน: ${totalCost.toLocaleString()}฿\n`;
+    msg += `   • ยอดขาย: ${totalSales.toLocaleString()}฿\n`;
+    msg += `   • กำไร: ${totalProfit.toLocaleString()}฿\n`;
+    msg += `   • กำไรสุทธิ: ${profitMargin}%\n\n`;
     
     if (topProducts.length > 0) {
       msg += `🏆 สินค้าขายดี Top ${topProducts.length}:\n`;
-      topProducts.forEach((p, i) => msg += `${i + 1}. ${p}\n`);
+      topProducts.forEach((p, i) => msg += `   ${i + 1}. ${p}\n`);
+      msg += `\n`;
     }
 
+    if (topCustomers.length > 0) {
+      msg += `👑 ลูกค้าประจำ:\n`;
+      topCustomers.forEach((c, i) => msg += `   ${i + 1}. ${c}\n`);
+    }
+
+    // Save to Dashboard
     try {
       const dashRows = await getSheetData(CONFIG.SHEET_ID, 'Dashboard!A:F');
       const exists = dashRows.slice(1).some(row => row[0] === date);
@@ -109,6 +120,12 @@ async function generateDailySummary(targetDate = null) {
     Logger.error('generateDailySummary failed', error);
     return `❌ ไม่สามารถสร้างรายงานได้: ${error.message}`;
   }
+}
+
+function formatDateForDisplay(gregorianDate) {
+  // Convert "2026-01-07" → "07/01/2026"
+  const [year, month, day] = gregorianDate.split('-');
+  return `${day}/${month}/${year}`;
 }
 
 async function generateInboxSummary(limit = 15) {
