@@ -1,9 +1,8 @@
-// smartOrderLearning.js - Learn from past orders to improve accuracy
+// smartOrderLearning.js - FIXED: Removed filesystem dependency (not needed)
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { normalizeText } = require('./utils');
 const { getSheetData } = require('./googleServices');
-const { getStockCache } = require('./cacheManager');
 
 // ============================================================================
 // CUSTOMER ORDER HISTORY ANALYZER
@@ -13,63 +12,24 @@ class SmartOrderLearner {
   constructor() {
     this.customerPatterns = new Map();
     this.lastLoaded = 0;
-    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes refresh for Sheet
-  }
-
-  // HELPER: Convert Map to Object for JSON saving
-  _serializeMap(map) {
-    return JSON.stringify(Array.from(map.entries()));
-  }
-
-  // HELPER: Convert Object back to Map for loading
-  _deserializeMap(jsonStr) {
-    return new Map(JSON.parse(jsonStr));
-  }
-
-  async saveCache() {
-    try {
-      const data = this._serializeMap(this.customerPatterns);
-      await fs.writeFile(CACHE_FILE, data, 'utf8');
-      Logger.info('💾 Smart memory saved to disk');
-    } catch (error) {
-      Logger.error('Failed to save smart cache', error);
-    }
-  }
-
-  async loadCacheFromFile() {
-    try {
-      // Check if file exists
-      await fs.access(CACHE_FILE);
-      
-      const data = await fs.readFile(CACHE_FILE, 'utf8');
-      this.customerPatterns = this._deserializeMap(data);
-      Logger.success(`📂 Loaded ${this.customerPatterns.size} customer patterns from disk`);
-      return true;
-    } catch (error) {
-      Logger.info('No local cache found, starting fresh');
-      return false;
-    }
+    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes - refresh from Sheets
   }
 
   async loadOrderHistory() {
     const now = Date.now();
     
-    // 1. Try loading from disk first (if empty)
-    if (this.customerPatterns.size === 0) {
-      await this.loadCacheFromFile();
-    }
-
-    // 2. Check if we need to refresh from Sheets (Time based)
+    // Check if we need to refresh from Sheets
     if (this.customerPatterns.size > 0 && (now - this.lastLoaded) < this.CACHE_DURATION) {
-      return;
+      return; // Use existing in-memory cache
     }
 
     try {
-      Logger.info('🧠 Syncing order history from Sheets...');
+      Logger.info('🧠 Loading order history from Sheets...');
       
       const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
       
       if (orderRows.length <= 1) {
+        Logger.warn('No order history found');
         return;
       }
 
@@ -94,6 +54,7 @@ class SmartOrderLearner {
               commonItems: new Map(),
               totalOrders: 0
             });
+            newLearningCount++;
           }
 
           const pattern = this.customerPatterns.get(customer);
@@ -104,18 +65,12 @@ class SmartOrderLearner {
             const itemName = item.item;
             const key = normalizeText(itemName);
             
-            // Re-map internal commonItems if it was loaded from JSON (it might be a plain object, we need to fix it)
-            if (!(pattern.commonItems instanceof Map)) {
-                pattern.commonItems = new Map(JSON.parse(JSON.stringify(pattern.commonItems))); 
-            }
-
             if (!pattern.commonItems.has(key)) {
               pattern.commonItems.set(key, {
                 name: itemName,
                 count: 0,
                 quantities: []
               });
-              newLearningCount++;
             }
             
             const itemData = pattern.commonItems.get(key);
@@ -123,7 +78,7 @@ class SmartOrderLearner {
             itemData.quantities.push(item.quantity);
           });
 
-          // Store full order pattern
+          // Store full order pattern (keep last 20 per customer)
           pattern.orders.push({
             items: lineItems.map(i => ({
               item: i.item,
@@ -133,27 +88,30 @@ class SmartOrderLearner {
             timestamp: order[1]
           });
           
-          // Keep only last 20 orders per customer to save RAM
-          if (pattern.orders.length > 20) pattern.orders.shift();
+          if (pattern.orders.length > 20) {
+            pattern.orders.shift();
+          }
 
         } catch (parseError) {
-          // Ignore bad rows
+          // Skip invalid orders
         }
       }
 
       this.lastLoaded = now;
       
       if (newLearningCount > 0) {
-        await this.saveCache(); // SAVE TO DISK
-        Logger.success(`✅ Learned/Updated patterns for ${this.customerPatterns.size} customers`);
+        Logger.success(`✅ Learned patterns for ${newLearningCount} new customers`);
       }
+      
+      Logger.success(`📊 Total: ${this.customerPatterns.size} customers, ${this.getTotalPatterns()} patterns`);
 
     } catch (error) {
       Logger.error('Failed to load order history', error);
     }
   }
+
   // ============================================================================
-  // SMART MATCHING: Find customer by fuzzy name match
+  // SMART MATCHING
   // ============================================================================
 
   findCustomerByName(inputName) {
@@ -166,21 +124,20 @@ class SmartOrderLearner {
     for (const [customer, pattern] of this.customerPatterns.entries()) {
       const score = this.calculateNameSimilarity(normalized, pattern.normalizedName);
       
-      if (score > bestScore && score >= 0.7) { // 70% similarity threshold
+      if (score > bestScore && score >= 0.7) {
         bestScore = score;
         bestMatch = pattern;
       }
     }
 
     if (bestMatch) {
-      Logger.info(`🎯 Found customer match: "${inputName}" → "${bestMatch.customer}" (${(bestScore * 100).toFixed(0)}%)`);
+      Logger.info(`🎯 Found customer: "${inputName}" → "${bestMatch.customer}" (${(bestScore * 100).toFixed(0)}%)`);
     }
 
     return bestMatch;
   }
 
   calculateNameSimilarity(str1, str2) {
-    // Simple similarity: longest common substring ratio
     let longest = 0;
     const len1 = str1.length;
     const len2 = str2.length;
@@ -199,15 +156,20 @@ class SmartOrderLearner {
   }
 
   // ============================================================================
-  // PREDICT ORDER: Based on customer history
+  // PREDICT ORDER
   // ============================================================================
 
   predictOrder(customerName, parsedItems = []) {
     const customerPattern = this.findCustomerByName(customerName);
-    if (!customerPattern) return { success: false, reason: 'customer_not_found', confidence: 0 };
+    
+    if (!customerPattern) {
+      return { success: false, reason: 'customer_not_found', confidence: 0 };
+    }
 
+    // No items parsed - suggest common items
     if (!parsedItems || parsedItems.length === 0) {
       const suggestions = this.getMostCommonItems(customerPattern);
+      
       if (suggestions.length > 0) {
         return {
           success: true,
@@ -219,7 +181,8 @@ class SmartOrderLearner {
         };
       }
     }
-    // If items were parsed, boost confidence if they match history
+
+    // Items parsed - check match rate
     if (parsedItems && parsedItems.length > 0) {
       let matchCount = 0;
       const enhancedItems = [];
@@ -231,7 +194,6 @@ class SmartOrderLearner {
         if (historical) {
           matchCount++;
           
-          // Get average quantity from history
           const avgQty = Math.round(
             historical.quantities.reduce((a, b) => a + b, 0) / historical.quantities.length
           );
@@ -248,15 +210,14 @@ class SmartOrderLearner {
             ...item,
             historical: false
           });
-        return { success: false, reason: 'no_pattern_match', confidence: 'low' };
         }
       }
 
       const matchRate = matchCount / parsedItems.length;
       let confidence = 'low';
       
-      if (matchRate >= 0.8) confidence = 'high';      // 80%+ match
-      else if (matchRate >= 0.5) confidence = 'medium'; // 50%+ match
+      if (matchRate >= 0.8) confidence = 'high';
+      else if (matchRate >= 0.5) confidence = 'medium';
 
       return {
         success: true,
@@ -270,39 +231,32 @@ class SmartOrderLearner {
       };
     }
 
-    return {
-      success: false,
-      reason: 'no_pattern_match',
-      confidence: 'low'
-    };
-    
+    return { success: false, reason: 'no_pattern_match', confidence: 'low' };
   }
 
- getMostCommonItems(customerPattern, limit = 3) {
-    // Ensure Map conversion if needed (safety check)
-    let itemsMap = customerPattern.commonItems;
-    if (!(itemsMap instanceof Map)) itemsMap = new Map(Object.entries(itemsMap));
-
-    const items = Array.from(itemsMap.values())
+  getMostCommonItems(customerPattern, limit = 3) {
+    const items = Array.from(customerPattern.commonItems.values())
       .sort((a, b) => b.count - a.count)
       .slice(0, limit)
       .map(item => ({
         name: item.name,
         count: item.count,
-        avgQuantity: Math.round(item.quantities.reduce((a, b) => a + b, 0) / item.quantities.length)
+        avgQuantity: Math.round(
+          item.quantities.reduce((a, b) => a + b, 0) / item.quantities.length
+        )
       }));
+
     return items;
   }
+
   // ============================================================================
-  // FIND EXACT ORDER MATCH: Check if input matches previous order exactly
+  // EXACT ORDER MATCH
   // ============================================================================
 
   findExactOrderMatch(customerName, items) {
     const customerPattern = this.findCustomerByName(customerName);
-    
     if (!customerPattern) return null;
 
-    // Check recent orders (last 10)
     const recentOrders = customerPattern.orders.slice(-10);
 
     for (const order of recentOrders) {
@@ -324,7 +278,6 @@ class SmartOrderLearner {
   ordersMatch(order1, order2) {
     if (order1.length !== order2.length) return false;
 
-    // Create normalized item maps
     const map1 = new Map();
     const map2 = new Map();
 
@@ -338,7 +291,6 @@ class SmartOrderLearner {
       map2.set(key, item.quantity);
     });
 
-    // Check if all items match
     for (const [key, qty] of map1.entries()) {
       if (map2.get(key) !== qty) return false;
     }
@@ -347,14 +299,18 @@ class SmartOrderLearner {
   }
 
   // ============================================================================
-  // GET STATISTICS
+  // STATS
   // ============================================================================
+
+  getTotalPatterns() {
+    return Array.from(this.customerPatterns.values())
+      .reduce((sum, p) => sum + p.commonItems.size, 0);
+  }
 
   getStats() {
     return {
       customersLearned: this.customerPatterns.size,
-      totalPatterns: Array.from(this.customerPatterns.values())
-        .reduce((sum, p) => sum + p.commonItems.size, 0),
+      totalPatterns: this.getTotalPatterns(),
       lastLoaded: this.lastLoaded
     };
   }
