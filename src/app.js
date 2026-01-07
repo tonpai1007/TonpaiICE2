@@ -20,7 +20,7 @@ const { autoAddCustomer } = require('./customerService');
 const { generateDailySummary, generateInboxSummary } = require('./dashboardService');
 const { getSheetData, updateSheetData } = require('./googleServices');
 const { CONFIG } = require('./config');
-
+const { smartLearner } = require('./smartOrderLearning');
 const app = express();
 app.use(express.json());
 
@@ -234,7 +234,12 @@ async function initializeApp() {
     await loadStockCache(true);
     await loadCustomerCache(true);
     
-    Logger.success('✅ System Ready');
+    // 🧠 Load order history for learning
+    await smartLearner.loadOrderHistory();
+    const stats = smartLearner.getStats();
+    Logger.success(`🧠 Smart Learning: ${stats.customersLearned} customers, ${stats.totalPatterns} patterns`);
+    
+    Logger.success('✅ System Ready with Smart Learning');
   } catch (error) {
     Logger.error('❌ Init failed', error);
     process.exit(1);
@@ -523,22 +528,27 @@ async function handleTextMessage(text, replyToken, userId) {
 
 async function handleVoiceMessage(messageId, replyToken, userId) {
   try {
-    await saveToInbox(userId, '[🎤 Voice Input]', 'voice_raw');
-
+    // Fetch and transcribe
     const audioBuffer = await fetchAudioFromLine(messageId);
     const { success, text } = await transcribeAudio(audioBuffer);
     
     if (!success || !text) {
-      await saveToInbox(userId, '[ฟังไม่ออก]', 'voice_error');
       await replyToLine(replyToken, '❌ ฟังไม่ออก ลองใหม่หรือพิมพ์ข้อความมา');
       return;
     }
 
     Logger.info(`📝 Transcribed: "${text}"`);
-    await saveToInbox(userId, text, 'voice_transcribed');
+    await saveToInbox(userId, text);
 
-    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
-    if (paymentMatch) {
+    // Check special commands first
+    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*(?:#?(\d+))?/i);
+    if (paymentMatch && paymentMatch[0].length >= 3) {
+      await handleTextMessage(text, replyToken, userId);
+      return;
+    }
+
+    const deliveryMatch = text.match(/ส่ง\s*(?:#?(\d+))?\s*(.+)?/i);
+    if (deliveryMatch && deliveryMatch[0].length >= 2) {
       await handleTextMessage(text, replyToken, userId);
       return;
     }
@@ -549,88 +559,192 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
       return;
     }
 
+    // ============================================================
+    // 🧠 SMART LEARNING: Load order history
+    // ============================================================
+    await smartLearner.loadOrderHistory();
+
+    // ============================================================
+    // PARSE ORDER with AI
+    // ============================================================
     const parsed = await parseOrder(text);
     parsed.rawInput = text;
 
-    if (!parsed.success || !parsed.items || parsed.items.length === 0) {
-      await saveToInbox(userId, text, 'parse_failed');
-      const errorMsg = formatError('parse_failed', { input: text });
-      await replyToLine(replyToken, errorMsg);
-      return;
-    }
-
-    const corrected = applySmartCorrection(parsed);
-    const stockCheck = checkStockWarnings(corrected.items);
-    
-    if (stockCheck.hasCritical) {
-      const warningMsg = formatStockWarnings(stockCheck);
-      await replyToLine(replyToken, warningMsg);
-      await saveToInbox(userId, text, 'insufficient_stock');
-      return;
-    }
-
-    const orderValue = corrected.items.reduce((sum, item) => 
-      sum + (item.quantity * item.stockItem.price), 0
-    );
-
-    const decision = shouldAutoProcess(corrected, orderValue);
-
-    if (decision.shouldAuto) {
-      if (corrected.customer && corrected.customer !== 'ไม่ระบุ') {
-        await autoAddCustomer(corrected.customer);
-      }
+    // ============================================================
+    // 🎯 SCENARIO 1: AI parsed customer + items
+    // ============================================================
+    if (parsed.success && parsed.items && parsed.items.length > 0 && 
+        parsed.customer && parsed.customer !== 'ไม่ระบุ') {
       
-      const result = await createOrderTransaction({
-        customer: corrected.customer,
-        items: corrected.items,
-        paymentStatus: corrected.paymentStatus || 'unpaid'
-      });
-
-      if (result.success) {
-        await saveToInbox(userId, text, 'order_auto_success');
-
-        const msg = formatOrderSuccess(
-          result.orderNo,
-          result.customer,
-          result.items,
-          result.totalAmount,
-          corrected.confidence
-        );
+      Logger.info(`🤖 AI parsed: ${parsed.customer} + ${parsed.items.length} items`);
+      
+      // 🧠 CHECK: Does this match exact previous order?
+      const exactMatch = smartLearner.findExactOrderMatch(parsed.customer, parsed.items);
+      
+      if (exactMatch) {
+        Logger.success(`🎯 EXACT REPEAT ORDER DETECTED!`);
         
-        if (stockCheck.hasWarnings) {
-          const warnings = stockCheck.warnings.map(w => w.message).join('\n');
-          await replyToLine(replyToken, msg + '\n\n━━━━━━━━━━━━━━━━━━━━\n' + warnings);
-        } else {
-          await replyToLine(replyToken, msg);
+        // Auto-create with HIGH confidence
+        const corrected = applySmartCorrection(parsed);
+        corrected.confidence = 'high'; // Boost to high
+        
+        const result = await createOrderTransaction({
+          customer: exactMatch.customer,
+          items: corrected.items,
+          paymentStatus: corrected.paymentStatus || 'unpaid'
+        });
+
+        if (result.success) {
+          await replyToLine(replyToken,
+            `✅ บันทึกออเดอร์สำเร็จ!\n\n` +
+            `🎯 ${exactMatch.message}\n\n` +
+            `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+            `👤 ${result.customer}\n` +
+            `💰 รวม: ${result.totalAmount.toLocaleString()}฿\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `⚡ Quick Actions:\n` +
+            `• "จ่าย" - จ่ายเงิน\n` +
+            `• "ส่ง" - อัปเดตการจัดส่ง`
+          );
+          
+          Logger.success(`✅ Exact repeat order auto-created: #${result.orderNo}`);
+          return;
         }
-
-        monitor.recordDecision(decision, result.orderNo);
-        
-        if (stockCheck.warnings.some(w => w.level === 'critical')) {
-          await pushToAdmin(`⚠️ สต็อกเหลือน้อยมาก!\n\n${formatStockWarnings(stockCheck)}`);
-        }
-        
-      } else {
-        await saveToInbox(userId, text, 'order_auto_failed');
-        await replyToLine(replyToken, 
-          `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}\n\n💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
-        );
       }
-    } else {
+
+      // 🧠 CHECK: Does customer + items match history pattern?
+      const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
+      
+      if (prediction.success && prediction.confidence === 'high') {
+        Logger.success(`🧠 HIGH CONFIDENCE from history: ${prediction.matchRate * 100}%`);
+        
+        // Auto-create with learning boost
+        const corrected = applySmartCorrection(parsed);
+        
+        const stockCheck = checkStockWarnings(corrected.items);
+        if (stockCheck.hasCritical) {
+          await replyToLine(replyToken, formatStockWarnings(stockCheck));
+          return;
+        }
+
+        const result = await createOrderTransaction({
+          customer: prediction.customer,
+          items: corrected.items,
+          paymentStatus: corrected.paymentStatus || 'unpaid'
+        });
+
+        if (result.success) {
+          await replyToLine(replyToken,
+            `✅ บันทึกออเดอร์สำเร็จ!\n\n` +
+            `🧠 ${prediction.message}\n\n` +
+            `📋 คำสั่งซื้อ #${result.orderNo}\n` +
+            `👤 ${result.customer}\n` +
+            `💰 รวม: ${result.totalAmount.toLocaleString()}฿\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `⚡ Quick Actions:\n` +
+            `• "จ่าย" - จ่ายเงิน\n` +
+            `• "ส่ง" - อัปเดตการจัดส่ง`
+          );
+          
+          Logger.success(`✅ History-boosted order auto-created: #${result.orderNo}`);
+          return;
+        }
+      }
+
+      // Regular auto-processing logic
+      const corrected = applySmartCorrection(parsed);
+      const stockCheck = checkStockWarnings(corrected.items);
+      
+      if (stockCheck.hasCritical) {
+        await replyToLine(replyToken, formatStockWarnings(stockCheck));
+        return;
+      }
+
+      const orderValue = corrected.items.reduce((sum, item) => 
+        sum + (item.quantity * item.stockItem.price), 0
+      );
+
+      const decision = shouldAutoProcess(corrected, orderValue);
+
+      if (decision.shouldAuto) {
+        await autoAddCustomer(corrected.customer);
+        
+        const result = await createOrderTransaction({
+          customer: corrected.customer,
+          items: corrected.items,
+          paymentStatus: corrected.paymentStatus || 'unpaid'
+        });
+
+        if (result.success) {
+          const msg = formatOrderSuccess(
+            result.orderNo,
+            result.customer,
+            result.items,
+            result.totalAmount,
+            corrected.confidence
+          );
+          await replyToLine(replyToken, msg);
+          Logger.success(`✅ Voice order created: #${result.orderNo}`);
+          return;
+        }
+      }
+
+      // Manual review needed
       const guess = corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ');
-      await saveToInbox(userId, text, 'pending_review');
       await replyToLine(replyToken, 
         `📝 รับคำสั่งแล้ว (รอตรวจสอบ)\n\n"${text}"\n\n` +
         `🤖 ระบบเดา:\n• ลูกค้า: ${corrected.customer}\n• สินค้า: ${guess}\n` +
-        `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n⚠️ เหตุผล: ${decision.reason}\n` +
+        `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n` +
+        `⚠️ เหตุผล: ${decision.reason}\n` +
+        `✅ บันทึกไว้ใน Inbox แล้ว\n` +
         `💡 แอดมินจะตรวจสอบและบันทึกให้`
       );
-      monitor.recordDecision(decision, 'pending');
+      return;
     }
+
+    // ============================================================
+    // 🎯 SCENARIO 2: AI only parsed customer (no items)
+    // ============================================================
+    if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
+      Logger.info(`🤖 AI parsed customer only: ${parsed.customer}`);
+      
+      // 🧠 CHECK: Suggest common items for this customer
+      const prediction = smartLearner.predictOrder(parsed.customer, []);
+      
+      if (prediction.success && prediction.suggestedItems) {
+        const suggestions = prediction.suggestedItems
+          .map(s => `${s.name} (มักสั่ง ${s.avgQuantity} ${s.count} ครั้ง)`)
+          .join('\n• ');
+
+        await replyToLine(replyToken,
+          `💡 รู้จัก "${prediction.customer}"!\n\n` +
+          `${prediction.customer} มักสั่ง:\n` +
+          `• ${suggestions}\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `📝 กรุณาระบุสินค้าที่ต้องการ:\n` +
+          `ตัวอย่าง: "เอา${prediction.suggestedItems[0].name} ${prediction.suggestedItems[0].avgQuantity}"\n\n` +
+          `✅ บันทึกไว้ใน Inbox แล้ว`
+        );
+        return;
+      }
+    }
+
+    // ============================================================
+    // 🎯 SCENARIO 3: AI completely failed
+    // ============================================================
+    await replyToLine(replyToken, 
+      `❓ ไม่เข้าใจคำสั่ง\n\n"${text}"\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ บันทึกไว้ใน Inbox แล้ว\n` +
+      `💡 แอดมินจะตรวจสอบและบันทึกให้\n\n` +
+      `หรือลองพิมพ์ใหม่:\n` +
+      `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง"`
+    );
+    
+    Logger.warn(`📥 Saved unparseable voice to Inbox: "${text}"`);
 
   } catch (error) {
     Logger.error('Voice handler error', error);
-    await saveToInbox(userId, '[System Error]', 'voice_error');
     await replyToLine(replyToken, '❌ เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่อีกครั้ง');
   }
 }
