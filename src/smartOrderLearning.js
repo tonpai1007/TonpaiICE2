@@ -248,6 +248,7 @@ class SmartOrderLearner {
             ...item,
             historical: false
           });
+        return { success: false, reason: 'no_pattern_match', confidence: 'low' };
         }
       }
 
@@ -274,23 +275,24 @@ class SmartOrderLearner {
       reason: 'no_pattern_match',
       confidence: 'low'
     };
+    
   }
 
-  getMostCommonItems(customerPattern, limit = 3) {
-    const items = Array.from(customerPattern.commonItems.values())
+ getMostCommonItems(customerPattern, limit = 3) {
+    // Ensure Map conversion if needed (safety check)
+    let itemsMap = customerPattern.commonItems;
+    if (!(itemsMap instanceof Map)) itemsMap = new Map(Object.entries(itemsMap));
+
+    const items = Array.from(itemsMap.values())
       .sort((a, b) => b.count - a.count)
       .slice(0, limit)
       .map(item => ({
         name: item.name,
         count: item.count,
-        avgQuantity: Math.round(
-          item.quantities.reduce((a, b) => a + b, 0) / item.quantities.length
-        )
+        avgQuantity: Math.round(item.quantities.reduce((a, b) => a + b, 0) / item.quantities.length)
       }));
-
     return items;
   }
-
   // ============================================================================
   // FIND EXACT ORDER MATCH: Check if input matches previous order exactly
   // ============================================================================
