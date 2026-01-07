@@ -184,9 +184,9 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
       if (rows[i][0] == orderNo) {
         rowIndex = i + 1;
         orderData = {
-          customer: rows[i][2],
-          items: rows[i][3],
-          currentStatus: rows[i][4]
+          customer: rows[i][2],      // C - Customer ✅
+          currentStatus: rows[i][4]  // E - Delivery Status ✅
+          // Removed: items: rows[i][3] - this is deliveryPerson column, not items!
         };
         break;
       }
@@ -196,8 +196,10 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
     
+    // Update delivery status (Column E)
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${rowIndex}`, [[status]]);
     
+    // Update delivery person if provided (Column D)
     if (deliveryPerson) {
       await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!D${rowIndex}`, [[deliveryPerson]]);
     }
@@ -219,7 +221,6 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
     return { success: false, error: error.message };
   }
 }
-
 // ============================================================================
 // MAIN MESSAGE HANDLER - Handles both text and voice
 // ============================================================================
