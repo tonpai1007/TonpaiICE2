@@ -1,20 +1,4 @@
-// orderParser.js - FIXED: Add "มี" pattern support
-const { Logger } = require('./logger');
-const { generateWithGroq } = require('./aiServices');
-const { getStockCache, getCustomerCache } = require('./cacheManager');
-
-// 🔧 NEW: Pre-process input to normalize "มี" pattern
-function normalizeOrderInput(text) {
-  // Transform "น้ำแข็งมี 5 ถุง" → "น้ำแข็ง 5 ถุง"
-  // Transform "น้ำแข็ง มี 5" → "น้ำแข็ง 5"
-  let normalized = text.replace(/\s*มี\s*/g, ' ').trim();
-  
-  // Remove extra spaces
-  normalized = normalized.replace(/\s+/g, ' ');
-  
-  Logger.info(`📝 Normalized: "${text}" → "${normalized}"`);
-  return normalized;
-}
+// orderParser.js - ENHANCED: Use price as a matching hint
 
 async function parseOrder(userInput) {
   const stockCache = getStockCache();
@@ -25,53 +9,41 @@ async function parseOrder(userInput) {
   }
 
   try {
-    // 🔧 APPLY NORMALIZATION
     const normalizedInput = normalizeOrderInput(userInput);
     
-    const stockList = stockCache.map((item, idx) => 
-      `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}`
-    ).join('\n');
+    // Extract price hints from input
+    const priceHints = extractPriceHints(userInput);
+    
+    // Enhanced stock list with price-based grouping
+    const stockList = buildSmartStockList(stockCache, priceHints);
 
     const customerList = customerCache.slice(0, 50).map(c => c.name).join(', ');
 
-    const prompt = `You are an expert Thai order parser. Extract order details with HIGH confidence.
+    const prompt = `You are an expert Thai order parser with SMART PRICE MATCHING.
 
-STOCK CATALOG:
+STOCK CATALOG WITH PRICE HINTS:
 ${stockList}
 
 KNOWN CUSTOMERS: ${customerList}
 
 USER INPUT: "${normalizedInput}"
 
-IMPORTANT PATTERNS TO RECOGNIZE:
-- "น้ำแข็ง 2 ถุง" = ice 2 bags
-- "น้ำแข็งมี 5" = ice 5 (quantity)
-- "เอา 3 น้ำแข็ง" = take 3 ice
-
-CONFIDENCE RULES (return "high" if ALL true):
-1. Customer name is clearly mentioned (even if not in known customers list)
-2. Item name matches stock catalog clearly (fuzzy match OK)
-3. Quantity is explicitly stated with number
-4. No ambiguous words like "บางที", "คิดว่า", "อาจจะ"
-
-CUSTOMER MATCHING RULES:
-- If customer name is mentioned at the start → USE IT (even if not in known customers)
-- Examples: "แฟน", "พี่ใหม่", "คุณสมชาย", "ร้านป้าไก่"
-- ONLY use "ไม่ระบุ" if absolutely NO customer name is mentioned
-
-FUZZY MATCHING:
-- "น้ำแข็ง" matches "น้ำแข็งหลอด", "น้ำแข็งก้อน"
-- "เบียร์" matches "เบียร์ลีโอ", "เบียร์ช้าง"
-- Numbers: "ห้า"=5, "สิบ"=10
+CRITICAL PRICE MATCHING RULES:
+1. If user mentions price (e.g., "บด 40 บาท"), find the stock item that EXACTLY matches that price
+2. Example: "บด 40" should match "บดหยาบ" (40฿) NOT "บดละเอียด" (30฿)
+3. If no exact price match, use closest match by name
+4. Set "priceMatchUsed": true if you used price to disambiguate
 
 OUTPUT JSON:
 {
-  "customer": "ชื่อลูกค้าที่พูดมา หรือ ไม่ระบุ ถ้าไม่มีเลย",
+  "customer": "ชื่อลูกค้า หรือ ไม่ระบุ",
   "items": [
     {
       "stockId": 0,
       "quantity": 2,
-      "matchConfidence": "exact|fuzzy|guess"
+      "matchConfidence": "exact|fuzzy|guess",
+      "priceMatchUsed": false,
+      "mentionedPrice": 40
     }
   ],
   "paymentStatus": "unpaid or credit",
@@ -82,11 +54,30 @@ OUTPUT JSON:
     const result = await generateWithGroq(prompt, true);
 
     const mappedItems = [];
+    const matchDetails = [];
+    
     if (result.items && Array.isArray(result.items)) {
       for (const item of result.items) {
         if (item.stockId >= 0 && item.stockId < stockCache.length) {
+          const stockItem = stockCache[item.stockId];
+          
+          // Track how item was matched
+          const matchInfo = {
+            item: stockItem.item,
+            method: item.priceMatchUsed ? 'price' : 'name',
+            confidence: item.matchConfidence
+          };
+          
+          if (item.mentionedPrice) {
+            matchInfo.mentionedPrice = item.mentionedPrice;
+            matchInfo.actualPrice = stockItem.price;
+            matchInfo.priceMatch = item.mentionedPrice === stockItem.price;
+          }
+          
+          matchDetails.push(matchInfo);
+          
           mappedItems.push({
-            stockItem: stockCache[item.stockId],
+            stockItem: stockItem,
             quantity: item.quantity || 1,
             matchConfidence: item.matchConfidence || 'exact'
           });
@@ -96,11 +87,7 @@ OUTPUT JSON:
 
     const boostedConfidence = boostConfidence(result, mappedItems, normalizedInput, customerCache);
 
-    Logger.info(
-      `📝 Parsed: ${mappedItems.length} items | ` +
-      `Base: ${result.confidence} → Boosted: ${boostedConfidence} | ` +
-      `Reason: ${result.reasoning}`
-    );
+    Logger.info(`🎯 Match details: ${JSON.stringify(matchDetails)}`);
 
     return {
       success: mappedItems.length > 0,
@@ -110,6 +97,7 @@ OUTPUT JSON:
       confidence: boostedConfidence,
       baseConfidence: result.confidence,
       reasoning: result.reasoning,
+      matchDetails: matchDetails, // For debugging
       action: 'order'
     };
 
@@ -123,62 +111,71 @@ OUTPUT JSON:
   }
 }
 
-function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
-  let confidence = aiResult.confidence || 'low';
-  const boostReasons = [];
+// ============================================================================
+// EXTRACT PRICE HINTS
+// ============================================================================
 
-  const allExactMatch = mappedItems.every(item => 
-    item.matchConfidence === 'exact'
-  );
-  if (allExactMatch && mappedItems.length > 0) {
-    boostReasons.push('exact_match');
+function extractPriceHints(text) {
+  const hints = [];
+  
+  // Pattern: "บด 40 บาท" → {keyword: "บด", price: 40}
+  const matches = text.matchAll(/([ก-๙a-z]+)\s+(\d+)\s*(?:บาท|฿)/gi);
+  
+  for (const match of matches) {
+    hints.push({
+      keyword: match[1].toLowerCase(),
+      price: parseInt(match[2])
+    });
   }
-
-  const customerMentioned = aiResult.customer && aiResult.customer !== 'ไม่ระบุ';
-  if (customerMentioned) {
-    boostReasons.push('customer_mentioned');
-    
-    const customerExists = customerCache.some(c => 
-      c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
-    );
-    if (customerExists) {
-      boostReasons.push('known_customer');
-    }
-  }
-
-  const allInStock = mappedItems.every(item => 
-    item.stockItem.stock >= item.quantity
-  );
-  if (allInStock) {
-    boostReasons.push('stock_available');
-  }
-
-  const hasQuantityWords = /\d+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ/.test(userInput);
-  if (hasQuantityWords) {
-    boostReasons.push('clear_quantity');
-  }
-
-  const negativeWords = ['บางที', 'คิดว่า', 'อาจจะ', 'ไม่แน่ใจ', 'หรือเปล่า'];
-  const hasNegativeSignal = negativeWords.some(word => 
-    userInput.toLowerCase().includes(word)
-  );
-
-  if (confidence === 'medium' && boostReasons.length >= 3) {
-    Logger.info(`🚀 Confidence boosted: medium → high (${boostReasons.join(', ')})`);
-    return 'high';
-  }
-
-  if (confidence === 'low' && boostReasons.length >= 4 && !hasNegativeSignal) {
-    Logger.info(`🚀 Confidence boosted: low → medium (${boostReasons.join(', ')})`);
-    return 'medium';
-  }
-
-  if (hasNegativeSignal && confidence === 'high') {
-    Logger.warn(`⚠️ Confidence downgraded: high → medium (negative words)`);
-    return 'medium';
-  }
-
-  return confidence;
+  
+  Logger.info(`💡 Price hints extracted: ${JSON.stringify(hints)}`);
+  return hints;
 }
 
-module.exports = { parseOrder };
+// ============================================================================
+// BUILD SMART STOCK LIST
+// ============================================================================
+
+function buildSmartStockList(stockCache, priceHints) {
+  // Group items by price when hints exist
+  const grouped = new Map();
+  
+  stockCache.forEach((item, idx) => {
+    const key = `${item.price}฿`;
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push({ item, idx });
+  });
+  
+  let stockList = '';
+  
+  // If price hints exist, prioritize those prices
+  if (priceHints.length > 0) {
+    stockList += '🎯 PRICE-MATCHED ITEMS (use these first):\n';
+    
+    priceHints.forEach(hint => {
+      const matchingItems = grouped.get(`${hint.price}฿`) || [];
+      matchingItems.forEach(({ item, idx }) => {
+        if (item.item.toLowerCase().includes(hint.keyword)) {
+          stockList += `[${idx}] ⭐ ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+        }
+      });
+    });
+    
+    stockList += '\nALL OTHER ITEMS:\n';
+  }
+  
+  // Regular list
+  stockCache.forEach((item, idx) => {
+    stockList += `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+  });
+  
+  return stockList;
+}
+
+module.exports = { 
+  parseOrder,
+  extractPriceHints,
+  buildSmartStockList
+};
