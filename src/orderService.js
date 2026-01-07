@@ -1,8 +1,8 @@
-// orderService.js - FIXED: Robust Optimistic Locking + Better Error Handling
+// orderService.js - FIXED: Simplified and working
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
-const { getSheetData, appendSheetData, updateSheetData, batchUpdateSheet } = require('./googleServices');
+const { getSheetData, appendSheetData, updateSheetData } = require('./googleServices');
 const { loadStockCache } = require('./cacheManager');
 
 const PAYMENT_STATUS_MAP = {
@@ -11,79 +11,29 @@ const PAYMENT_STATUS_MAP = {
   'unpaid': 'ยังไม่จ่าย'
 };
 
-// ============================================================================
-// 🔒 ROBUST OPTIMISTIC LOCKING with Fresh Data Fetch
-// ============================================================================
+async function updateStock(itemName, unit, newStock) {
+  try {
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    const key = itemName.toLowerCase().trim();
+    const unitKey = unit.toLowerCase().trim();
 
-async function updateStockWithOptimisticLocking(itemName, unit, decreaseBy, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      // ✅ ALWAYS fetch fresh data from sheet
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
-      const key = itemName.toLowerCase().trim();
+    for (let i = 1; i < rows.length; i++) {
+      const rowName = (rows[i][0] || '').trim().toLowerCase();
+      const rowUnit = (rows[i][3] || '').trim().toLowerCase();
 
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        const rowName = (row[0] || '').trim().toLowerCase();
-        const rowUnit = (row[3] || '').trim().toLowerCase();
-        const currentStock = parseInt(row[4] || 0);
-
-        if (rowName === key && rowUnit === unit.toLowerCase()) {
-          // ✅ Calculate new stock based on FRESH data
-          const newStock = currentStock - decreaseBy;
-          
-          if (newStock < 0) {
-            throw new Error(`INSUFFICIENT_STOCK: ${itemName} has ${currentStock}, need ${decreaseBy}`);
-          }
-
-          // ✅ Atomic update
-          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
-          
-          Logger.success(`📦 Stock updated: ${itemName} (${currentStock} → ${newStock}) [attempt ${attempt}]`);
-          
-          return {
-            success: true,
-            oldStock: currentStock,
-            newStock: newStock,
-            item: itemName,
-            unit: unit
-          };
-        }
+      if (rowName === key && rowUnit === unitKey) {
+        await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
+        Logger.success(`📦 Stock updated: ${itemName} → ${newStock}`);
+        return { success: true, newStock };
       }
-      
-      throw new Error(`ITEM_NOT_FOUND: ${itemName} (${unit})`);
-      
-    } catch (error) {
-      const isRetryable = 
-        error.message.includes('STOCK_VERSION_CONFLICT') ||
-        error.message.includes('429') ||
-        error.message.includes('quota');
-      
-      if (error.message.includes('INSUFFICIENT_STOCK')) {
-        throw error; // Don't retry insufficient stock
-      }
-      
-      if (error.message.includes('ITEM_NOT_FOUND')) {
-        throw error; // Don't retry item not found
-      }
-      
-      if (isRetryable && attempt < maxRetries) {
-        const delay = Math.pow(2, attempt) * 500; // 500ms, 1s, 2s
-        Logger.warn(`⏳ Retry ${attempt}/${maxRetries} in ${delay}ms (${error.message})...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      }
-      
-      throw error;
     }
-  }
-  
-  throw new Error(`Failed after ${maxRetries} attempts`);
-}
 
-// ============================================================================
-// TRANSACTIONAL ORDER CREATION (FIXED)
-// ============================================================================
+    throw new Error(`Item not found: ${itemName} (${unit})`);
+  } catch (error) {
+    Logger.error('updateStock failed', error);
+    throw error;
+  }
+}
 
 async function createOrderTransaction(orderData) {
   const { customer, items, deliveryPerson = '', paymentStatus = 'unpaid' } = orderData;
@@ -91,68 +41,73 @@ async function createOrderTransaction(orderData) {
   if (!customer || !items || !Array.isArray(items) || items.length === 0) {
     return {
       success: false,
-      error: 'Invalid order data: missing customer or items'
+      error: 'ข้อมูลไม่ครบถ้วน: ต้องมีลูกค้าและรายการสินค้า'
     };
   }
 
-  Logger.info(`📝 Starting transaction: ${customer} (${items.length} items)`);
-  
-  let orderNo = null;
-  let stockUpdates = [];
-  
   try {
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 1: Reserve order number
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    orderNo = orderRows.length || 1;
+    const orderNo = orderRows.length || 1;
     
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 2: Update stock FIRST (fail fast if insufficient)
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const lineItems = [];
+    const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    const stockMap = new Map();
     
+    for (let i = 1; i < stockRows.length; i++) {
+      const name = (stockRows[i][0] || '').toLowerCase().trim();
+      const unit = (stockRows[i][3] || '').toLowerCase().trim();
+      const stock = parseInt(stockRows[i][4] || 0);
+      const key = `${name}|${unit}`;
+      stockMap.set(key, { stock, rowIndex: i + 1 });
+    }
+
     for (const item of items) {
-      try {
-        const result = await updateStockWithOptimisticLocking(
-          item.stockItem.item,
-          item.stockItem.unit,
-          item.quantity,
-          3
-        );
-        
-        stockUpdates.push(result);
-        
-        lineItems.push({
-          item: item.stockItem.item,
-          quantity: item.quantity,
-          unit: item.stockItem.unit,
-          price: item.stockItem.price,
-          cost: item.stockItem.cost,
-          subtotal: item.quantity * item.stockItem.price
-        });
-        
-      } catch (stockError) {
-        Logger.error(`❌ Stock update failed: ${item.stockItem.item}`, stockError);
-        
-        // Rollback previous updates
-        await rollbackStockUpdates(stockUpdates);
-        
+      const key = `${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`;
+      const stockInfo = stockMap.get(key);
+      
+      if (!stockInfo) {
         return {
           success: false,
-          error: stockError.message.includes('INSUFFICIENT_STOCK')
-            ? `❌ สต็อกไม่พอ: ${item.stockItem.item}\n\n${stockError.message}`
-            : `❌ ไม่สามารถอัปเดตสต็อก: ${item.stockItem.item}`,
-          details: stockError.message
+          error: `❌ ไม่พบสินค้า: ${item.stockItem.item}`
+        };
+      }
+      
+      if (stockInfo.stock < item.quantity) {
+        return {
+          success: false,
+          error: `❌ สต็อกไม่พอ: ${item.stockItem.item}\nมี ${stockInfo.stock} ต้องการ ${item.quantity}`
         };
       }
     }
-    
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 3: Create order (stock already deducted)
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    const lineItems = [];
+    const stockUpdates = [];
+
+    for (const item of items) {
+      const key = `${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`;
+      const stockInfo = stockMap.get(key);
+      const newStock = stockInfo.stock - item.quantity;
+      
+      await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${stockInfo.rowIndex}`, [[newStock]]);
+      
+      lineItems.push({
+        item: item.stockItem.item,
+        quantity: item.quantity,
+        unit: item.stockItem.unit,
+        price: item.stockItem.price,
+        cost: item.stockItem.cost,
+        subtotal: item.quantity * item.stockItem.price
+      });
+      
+      stockUpdates.push({
+        item: item.stockItem.item,
+        oldStock: stockInfo.stock,
+        newStock: newStock
+      });
+      
+      Logger.success(`📦 ${item.stockItem.item}: ${stockInfo.stock} → ${newStock}`);
+    }
+
     const totalAmount = lineItems.reduce((sum, line) => sum + line.subtotal, 0);
-    const lineItemsText = lineItems.map(l => `${l.item} x${l.quantity}`).join(', ');
     const thaiPaymentStatus = PAYMENT_STATUS_MAP[paymentStatus] || 'ยังไม่จ่าย';
     
     const orderRow = [
@@ -163,17 +118,15 @@ async function createOrderTransaction(orderData) {
       'รอดำเนินการ',
       thaiPaymentStatus,
       totalAmount,
-      JSON.stringify(lineItems), // Store full line items as JSON
+      JSON.stringify(lineItems),
       ''
     ];
     
     await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I', [orderRow]);
-    
-    // ✅ Reload cache after successful transaction
     await loadStockCache(true);
-    
-    Logger.success(`✅ TRANSACTION COMMITTED: Order #${orderNo}`);
-    
+
+    Logger.success(`✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿`);
+
     return {
       success: true,
       orderNo,
@@ -184,118 +137,58 @@ async function createOrderTransaction(orderData) {
         quantity: line.quantity,
         unit: line.unit,
         unitPrice: line.price,
-        unitCost: line.cost,
         lineTotal: line.subtotal,
         newStock: stockUpdates[idx].newStock,
         stockItem: items[idx].stockItem
       })),
       stockUpdates
     };
-    
-  } catch (criticalError) {
-    Logger.error('❌ CRITICAL TRANSACTION FAILURE', criticalError);
-    
-    // Rollback everything
-    if (stockUpdates.length > 0) {
-      await rollbackStockUpdates(stockUpdates);
-    }
-    if (orderNo) {
-      await rollbackOrderHeader(orderNo);
-    }
-    
+
+  } catch (error) {
+    Logger.error('createOrderTransaction failed', error);
     return {
       success: false,
-      error: '❌ เกิดข้อผิดพลาดร้ายแรง กรุณาลองใหม่',
-      details: criticalError.message
+      error: `❌ ไม่สามารถสร้างออเดอร์ได้: ${error.message}`
     };
   }
 }
-
-async function rollbackStockUpdates(stockUpdates) {
-  if (stockUpdates.length === 0) return;
-  
-  Logger.warn(`🔄 Rolling back ${stockUpdates.length} stock updates...`);
-  
-  for (const update of stockUpdates.reverse()) {
-    try {
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
-      for (let i = 1; i < rows.length; i++) {
-        const rowName = (rows[i][0] || '').trim().toLowerCase();
-        const rowUnit = (rows[i][3] || '').trim().toLowerCase();
-        
-        if (rowName === update.item.toLowerCase() && rowUnit === update.unit.toLowerCase()) {
-          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[update.oldStock]]);
-          Logger.success(`✅ Rolled back: ${update.item} → ${update.oldStock}`);
-          break;
-        }
-      }
-    } catch (error) {
-      Logger.error(`Failed to rollback ${update.item}`, error);
-    }
-  }
-  
-  await loadStockCache(true);
-}
-
-async function rollbackOrderHeader(orderNo) {
-  try {
-    Logger.warn(`🔄 Rolling back order #${orderNo}...`);
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    const filteredRows = rows.filter((row, idx) => idx === 0 || row[0] != orderNo);
-    await batchUpdateSheet(CONFIG.SHEET_ID, [{
-      range: 'คำสั่งซื้อ!A:I',
-      values: filteredRows
-    }]);
-    Logger.success(`✅ Order #${orderNo} rolled back`);
-  } catch (error) {
-    Logger.error('Failed to rollback order', error);
-  }
-}
-
-// ============================================================================
-// PAYMENT STATUS UPDATE
-// ============================================================================
 
 async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     let rowIndex = -1;
+    let orderData = null;
     
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] == orderNo) {
         rowIndex = i + 1;
+        orderData = {
+          customer: rows[i][2] || 'ลูกค้า',
+          totalAmount: parseFloat(rows[i][6] || 0),
+          currentStatus: rows[i][5] || ''
+        };
         break;
       }
     }
 
-    if (rowIndex === -1) {
-      return { success: false, error: `ไม่พบคำสั่งซื้อ #${orderNo}` };
+    if (!orderData) {
+      return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
 
-    const validStatuses = ['ยังไม่จ่าย', 'จ่ายแล้ว', 'เครดิต', 'ยกเลิก'];
-    if (!validStatuses.includes(newStatus)) {
-      return { success: false, error: `สถานะไม่ถูกต้อง: ${newStatus}` };
-    }
-
-    const currentStatus = rows[rowIndex - 1][5] || '';
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!F${rowIndex}`, [[newStatus]]);
-
-    const customer = rows[rowIndex - 1][2] || 'ลูกค้า';
-    const totalAmount = parseFloat(rows[rowIndex - 1][6] || 0);
-
-    Logger.success(`💰 Payment updated: Order #${orderNo} - ${currentStatus} → ${newStatus}`);
+    Logger.success(`💰 Payment updated: #${orderNo} → ${newStatus}`);
 
     return {
       success: true,
       orderNo,
-      customer,
-      totalAmount,
-      oldStatus: currentStatus,
+      customer: orderData.customer,
+      totalAmount: orderData.totalAmount,
+      oldStatus: orderData.currentStatus,
       newStatus
     };
   } catch (error) {
     Logger.error('updateOrderPaymentStatus failed', error);
-    throw error;
+    return { success: false, error: error.message };
   }
 }
 
@@ -303,5 +196,5 @@ module.exports = {
   createOrderTransaction,
   createOrder: createOrderTransaction,
   updateOrderPaymentStatus,
-  updateStockWithOptimisticLocking
+  updateStock
 };
