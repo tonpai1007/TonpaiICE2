@@ -38,118 +38,52 @@ async function updateStock(itemName, unit, newStock) {
 async function createOrderTransaction(orderData) {
   const { customer, items, deliveryPerson = '', paymentStatus = 'unpaid' } = orderData;
   
-  if (!customer || !items || !Array.isArray(items) || items.length === 0) {
-    return {
-      success: false,
-      error: 'ข้อมูลไม่ครบถ้วน: ต้องมีลูกค้าและรายการสินค้า'
-    };
-  }
-
   try {
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
+    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
     const orderNo = orderRows.length || 1;
     
-    const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
-    const stockMap = new Map();
+    // For EACH item, create a SEPARATE row
+    const rowsToAdd = [];
     
-    for (let i = 1; i < stockRows.length; i++) {
-      const name = (stockRows[i][0] || '').toLowerCase().trim();
-      const unit = (stockRows[i][3] || '').toLowerCase().trim();
-      const stock = parseInt(stockRows[i][4] || 0);
-      const key = `${name}|${unit}`;
-      stockMap.set(key, { stock, rowIndex: i + 1 });
-    }
-
     for (const item of items) {
-      const key = `${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`;
-      const stockInfo = stockMap.get(key);
+      const row = [
+        orderNo,                           // A - รหัส
+        getThaiDateTimeString(),           // B - วันที่
+        customer,                          // C - ลูกค้า
+        item.stockItem.item,               // D - สินค้า (name only)
+        item.quantity,                     // E - จำนวน (number only)
+        '',                                // F - หมายเหตุ
+        deliveryPerson,                    // G - ผู้ส่ง
+        'รอดำเนินการ',                     // H - สถานะ
+        paymentStatus === 'paid' ? 'จ่ายแล้ว' : 'ยังไม่จ่าย', // I
+        item.quantity * item.stockItem.price  // J - ยอดเงิน (per item)
+      ];
+      rowsToAdd.push(row);
       
-      if (!stockInfo) {
-        return {
-          success: false,
-          error: `❌ ไม่พบสินค้า: ${item.stockItem.item}`
-        };
-      }
-      
-      if (stockInfo.stock < item.quantity) {
-        return {
-          success: false,
-          error: `❌ สต็อกไม่พอ: ${item.stockItem.item}\nมี ${stockInfo.stock} ต้องการ ${item.quantity}`
-        };
-      }
+      // Update stock
+      await updateStockForItem(item);
     }
-
-    const lineItems = [];
-    const stockUpdates = [];
-
-    for (const item of items) {
-      const key = `${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`;
-      const stockInfo = stockMap.get(key);
-      const newStock = stockInfo.stock - item.quantity;
-      
-      await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${stockInfo.rowIndex}`, [[newStock]]);
-      
-      lineItems.push({
-        item: item.stockItem.item,
-        quantity: item.quantity,
-        unit: item.stockItem.unit,
-        price: item.stockItem.price,
-        cost: item.stockItem.cost,
-        subtotal: item.quantity * item.stockItem.price
-      });
-      
-      stockUpdates.push({
-        item: item.stockItem.item,
-        oldStock: stockInfo.stock,
-        newStock: newStock
-      });
-      
-      Logger.success(`📦 ${item.stockItem.item}: ${stockInfo.stock} → ${newStock}`);
-    }
-
-    const totalAmount = lineItems.reduce((sum, line) => sum + line.subtotal, 0);
-    const thaiPaymentStatus = PAYMENT_STATUS_MAP[paymentStatus] || 'ยังไม่จ่าย';
     
-    const orderRow = [
-      orderNo,
-      getThaiDateTimeString(),
-      customer,
-      deliveryPerson,
-      'รอดำเนินการ',
-      thaiPaymentStatus,
-      totalAmount,
-      JSON.stringify(lineItems),
-      ''
-    ];
-    
-    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I', [orderRow]);
+    // Add all rows at once
+    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J', rowsToAdd);
     await loadStockCache(true);
-
-    Logger.success(`✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿`);
-
+    
+    const totalAmount = rowsToAdd.reduce((sum, row) => sum + row[9], 0);
+    
     return {
       success: true,
       orderNo,
       customer,
       totalAmount,
-      items: lineItems.map((line, idx) => ({
-        productName: line.item,
-        quantity: line.quantity,
-        unit: line.unit,
-        unitPrice: line.price,
-        lineTotal: line.subtotal,
-        newStock: stockUpdates[idx].newStock,
-        stockItem: items[idx].stockItem
-      })),
-      stockUpdates
+      items: items.map(i => ({
+        productName: i.stockItem.item,
+        quantity: i.quantity,
+        unitPrice: i.stockItem.price
+      }))
     };
-
   } catch (error) {
     Logger.error('createOrderTransaction failed', error);
-    return {
-      success: false,
-      error: `❌ ไม่สามารถสร้างออเดอร์ได้: ${error.message}`
-    };
+    return { success: false, error: error.message };
   }
 }
 
