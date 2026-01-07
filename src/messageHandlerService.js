@@ -221,6 +221,19 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
     return { success: false, error: error.message };
   }
 }
+
+async function getLastOrderNumber() {
+  try {
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
+    if (rows.length <= 1) return null;
+    
+    // Get the most recent order number (last row)
+    return rows[rows.length - 1][0];
+  } catch (error) {
+    Logger.error('getLastOrderNumber failed', error);
+    return null;
+  }
+}
 // ============================================================================
 // MAIN MESSAGE HANDLER - Handles both text and voice
 // ============================================================================
@@ -234,35 +247,64 @@ async function handleMessage(text, userId) {
     // ========================================
     
     // Payment command
-    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
-    if (paymentMatch) {
-      const orderNo = paymentMatch[1];
+     const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง)?(?:แล้ว|เเล้ว)?)\s*(?:#?(\d+))?/i);
+    if (paymentMatch && paymentMatch[0].length >= 3) {
+      let orderNo = paymentMatch[1];
+      
+      // NO NUMBER? USE LAST ORDER
+      if (!orderNo) {
+        orderNo = await getLastOrderNumber();
+        if (!orderNo) {
+          return { 
+            success: false, 
+            message: '❌ ไม่มีออเดอร์ในระบบ\n\nสร้างออเดอร์ก่อนนะ!' 
+          };
+        }
+        Logger.info(`💡 Using last order: #${orderNo}`);
+      }
+      
       const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
-
+      
       if (result.success) {
         await saveToInbox(userId, text);
-        return { success: true, message: formatPaymentSuccess(orderNo, result.customer, result.totalAmount) };
+        return { 
+          success: true, 
+          message: `✅ อัปเดตการชำระเงิน\n\n📋 ออเดอร์ #${orderNo}\n💰 ${result.totalAmount?.toLocaleString() || 0}฿` 
+        };
       } else {
-        return { success: false, message: formatError('order_not_found', { orderNo }) };
+        return { success: false, message: `❌ ไม่พบออเดอร์ #${orderNo}` };
       }
     }
-
     // Delivery command
-    const deliveryMatch = text.match(/ส่ง\s*#?(\d+)(?:\s+(.+))?/i);
-    if (deliveryMatch) {
-      const orderNo = deliveryMatch[1];
+    const deliveryMatch = text.match(/ส่ง\s*(?:#?(\d+))?\s*(.+)?/i);
+    if (deliveryMatch && deliveryMatch[0].length >= 2) {
+      let orderNo = deliveryMatch[1];
       const deliveryPerson = deliveryMatch[2]?.trim() || null;
       
+      // NO NUMBER? USE LAST ORDER
+      if (!orderNo) {
+        orderNo = await getLastOrderNumber();
+        if (!orderNo) {
+          return { 
+            success: false, 
+            message: '❌ ไม่มีออเดอร์ในระบบ' 
+          };
+        }
+        Logger.info(`💡 Using last order: #${orderNo}`);
+      }
+      
       const result = await updateDeliveryStatus(orderNo, 'กำลังจัดส่ง', deliveryPerson);
-
+      
       if (result.success) {
         await saveToInbox(userId, text);
-        return { success: true, message: formatDeliveryStatus(result) };
+        return { 
+          success: true, 
+          message: `✅ อัปเดตการจัดส่ง\n\n📋 ออเดอร์ #${orderNo}\n🚚 สถานะ: กำลังจัดส่ง${deliveryPerson ? `\n👤 คนส่ง: ${deliveryPerson}` : ''}` 
+        };
       } else {
-        return { success: false, message: formatError('order_not_found', { orderNo }) };
+        return { success: false, message: `❌ ไม่พบออเดอร์ #${orderNo}` };
       }
     }
-
     // Cancel command
     const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/i);
     if (cancelMatch) {
