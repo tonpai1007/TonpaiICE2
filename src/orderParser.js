@@ -164,6 +164,7 @@ OUTPUT JSON:
 }`;
 
     const result = await generateWithGroq(prompt, true);
+    result.rawInput = userInput; 
 
     const mappedItems = [];
     const matchDetails = [];
