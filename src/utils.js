@@ -1,5 +1,4 @@
-// utils.js - Utility functions for text processing, date handling, validation
-
+// utils.js - FIXED: Consistent date handling across system
 // ============================================================================
 // TEXT PROCESSING
 // ============================================================================
@@ -74,26 +73,61 @@ function calculateAdvancedSimilarity(str1, str2) {
 }
 
 // ============================================================================
-// DATE & TIME
+// DATE & TIME - FIXED: Consistent Gregorian format
 // ============================================================================
 
+/**
+ * Get current date in YYYY-MM-DD format (Gregorian)
+ * Used for: Date comparisons, Dashboard, filtering
+ */
 function getThaiDateString() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
+  const now = new Date();
+  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  return bangkokTime.toISOString().split('T')[0]; // Returns: "2026-01-07"
 }
 
+/**
+ * Get current datetime in display format
+ * Used for: Order timestamps, user-facing displays
+ * Returns: "07/01/2026 14:30:00" (Thai format for readability)
+ */
 function getThaiDateTimeString() {
-  return new Date().toLocaleString('th-TH', { 
-    timeZone: 'Asia/Bangkok',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
+  const now = new Date();
+  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  
+  const day = String(bangkokTime.getDate()).padStart(2, '0');
+  const month = String(bangkokTime.getMonth() + 1).padStart(2, '0');
+  const year = bangkokTime.getFullYear();
+  const hours = String(bangkokTime.getHours()).padStart(2, '0');
+  const minutes = String(bangkokTime.getMinutes()).padStart(2, '0');
+  const seconds = String(bangkokTime.getSeconds()).padStart(2, '0');
+  
+  return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
 }
 
+/**
+ * Extract Gregorian date from Thai datetime string
+ * Converts: "07/01/2026 14:30:00" → "2026-01-07"
+ * Used for: Date comparisons in reports
+ */
+function extractGregorianDate(thaiDateTimeStr) {
+  if (!thaiDateTimeStr) return null;
+  
+  // Handle format: "07/01/2026 14:30:00"
+  if (thaiDateTimeStr.includes('/')) {
+    const datePart = thaiDateTimeStr.split(' ')[0]; // "07/01/2026"
+    const [day, month, year] = datePart.split('/');
+    return `${year}-${month}-${day}`; // "2026-01-07"
+  }
+  
+  // Handle format: "2026-01-07 14:30:00"
+  return thaiDateTimeStr.split(' ')[0];
+}
+
+/**
+ * Convert Thai Buddhist year date to Gregorian
+ * Converts: "07/01/2569" → "2026-01-07"
+ */
 function convertThaiDateToGregorian(thaiDateStr) {
   const match = thaiDateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
   if (!match) return null;
@@ -101,9 +135,24 @@ function convertThaiDateToGregorian(thaiDateStr) {
   const day = match[1];
   const month = match[2];
   const buddhistYear = parseInt(match[3]);
-  const gregorianYear = buddhistYear - 543;
   
+  // Check if it's already Gregorian (year < 2500)
+  if (buddhistYear < 2500) {
+    return `${buddhistYear}-${month}-${day}`;
+  }
+  
+  // Convert from Buddhist to Gregorian
+  const gregorianYear = buddhistYear - 543;
   return `${gregorianYear}-${month}-${day}`;
+}
+
+/**
+ * Check if two dates are the same day
+ */
+function isSameDay(dateStr1, dateStr2) {
+  const date1 = extractGregorianDate(dateStr1) || dateStr1;
+  const date2 = extractGregorianDate(dateStr2) || dateStr2;
+  return date1 === date2;
 }
 
 // ============================================================================
@@ -196,7 +245,9 @@ module.exports = {
   calculateAdvancedSimilarity,
   getThaiDateString,
   getThaiDateTimeString,
+  extractGregorianDate,
   convertThaiDateToGregorian,
+  isSameDay,
   Validator,
   retryWithBackoff,
   generateSKU
