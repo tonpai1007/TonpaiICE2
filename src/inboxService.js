@@ -1,28 +1,39 @@
-// inboxService.js - FIXED: Cancel reads JSON line items
+// inboxService.js - FIXED: Proper inbox structure and cancel order
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
 const { appendSheetData, getSheetData, updateSheetData } = require('./googleServices');
-const { updateStock } = require('./orderService');
+const { loadStockCache } = require('./cacheManager');
 
 // ============================================================================
-// INBOX: บันทึกทุก Input ที่เข้ามา
+// INBOX: Simple 2-column format (วันที่/เวลา, ข้อความ)
 // ============================================================================
 
-async function saveToInbox(userId, text, type = 'voice', metadata = {}) {
+async function saveToInbox(userId, text, type = 'text', metadata = {}) {
   try {
+    // Simple format: [timestamp] [type] text
+    let displayText = text;
+    
+    // Add type prefix if needed
+    if (type === 'voice_raw') {
+      displayText = `🎤 [Voice Input]`;
+    } else if (type === 'voice_transcribed') {
+      displayText = `🎤 "${text}"`;
+    } else if (type === 'order_auto_success') {
+      displayText = `✅ Order #${metadata.orderNo}: ${text}`;
+    } else if (type === 'insufficient_stock') {
+      displayText = `⚠️ Insufficient stock: ${text}`;
+    } else if (type === 'parse_failed') {
+      displayText = `❌ Parse failed: ${text}`;
+    }
+
     const row = [
       getThaiDateTimeString(),
-      userId.substring(0, 15),
-      type,
-      text,
-      JSON.stringify(metadata),
-      'pending',
-      ''
+      displayText
     ];
 
-    await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A:G', [row]);
-    Logger.success(`📥 Saved to Inbox: ${text.substring(0, 30)}...`);
+    await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A:B', [row]);
+    Logger.success(`📥 Saved to Inbox`);
     return true;
   } catch (error) {
     Logger.error('saveToInbox failed', error);
@@ -31,16 +42,14 @@ async function saveToInbox(userId, text, type = 'voice', metadata = {}) {
 }
 
 // ============================================================================
-// CANCEL: ยกเลิกออเดอร์ + คืนสต็อก (FIXED: Read JSON)
+// CANCEL ORDER: Fixed to read JSON line items correctly
 // ============================================================================
 
 async function cancelOrder(orderNo) {
   try {
     Logger.info(`🔄 Cancelling order #${orderNo}...`);
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 1: Get order with embedded line items
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Get order data
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     let orderIndex = -1;
     let orderData = null;
@@ -50,9 +59,8 @@ async function cancelOrder(orderNo) {
         orderIndex = i + 1;
         orderData = {
           orderNo: orderRows[i][0],
-          customer: orderRows[i][2],
-          paymentStatus: orderRows[i][5],
-          lineItemsJson: orderRows[i][7] || '[]'  // Column H
+          customer: orderRows[i][2] || 'ลูกค้า',
+          lineItemsJson: orderRows[i][7] || '[]'  // Column H contains JSON
         };
         break;
       }
@@ -62,56 +70,59 @@ async function cancelOrder(orderNo) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 2: Parse line items from JSON
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Parse line items
     let lineItems = [];
     try {
       lineItems = JSON.parse(orderData.lineItemsJson);
     } catch (parseError) {
-      Logger.error('Failed to parse line items JSON', parseError);
-      return { success: false, error: 'Invalid order data format' };
+      Logger.error('Failed to parse line items', parseError);
+      return { success: false, error: 'ข้อมูลออเดอร์ไม่ถูกต้อง' };
     }
 
     if (lineItems.length === 0) {
-      return { success: false, error: 'ไม่พบรายการสินค้า' };
+      return { success: false, error: 'ไม่พบรายการสินค้าในออเดอร์' };
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 3: Restore stock
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Restore stock for each item
     const stockRestored = [];
-    
-    for (const line of lineItems) {
-      const productName = line.item;
-      const quantity = parseInt(line.quantity || 0);
-      const unit = line.unit;
+    const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
 
-      // Get current stock
-      const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    for (const line of lineItems) {
+      const productName = (line.item || '').toLowerCase().trim();
+      const quantity = parseInt(line.quantity || 0);
+      const unit = (line.unit || '').toLowerCase().trim();
+
       for (let i = 1; i < stockRows.length; i++) {
-        const stockName = (stockRows[i][0] || '').trim().toLowerCase();
-        const stockUnit = (stockRows[i][3] || '').trim().toLowerCase();
+        const stockName = (stockRows[i][0] || '').toLowerCase().trim();
+        const stockUnit = (stockRows[i][3] || '').toLowerCase().trim();
         
-        if (stockName === productName.toLowerCase() && stockUnit === unit.toLowerCase()) {
+        if (stockName === productName && stockUnit === unit) {
           const currentStock = parseInt(stockRows[i][4] || 0);
           const newStock = currentStock + quantity;
           
-          await updateStock(productName, unit, newStock);
-          stockRestored.push({ item: productName, restored: quantity, newStock });
-          Logger.success(`✅ Restored: ${productName} +${quantity} → ${newStock}`);
+          // Update stock
+          await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
+          
+          stockRestored.push({ 
+            item: line.item, 
+            restored: quantity, 
+            newStock 
+          });
+          
+          Logger.success(`✅ Restored: ${line.item} +${quantity} → ${newStock}`);
           break;
         }
       }
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 4: Mark order as cancelled
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Mark order as cancelled
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${orderIndex}`, [['ยกเลิก']]);
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${orderIndex}`, [['[ยกเลิกโดยระบบ]']]);
 
-    Logger.success(`✅ Cancelled order #${orderNo}`);
+    // Reload cache
+    await loadStockCache(true);
+
+    Logger.success(`✅ Cancelled order #${orderNo}, restored ${stockRestored.length} items`);
 
     return {
       success: true,
@@ -127,30 +138,44 @@ async function cancelOrder(orderNo) {
 }
 
 // ============================================================================
-// INBOX STATUS UPDATE
+// GENERATE INBOX SUMMARY
 // ============================================================================
 
-async function updateInboxStatus(timestamp, userId, newStatus) {
+async function generateInboxSummary(limit = 15) {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'Inbox!A:G');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'Inbox!A:B');
     
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][0] === timestamp && rows[i][1].includes(userId.substring(0, 10))) {
-        await updateSheetData(CONFIG.SHEET_ID, `Inbox!F${i + 1}`, [[newStatus]]);
-        Logger.success(`✅ Inbox status updated: ${newStatus}`);
-        return true;
-      }
+    if (rows.length <= 1) {
+      return '📝 Inbox ว่างเปล่า\n\nยังไม่มีข้อความในระบบ';
     }
+
+    const messages = rows.slice(1)
+      .slice(-limit)
+      .reverse();
+
+    let msg = `📝 Inbox (${messages.length} ข้อความล่าสุด)\n${'='.repeat(40)}\n\n`;
     
-    return false;
+    messages.forEach((row, idx) => {
+      const timestamp = row[0] || '';
+      const text = row[1] || '';
+      
+      const time = timestamp.split(' ')[1] || timestamp;
+      
+      msg += `${idx + 1}. [${time}] ${text.substring(0, 60)}\n`;
+      if (text.length > 60) msg += `   ...\n`;
+      msg += `\n`;
+    });
+
+    return msg;
+
   } catch (error) {
-    Logger.error('updateInboxStatus failed', error);
-    return false;
+    Logger.error('generateInboxSummary failed', error);
+    return `❌ ไม่สามารถดู Inbox ได้: ${error.message}`;
   }
 }
 
 module.exports = {
   saveToInbox,
   cancelOrder,
-  updateInboxStatus
+  generateInboxSummary
 };
