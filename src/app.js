@@ -1,4 +1,4 @@
-// app.js - FULLY INTEGRATED with UX Enhancements
+// app.js - COMPLETE & FIXED
 const express = require('express');
 const axios = require('axios');
 
@@ -17,20 +17,13 @@ const { saveToInbox, cancelOrder } = require('./inboxService');
 const { adjustStock, parseAdjustmentCommand, generateVarianceReport, viewCurrentStock } = require('./stockAdjustment');
 const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressiveAutoConfig');
 const { autoAddCustomer } = require('./customerService');
-
-// ✨ UX ENHANCEMENTS - Inline Implementation
-// No external module needed
+const { generateDailySummary, generateInboxSummary } = require('./dashboardService');
+const { getSheetData, updateSheetData } = require('./googleServices');
+const { CONFIG } = require('./config');
 
 const app = express();
 app.use(express.json());
 
-// ============================================================================
-// INBOX: บันทึกทุก Input ที่เข้ามา (FIXED: Simple 2-column format)
-// ============================================================================
-
-
-
-// 1. Stock Monitor
 function checkStockWarnings(items) {
   const warnings = [];
   const criticalItems = [];
@@ -87,7 +80,6 @@ function formatStockWarnings(checkResult) {
   return checkResult.warnings.map(w => w.message).join('\n');
 }
 
-// 2. Quick Actions Formatter
 function formatOrderSuccess(orderNo, customer, items, totalAmount, confidence) {
   const summary = items.map(i => {
     const itemName = i.productName || i.stockItem?.item || 'สินค้า';
@@ -135,7 +127,44 @@ function formatCancelSuccess(orderNo, customer, stockRestored) {
          `💡 สต็อกถูกคืนกลับแล้ว`;
 }
 
-// 3. Delivery Tracker
+function formatDeliveryStatus(result) {
+  let msg = `${result.icon} อัปเดตสถานะการจัดส่ง\n\n`;
+  msg += `📋 ออเดอร์ #${result.orderNo}\n`;
+  msg += `👤 ${result.customer}\n\n`;
+  msg += `สถานะ: ${result.oldStatus} → ${result.newStatus}\n`;
+  
+  if (result.deliveryPerson) {
+    msg += `🚚 คนส่ง: ${result.deliveryPerson}\n`;
+  }
+  
+  if (result.newStatus === 'ส่งเสร็จแล้ว') {
+    msg += `\n💡 พิมพ์ "จ่าย #${result.orderNo}" เพื่ออัปเดตการชำระเงิน`;
+  }
+  
+  return msg;
+}
+
+function formatError(errorType, details = {}) {
+  const errors = {
+    'order_not_found': `❌ ไม่พบออเดอร์ #${details.orderNo}\n\n` +
+                       `━━━━━━━━━━━━━━━━━━━━\n` +
+                       `💡 แก้ไข:\n` +
+                       `• ตรวจสอบเลขออเดอร์\n` +
+                       `• ออเดอร์อาจถูกยกเลิกไปแล้ว`,
+    
+    'parse_failed': `❌ ไม่เข้าใจคำสั่ง\n\n` +
+                    `"${details.input}"\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `💡 ตัวอย่างที่ถูกต้อง:\n` +
+                    `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง" (สั่งซื้อ)\n` +
+                    `• "จ่าย #123" (ชำระเงิน)\n` +
+                    `• "เติมน้ำแข็ง 20" (ปรับสต็อก)\n\n` +
+                    `พิมพ์ "help" เพื่อดูคำสั่งทั้งหมด`
+  };
+  
+  return errors[errorType] || `❌ เกิดข้อผิดพลาด\n\n${details.message || 'Unknown error'}`;
+}
+
 async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
   try {
     const validStatuses = {
@@ -170,12 +199,8 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
     
-    const { updateSheetData } = require('./googleServices');
-    
-    // Update delivery status
     await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${rowIndex}`, [[status]]);
     
-    // Update delivery person if provided
     if (deliveryPerson) {
       await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!D${rowIndex}`, [[deliveryPerson]]);
     }
@@ -198,65 +223,9 @@ async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
   }
 }
 
-function formatDeliveryStatus(result) {
-  let msg = `${result.icon} อัปเดตสถานะการจัดส่ง\n\n`;
-  msg += `📋 ออเดอร์ #${result.orderNo}\n`;
-  msg += `👤 ${result.customer}\n\n`;
-  msg += `สถานะ: ${result.oldStatus} → ${result.newStatus}\n`;
-  
-  if (result.deliveryPerson) {
-    msg += `🚚 คนส่ง: ${result.deliveryPerson}\n`;
-  }
-  
-  if (result.newStatus === 'ส่งเสร็จแล้ว') {
-    msg += `\n💡 พิมพ์ "จ่าย #${result.orderNo}" เพื่ออัปเดตการชำระเงิน`;
-  }
-  
-  return msg;
-}
-
-// 4. Smart Error Messages
-function formatError(errorType, details = {}) {
-  const errors = {
-    'order_not_found': `❌ ไม่พบออเดอร์ #${details.orderNo}\n\n` +
-                       `━━━━━━━━━━━━━━━━━━━━\n` +
-                       `💡 แก้ไข:\n` +
-                       `• ตรวจสอบเลขออเดอร์\n` +
-                       `• ออเดอร์อาจถูกยกเลิกไปแล้ว`,
-    
-    'parse_failed': `❌ ไม่เข้าใจคำสั่ง\n\n` +
-                    `"${details.input}"\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━\n` +
-                    `💡 ตัวอย่างที่ถูกต้อง:\n` +
-                    `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง" (สั่งซื้อ)\n` +
-                    `• "จ่าย #123" (ชำระเงิน)\n` +
-                    `• "เติมน้ำแข็ง 20" (ปรับสต็อก)\n\n` +
-                    `พิมพ์ "help" เพื่อดูคำสั่งทั้งหมด`
-  };
-  
-  return errors[errorType] || `❌ เกิดข้อผิดพลาด\n\n${details.message || 'Unknown error'}`;
-}
-
-// 5. Contextual Help
-function getContextualHelp(context) {
-  const helps = {
-    'stock_low': `⚠️ สต็อกเหลือน้อย!\n\n` +
-                 `📝 ควรทำ:\n` +
-                 `• "เติมน้ำแข็ง 50" - เติมสต็อก\n` +
-                 `• "สต็อก" - ดูรายการที่เหลือน้อย\n` +
-                 `• "รายงานสต็อก" - ดูการใช้วันนี้`
-  };
-  
-  return helps[context] || '';
-}
-
-// ============================================================================
-// INITIALIZATION
-// ============================================================================
-
 async function initializeApp() {
   try {
-    Logger.info('🚀 Starting Enhanced Order Bot...');
+    Logger.info('🚀 Starting Order Bot...');
     
     initializeGoogleServices();
     initializeAIServices();
@@ -265,16 +234,12 @@ async function initializeApp() {
     await loadStockCache(true);
     await loadCustomerCache(true);
     
-    Logger.success('✅ System Ready with UX Enhancements 🎯');
+    Logger.success('✅ System Ready');
   } catch (error) {
     Logger.error('❌ Init failed', error);
     process.exit(1);
   }
 }
-
-// ============================================================================
-// LINE MESSAGING
-// ============================================================================
 
 async function replyToLine(replyToken, text) {
   const token = configManager.get('LINE_TOKEN');
@@ -327,32 +292,19 @@ async function fetchAudioFromLine(messageId) {
   return Buffer.from(response.data);
 }
 
-// ============================================================================
-// TEXT HANDLER - ENHANCED with UX Features
-// ============================================================================
-
 async function handleTextMessage(text, replyToken, userId) {
   try {
     const lower = text.toLowerCase().trim();
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 💰 PAYMENT COMMAND: "จ่าย #123"
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
     if (paymentMatch) {
       const orderNo = paymentMatch[1];
       const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
 
       if (result.success) {
-        const msg = formatPaymentSuccess(
-          orderNo,
-          result.customer,
-          result.totalAmount
-        );
-        
+        const msg = formatPaymentSuccess(orderNo, result.customer, result.totalAmount);
         await replyToLine(replyToken, msg);
         await saveToInbox(userId, text);
-        Logger.success(`✅ Payment updated #${orderNo}`);
       } else {
         const errorMsg = formatError('order_not_found', { orderNo });
         await replyToLine(replyToken, errorMsg);
@@ -360,25 +312,17 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 🚚 DELIVERY COMMAND: "ส่ง #123" or "ส่ง #123 พี่แดง"
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const deliveryMatch = text.match(/ส่ง\s*#?(\d+)(?:\s+(.+))?/i);
     if (deliveryMatch) {
       const orderNo = deliveryMatch[1];
       const deliveryPerson = deliveryMatch[2]?.trim() || null;
       
-      const result = await updateDeliveryStatus(
-        orderNo,
-        'กำลังจัดส่ง',
-        deliveryPerson
-      );
+      const result = await updateDeliveryStatus(orderNo, 'กำลังจัดส่ง', deliveryPerson);
 
       if (result.success) {
         const msg = formatDeliveryStatus(result);
         await replyToLine(replyToken, msg);
         await saveToInbox(userId, text);
-        Logger.success(`✅ Delivery updated #${orderNo}`);
       } else {
         const errorMsg = formatError('order_not_found', { orderNo });
         await replyToLine(replyToken, errorMsg);
@@ -386,25 +330,16 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 🚫 CANCEL ORDER: "ยกเลิก #123"
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/i);
     if (cancelMatch) {
       const orderNo = cancelMatch[1];
       const result = await cancelOrder(orderNo);
 
       if (result.success) {
-        const msg = formatCancelSuccess(
-          orderNo,
-          result.customer,
-          result.stockRestored
-        );
-        
+        const msg = formatCancelSuccess(orderNo, result.customer, result.stockRestored);
         await replyToLine(replyToken, msg);
         await saveToInbox(userId, text);
         monitor.recordCancellation(orderNo, true);
-        Logger.success(`✅ Cancelled order #${orderNo}`);
       } else {
         const errorMsg = formatError('order_not_found', { orderNo });
         await replyToLine(replyToken, errorMsg);
@@ -412,9 +347,6 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 🔧 STOCK ADJUSTMENT
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const adjCommand = await parseAdjustmentCommand(text);
     if (adjCommand.isAdjustment) {
       const result = await adjustStock(
@@ -435,11 +367,6 @@ async function handleTextMessage(text, replyToken, userId) {
         msg += `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n`;
         msg += `💡 ${result.operationText}`;
         
-        // ✨ Add contextual help if stock is low
-        if (result.newStock <= 10) {
-          msg += '\n\n' + getContextualHelp('stock_low');
-        }
-        
         await replyToLine(replyToken, msg);
         await saveToInbox(userId, text);
       } else {
@@ -448,27 +375,18 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 📊 DAILY SUMMARY: "สรุป" or "สรุปวันนี้"
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower === 'สรุป' || lower.includes('สรุปวันนี้') || lower === 'summary') {
       const summary = await generateDailySummary();
       await replyToLine(replyToken, summary);
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 📝 INBOX VIEW: "inbox" or "ดูinbox"
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower === 'inbox' || lower.includes('ดูinbox')) {
       const inboxSummary = await generateInboxSummary(15);
       await replyToLine(replyToken, inboxSummary);
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // ❓ HELP
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower === 'help' || lower === 'ช่วยเหลือ') {
       await replyToLine(replyToken, 
         `🤖 คำสั่งที่ใช้ได้\n` +
@@ -488,7 +406,7 @@ async function handleTextMessage(text, replyToken, userId) {
         `• "สต็อก" - ดูสต็อกทั้งหมด\n\n` +
         `📊 รายงาน:\n` +
         `• "รายงานสต็อก" - ดูการปรับสต็อก\n` +
-        `• "สถิติ" - ดู automation stats\n\n` +
+        `• "สรุป" - สรุปยอดขายวันนี้\n\n` +
         `⚙️ อื่นๆ:\n` +
         `• "ยกเลิก #123" - ยกเลิกออเดอร์\n` +
         `• "รีเฟรช" - โหลดข้อมูลใหม่\n\n` +
@@ -497,9 +415,6 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 📦 VIEW STOCK
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower.includes('สต็อก') && !lower.includes('รายงาน')) {
       const searchTerm = text.replace(/สต็อก|ดู/gi, '').trim();
       const stockList = await viewCurrentStock(searchTerm || null);
@@ -507,18 +422,12 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 📊 VARIANCE REPORT
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower.includes('รายงานสต็อก')) {
       const report = await generateVarianceReport('today');
       await replyToLine(replyToken, report);
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 🔄 REFRESH CACHE
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (lower === 'รีเฟรช' || lower === 'refresh') {
       await loadStockCache(true);
       await loadCustomerCache(true);
@@ -526,27 +435,18 @@ async function handleTextMessage(text, replyToken, userId) {
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 📦 TRY TO PARSE AS ORDER (for text input)
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // If not a command, try parsing as order
     await saveToInbox(userId, text, 'text_input');
     
     const parsed = await parseOrder(text);
     
     if (parsed.success && parsed.items && parsed.items.length > 0) {
-      // Successfully parsed as order
       const corrected = applySmartCorrection(parsed);
-      
-      // Check stock warnings
       const stockCheck = checkStockWarnings(corrected.items);
       
       if (stockCheck.hasCritical) {
         const warningMsg = formatStockWarnings(stockCheck);
         await replyToLine(replyToken, warningMsg);
-        await saveToInbox(userId, text, 'insufficient_stock', { 
-          items: stockCheck.criticalItems 
-        });
+        await saveToInbox(userId, text, 'insufficient_stock');
         return;
       }
       
@@ -557,7 +457,6 @@ async function handleTextMessage(text, replyToken, userId) {
       const decision = shouldAutoProcess(corrected, orderValue);
       
       if (decision.shouldAuto) {
-        // Auto-add customer
         if (corrected.customer && corrected.customer !== 'ไม่ระบุ') {
           await autoAddCustomer(corrected.customer);
         }
@@ -569,11 +468,7 @@ async function handleTextMessage(text, replyToken, userId) {
         });
         
         if (result.success) {
-          await saveToInbox(userId, text, 'order_auto_success', { 
-            orderNo: result.orderNo,
-            customer: result.customer,
-            totalAmount: result.totalAmount
-          });
+          await saveToInbox(userId, text, 'order_auto_success');
           
           const msg = formatOrderSuccess(
             result.orderNo,
@@ -595,71 +490,40 @@ async function handleTextMessage(text, replyToken, userId) {
           if (stockCheck.warnings.some(w => w.level === 'critical')) {
             await pushToAdmin(`⚠️ สต็อกเหลือน้อยมาก!\n\n${formatStockWarnings(stockCheck)}`);
           }
-          
-          Logger.success(`✅ Text order #${result.orderNo} created`);
         } else {
-          await saveToInbox(userId, text, 'order_auto_failed', { 
-            error: result.error
-          });
-          
+          await saveToInbox(userId, text, 'order_auto_failed');
           await replyToLine(replyToken, 
-            `❌ ไม่สามารถสร้างออเดอร์ได้\n\n` +
-            `${result.error}\n\n` +
-            `💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
+            `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}\n\n💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
           );
-          Logger.error(`❌ Text order failed: ${result.error}`);
         }
       } else {
-        // Manual review mode
-        const guess = corrected.items.map(i => 
-          `${i.stockItem.item} x${i.quantity}`
-        ).join(', ');
-        
-        await saveToInbox(userId, text, 'pending_review', { 
-          summary: guess,
-          customer: corrected.customer,
-          blockReason: decision.reason
-        });
-        
+        const guess = corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ');
+        await saveToInbox(userId, text, 'pending_review');
         await replyToLine(replyToken, 
-          `📝 รับคำสั่งแล้ว (รอตรวจสอบ)\n\n` +
-          `"${text}"\n\n` +
-          `🤖 ระบบเดา:\n` +
-          `• ลูกค้า: ${corrected.customer}\n` +
-          `• สินค้า: ${guess}\n` +
-          `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n` +
-          `⚠️ เหตุผล: ${decision.reason}\n` +
+          `📝 รับคำสั่งแล้ว (รอตรวจสอบ)\n\n"${text}"\n\n` +
+          `🤖 ระบบเดา:\n• ลูกค้า: ${corrected.customer}\n• สินค้า: ${guess}\n` +
+          `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n⚠️ เหตุผล: ${decision.reason}\n` +
           `💡 แอดมินจะตรวจสอบและบันทึกให้`
         );
-        
         monitor.recordDecision(decision, 'pending');
-        Logger.info(`📥 Text order pending review: "${text}"`);
       }
       return;
     }
 
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // DEFAULT: Unknown command (parse failed)
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     await saveToInbox(userId, text, 'unknown_command');
-    
     const errorMsg = formatError('parse_failed', { input: text });
     await replyToLine(replyToken, errorMsg);
 
   } catch (error) {
     Logger.error('Text handler error', error);
-    await saveToInbox(userId, text, 'text_error', { error: error.message });
+    await saveToInbox(userId, text, 'text_error');
     await replyToLine(replyToken, '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง');
   }
 }
 
-// ============================================================================
-// VOICE HANDLER - ENHANCED with Stock Warnings
-// ============================================================================
-
 async function handleVoiceMessage(messageId, replyToken, userId) {
   try {
-    await saveToInbox(userId, '[🎤 Voice Input]', 'voice_raw', { messageId });
+    await saveToInbox(userId, '[🎤 Voice Input]', 'voice_raw');
 
     const audioBuffer = await fetchAudioFromLine(messageId);
     const { success, text } = await transcribeAudio(audioBuffer);
@@ -671,47 +535,37 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
     }
 
     Logger.info(`📝 Transcribed: "${text}"`);
-    await saveToInbox(userId, text, 'voice_transcribed', { 
-      transcription: text,
-      timestamp: new Date().toISOString()
-    });
+    await saveToInbox(userId, text, 'voice_transcribed');
 
-    // Check for payment command
     const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง|แล้ว)?)\s*#?(\d+)/i);
     if (paymentMatch) {
       await handleTextMessage(text, replyToken, userId);
       return;
     }
 
-    // Check for stock adjustment
     const adjCommand = await parseAdjustmentCommand(text);
     if (adjCommand.isAdjustment) {
       await handleTextMessage(text, replyToken, userId);
       return;
     }
 
-    // Parse as order
     const parsed = await parseOrder(text);
     parsed.rawInput = text;
 
     if (!parsed.success || !parsed.items || parsed.items.length === 0) {
-      await saveToInbox(userId, text, 'parse_failed', { error: parsed.error });
+      await saveToInbox(userId, text, 'parse_failed');
       const errorMsg = formatError('parse_failed', { input: text });
       await replyToLine(replyToken, errorMsg);
       return;
     }
 
     const corrected = applySmartCorrection(parsed);
-    
-    // ✨ CHECK STOCK WARNINGS BEFORE PROCESSING
     const stockCheck = checkStockWarnings(corrected.items);
     
     if (stockCheck.hasCritical) {
       const warningMsg = formatStockWarnings(stockCheck);
       await replyToLine(replyToken, warningMsg);
-      await saveToInbox(userId, text, 'insufficient_stock', { 
-        items: stockCheck.criticalItems 
-      });
+      await saveToInbox(userId, text, 'insufficient_stock');
       return;
     }
 
@@ -722,7 +576,6 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
     const decision = shouldAutoProcess(corrected, orderValue);
 
     if (decision.shouldAuto) {
-      // Auto-add customer
       if (corrected.customer && corrected.customer !== 'ไม่ระบุ') {
         await autoAddCustomer(corrected.customer);
       }
@@ -734,13 +587,8 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
       });
 
       if (result.success) {
-        await saveToInbox(userId, text, 'order_auto_success', { 
-          orderNo: result.orderNo,
-          customer: result.customer,
-          totalAmount: result.totalAmount
-        });
+        await saveToInbox(userId, text, 'order_auto_success');
 
-        // ✨ USE ENHANCED SUCCESS MESSAGE
         const msg = formatOrderSuccess(
           result.orderNo,
           result.customer,
@@ -749,11 +597,8 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
           corrected.confidence
         );
         
-        // ✨ ADD STOCK WARNING IF ANY
         if (stockCheck.hasWarnings) {
-          const warnings = stockCheck.warnings
-            .map(w => w.message)
-            .join('\n');
+          const warnings = stockCheck.warnings.map(w => w.message).join('\n');
           await replyToLine(replyToken, msg + '\n\n━━━━━━━━━━━━━━━━━━━━\n' + warnings);
         } else {
           await replyToLine(replyToken, msg);
@@ -761,51 +606,31 @@ async function handleVoiceMessage(messageId, replyToken, userId) {
 
         monitor.recordDecision(decision, result.orderNo);
         
-        // ✨ Notify admin if stock is critical
         if (stockCheck.warnings.some(w => w.level === 'critical')) {
           await pushToAdmin(`⚠️ สต็อกเหลือน้อยมาก!\n\n${formatStockWarnings(stockCheck)}`);
         }
         
       } else {
-        await saveToInbox(userId, text, 'order_auto_failed', { 
-          error: result.error
-        });
-        
+        await saveToInbox(userId, text, 'order_auto_failed');
         await replyToLine(replyToken, 
-          `❌ ไม่สามารถสร้างออเดอร์ได้\n\n` +
-          `${result.error}\n\n` +
-          `💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
+          `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}\n\n💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
         );
       }
     } else {
-      // Manual review mode
-      const guess = corrected.items.map(i => 
-        `${i.stockItem.item} x${i.quantity}`
-      ).join(', ');
-
-      await saveToInbox(userId, text, 'pending_review', { 
-        summary: guess,
-        customer: corrected.customer,
-        blockReason: decision.reason
-      });
-
+      const guess = corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ');
+      await saveToInbox(userId, text, 'pending_review');
       await replyToLine(replyToken, 
-        `📝 รับคำสั่งแล้ว (รอตรวจสอบ)\n\n` +
-        `"${text}"\n\n` +
-        `🤖 ระบบเดา:\n` +
-        `• ลูกค้า: ${corrected.customer}\n` +
-        `• สินค้า: ${guess}\n` +
-        `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n` +
-        `⚠️ เหตุผล: ${decision.reason}\n` +
+        `📝 รับคำสั่งแล้ว (รอตรวจสอบ)\n\n"${text}"\n\n` +
+        `🤖 ระบบเดา:\n• ลูกค้า: ${corrected.customer}\n• สินค้า: ${guess}\n` +
+        `• ยอดรวม: ${orderValue.toLocaleString()}฿\n\n⚠️ เหตุผล: ${decision.reason}\n` +
         `💡 แอดมินจะตรวจสอบและบันทึกให้`
       );
-
       monitor.recordDecision(decision, 'pending');
     }
 
   } catch (error) {
     Logger.error('Voice handler error', error);
-    await saveToInbox(userId, '[System Error]', 'voice_error', { error: error.message });
+    await saveToInbox(userId, '[System Error]', 'voice_error');
     await replyToLine(replyToken, '❌ เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่อีกครั้ง');
   }
 }
@@ -841,7 +666,6 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    mode: 'ux-enhanced',
     timestamp: new Date().toISOString() 
   });
 });
