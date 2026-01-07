@@ -13,29 +13,69 @@ class SmartOrderLearner {
   constructor() {
     this.customerPatterns = new Map();
     this.lastLoaded = 0;
-    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes refresh for Sheet
+  }
+
+  // HELPER: Convert Map to Object for JSON saving
+  _serializeMap(map) {
+    return JSON.stringify(Array.from(map.entries()));
+  }
+
+  // HELPER: Convert Object back to Map for loading
+  _deserializeMap(jsonStr) {
+    return new Map(JSON.parse(jsonStr));
+  }
+
+  async saveCache() {
+    try {
+      const data = this._serializeMap(this.customerPatterns);
+      await fs.writeFile(CACHE_FILE, data, 'utf8');
+      Logger.info('💾 Smart memory saved to disk');
+    } catch (error) {
+      Logger.error('Failed to save smart cache', error);
+    }
+  }
+
+  async loadCacheFromFile() {
+    try {
+      // Check if file exists
+      await fs.access(CACHE_FILE);
+      
+      const data = await fs.readFile(CACHE_FILE, 'utf8');
+      this.customerPatterns = this._deserializeMap(data);
+      Logger.success(`📂 Loaded ${this.customerPatterns.size} customer patterns from disk`);
+      return true;
+    } catch (error) {
+      Logger.info('No local cache found, starting fresh');
+      return false;
+    }
   }
 
   async loadOrderHistory() {
     const now = Date.now();
+    
+    // 1. Try loading from disk first (if empty)
+    if (this.customerPatterns.size === 0) {
+      await this.loadCacheFromFile();
+    }
+
+    // 2. Check if we need to refresh from Sheets (Time based)
     if (this.customerPatterns.size > 0 && (now - this.lastLoaded) < this.CACHE_DURATION) {
       return;
     }
 
     try {
-      Logger.info('🧠 Loading order history for learning...');
+      Logger.info('🧠 Syncing order history from Sheets...');
       
       const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
       
       if (orderRows.length <= 1) {
-        Logger.warn('No order history to learn from');
         return;
       }
 
-      this.customerPatterns.clear();
-
       // Analyze last 100 orders
       const recentOrders = orderRows.slice(1).slice(-100);
+      let newLearningCount = 0;
 
       for (const order of recentOrders) {
         const customer = (order[2] || '').trim();
@@ -64,12 +104,18 @@ class SmartOrderLearner {
             const itemName = item.item;
             const key = normalizeText(itemName);
             
+            // Re-map internal commonItems if it was loaded from JSON (it might be a plain object, we need to fix it)
+            if (!(pattern.commonItems instanceof Map)) {
+                pattern.commonItems = new Map(JSON.parse(JSON.stringify(pattern.commonItems))); 
+            }
+
             if (!pattern.commonItems.has(key)) {
               pattern.commonItems.set(key, {
                 name: itemName,
                 count: 0,
                 quantities: []
               });
+              newLearningCount++;
             }
             
             const itemData = pattern.commonItems.get(key);
@@ -86,20 +132,26 @@ class SmartOrderLearner {
             })),
             timestamp: order[1]
           });
+          
+          // Keep only last 20 orders per customer to save RAM
+          if (pattern.orders.length > 20) pattern.orders.shift();
 
         } catch (parseError) {
-          Logger.warn(`Failed to parse order #${order[0]}`);
+          // Ignore bad rows
         }
       }
 
       this.lastLoaded = now;
-      Logger.success(`✅ Learned patterns from ${this.customerPatterns.size} customers`);
+      
+      if (newLearningCount > 0) {
+        await this.saveCache(); // SAVE TO DISK
+        Logger.success(`✅ Learned/Updated patterns for ${this.customerPatterns.size} customers`);
+      }
 
     } catch (error) {
       Logger.error('Failed to load order history', error);
     }
   }
-
   // ============================================================================
   // SMART MATCHING: Find customer by fuzzy name match
   // ============================================================================
