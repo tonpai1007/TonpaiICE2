@@ -9,19 +9,22 @@ const { getSheetsList, createSheet, appendSheetData } = require('./googleService
 
 const REQUIRED_SHEETS = [
   // 1. คำสั่งซื้อ (Orders) - FIXED COLUMN ORDER
+ const REQUIRED_SHEETS = [
   { 
     name: 'คำสั่งซื้อ', 
     headers: [
-      'รหัสคำสั่ง',      // A - Order ID
-      'วันที่',          // B - Timestamp
-      'ลูกค้า',         // C - Customer name
-      'ผู้ส่ง',         // D - Delivery person ✅ FIXED
-      'สถานะการจัดส่ง',  // E - Delivery status
-      'สถานะการชำระ',    // F - Payment status
-      'ยอดรวม',         // G - Total amount
-      'รายการสินค้า',    // H - Line items JSON ✅ FIXED
-      'หมายเหตุ'        // I - Notes
-    ],
+      'รหัส',              // A
+      'วันที่',            // B
+      'ลูกค้า',           // C
+      'สินค้า',           // D
+      'จำนวน',            // E
+      'หมายเหตุ',         // F
+      'ผู้ส่ง',           // G
+      'สถานะ',            // H
+      'จ่ายแล้วหรือยัง',   // I
+      'ยอดเงิน'           // J
+    ]
+  ,
     purpose: 'ONE TRUTH for order management - matches orderService.js output'
   },
   
