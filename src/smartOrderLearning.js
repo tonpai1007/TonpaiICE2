@@ -204,19 +204,10 @@ class SmartOrderLearner {
 
   predictOrder(customerName, parsedItems = []) {
     const customerPattern = this.findCustomerByName(customerName);
-    
-    if (!customerPattern) {
-      return {
-        success: false,
-        reason: 'customer_not_found',
-        confidence: 0
-      };
-    }
+    if (!customerPattern) return { success: false, reason: 'customer_not_found', confidence: 0 };
 
-    // If no items parsed, suggest most common items
     if (!parsedItems || parsedItems.length === 0) {
       const suggestions = this.getMostCommonItems(customerPattern);
-      
       if (suggestions.length > 0) {
         return {
           success: true,
@@ -228,7 +219,6 @@ class SmartOrderLearner {
         };
       }
     }
-
     // If items were parsed, boost confidence if they match history
     if (parsedItems && parsedItems.length > 0) {
       let matchCount = 0;
