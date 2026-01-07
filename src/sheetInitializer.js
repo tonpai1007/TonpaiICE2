@@ -1,32 +1,31 @@
-// sheetInitializer.js - Single Source of Truth Architecture
+// sheetInitializer.js - FIXED: Correct column order
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getSheetsList, createSheet, appendSheetData } = require('./googleServices');
 
 // ============================================================================
-// REQUIRED SHEETS - SINGLE SOURCE OF TRUTH
+// REQUIRED SHEETS - CORRECT STRUCTURE
 // ============================================================================
 
 const REQUIRED_SHEETS = [
-  // 1. คำสั่งซื้อ (Orders) - ONE TRUTH for all orders
-  // Contains: Order header + line items in single row (comma-separated)
+  // 1. คำสั่งซื้อ (Orders) - FIXED COLUMN ORDER
   { 
     name: 'คำสั่งซื้อ', 
     headers: [
-      'รหัสคำสั่ง',      // Order ID
-      'วันที่',          // Timestamp
-      'ลูกค้า',         // Customer name
-      'รายการสินค้า',    // Items (format: "สินค้า1 x จำนวน, สินค้า2 x จำนวน")
-      'ผู้ส่ง',         // Delivery person
-      'สถานะการจัดส่ง',  // Delivery status
-      'สถานะการชำระ',    // Payment status
-      'ยอดรวม',         // Total amount
-      'หมายเหตุ'        // Notes
+      'รหัสคำสั่ง',      // A - Order ID
+      'วันที่',          // B - Timestamp
+      'ลูกค้า',         // C - Customer name
+      'ผู้ส่ง',         // D - Delivery person ✅ FIXED
+      'สถานะการจัดส่ง',  // E - Delivery status
+      'สถานะการชำระ',    // F - Payment status
+      'ยอดรวม',         // G - Total amount
+      'รายการสินค้า',    // H - Line items JSON ✅ FIXED
+      'หมายเหตุ'        // I - Notes
     ],
-    purpose: 'ONE TRUTH for order management - all order data in single sheet'
+    purpose: 'ONE TRUTH for order management - matches orderService.js output'
   },
   
-  // 2. สต็อก (Stock) - ONE TRUTH for inventory
+  // 2. สต็อก (Stock)
   { 
     name: 'สต็อก', 
     headers: [
@@ -38,42 +37,42 @@ const REQUIRED_SHEETS = [
       'หมวดหมู่',       // Category
       'SKU'            // SKU code
     ],
-    purpose: 'ONE TRUTH for inventory - RAG uses this for product matching'
+    purpose: 'ONE TRUTH for inventory'
   },
   
-  // 3. ลูกค้า (Customers) - Customer database
+  // 3. ลูกค้า (Customers)
   {
     name: 'ลูกค้า',
     headers: ['ชื่อลูกค้า', 'เบอร์โทร', 'ที่อยู่', 'หมายเหตุ'],
-    purpose: 'Customer database - RAG uses this for customer matching'
+    purpose: 'Customer database'
   },
   
-  // 4. Dashboard - Daily metrics (derived from คำสั่งซื้อ)
+  // 4. Dashboard
   { 
     name: 'Dashboard', 
     headers: ['วันที่', 'จำนวนออเดอร์', 'ต้นทุน', 'ยอดขาย', 'กำไร', 'Top5'],
-    purpose: 'Daily aggregated metrics - calculated from orders'
+    purpose: 'Daily aggregated metrics'
   },
   
-  // 5. เครดิต (Credit) - Credit tracking (links to คำสั่งซื้อ)
+  // 5. เครดิต (Credit)
   {
     name: 'เครดิต',
     headers: ['วันที่', 'ลูกค้า', 'รหัสคำสั่ง', 'ยอดเงิน', 'สถานะ', 'วันครบกำหนด', 'หมายเหตุ'],
-    purpose: 'Credit/debt tracking - references orders by ID'
+    purpose: 'Credit/debt tracking'
   },
   
-  // 6. Inbox - Simple notebook (วันที่/เวลา + ข้อความ)
+  // 6. Inbox
   {
     name: 'Inbox',
     headers: ['วันที่/เวลา', 'ข้อความ'],
-    purpose: 'Simple notebook - easy to read transcription log'
+    purpose: 'Simple notebook'
   },
   
-  // 7. VarianceLog - Stock adjustments (tracks changes to สต็อก)
+  // 7. VarianceLog
   {
     name: 'VarianceLog',
     headers: ['วันที่', 'สินค้า', 'สต็อกเก่า', 'สต็อกใหม่', 'ส่วนต่าง', 'เหตุผล'],
-    purpose: 'Stock adjustment history - audit trail for inventory changes'
+    purpose: 'Stock adjustment history'
   }
 ];
 
@@ -139,20 +138,10 @@ async function validateSheetsStructure() {
     const existingSheets = await getSheetsList(CONFIG.SHEET_ID);
     const issues = [];
 
-    // Check required sheets exist
     for (const required of REQUIRED_SHEETS) {
       if (!existingSheets.includes(required.name)) {
         issues.push(`Missing sheet: ${required.name}`);
       }
-    }
-
-    // Check for deprecated sheets
-    const deprecatedSheets = ['รายการสินค้า', 'รายละเอียดคำสั่งซื้อ'];
-    const foundDeprecated = existingSheets.filter(s => deprecatedSheets.includes(s));
-    
-    if (foundDeprecated.length > 0) {
-      Logger.warn(`⚠️ Found deprecated sheets: ${foundDeprecated.join(', ')}`);
-      Logger.warn(`💡 These can be safely deleted - data is now in คำสั่งซื้อ and สต็อก`);
     }
 
     if (issues.length > 0) {
@@ -175,7 +164,7 @@ async function validateSheetsStructure() {
 // ============================================================================
 
 function logSheetStructure(existingSheets) {
-  Logger.info('\n📊 Sheet Structure (Single Source of Truth):');
+  Logger.info('\n📊 Sheet Structure:');
   Logger.info('━'.repeat(60));
   
   REQUIRED_SHEETS.forEach(sheet => {
@@ -186,10 +175,6 @@ function logSheetStructure(existingSheets) {
   });
   
   Logger.info('━'.repeat(60));
-  Logger.info('\n🎯 Architecture:');
-  Logger.info('  • คำสั่งซื้อ = ONE TRUTH for orders');
-  Logger.info('  • สต็อก = ONE TRUTH for inventory');
-  Logger.info('  • Other sheets reference these two sources\n');
 }
 
 function getRequiredSheets() {
