@@ -247,7 +247,14 @@ async function handleMessage(text, userId) {
     // ========================================
     
     // Payment command
-     const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง)?(?:แล้ว|เเล้ว)?)\s*(?:#?(\d+))?/i);
+    const { getLastOrderNumber, updateOrderPaymentStatus, updateDeliveryStatus } = require('./orderService');
+
+// Inside handleMessage function, replace the payment section:
+
+    // ========================================
+    // PAYMENT - Use last order if no number
+    // ========================================
+    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง)?(?:แล้ว|เเล้ว)?)\s*(?:#?(\d+))?/i);
     if (paymentMatch && paymentMatch[0].length >= 3) {
       let orderNo = paymentMatch[1];
       
@@ -260,22 +267,25 @@ async function handleMessage(text, userId) {
             message: '❌ ไม่มีออเดอร์ในระบบ\n\nสร้างออเดอร์ก่อนนะ!' 
           };
         }
-        Logger.info(`💡 Using last order: #${orderNo}`);
+        Logger.info(`💡 No order # specified, using last order: #${orderNo}`);
       }
       
       const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
-      
+
       if (result.success) {
         await saveToInbox(userId, text);
         return { 
           success: true, 
-          message: `✅ อัปเดตการชำระเงิน\n\n📋 ออเดอร์ #${orderNo}\n💰 ${result.totalAmount?.toLocaleString() || 0}฿` 
+          message: `✅ อัปเดตการชำระเงินสำเร็จ\n\n📋 ออเดอร์ #${orderNo}\n👤 ${result.customer}\n💰 ${result.totalAmount?.toLocaleString() || 0}฿` 
         };
       } else {
-        return { success: false, message: `❌ ไม่พบออเดอร์ #${orderNo}` };
+        return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
     }
-    // Delivery command
+
+    // ========================================
+    // DELIVERY - Use last order if no number
+    // ========================================
     const deliveryMatch = text.match(/ส่ง\s*(?:#?(\d+))?\s*(.+)?/i);
     if (deliveryMatch && deliveryMatch[0].length >= 2) {
       let orderNo = deliveryMatch[1];
@@ -290,19 +300,20 @@ async function handleMessage(text, userId) {
             message: '❌ ไม่มีออเดอร์ในระบบ' 
           };
         }
-        Logger.info(`💡 Using last order: #${orderNo}`);
+        Logger.info(`💡 No order # specified, using last order: #${orderNo}`);
       }
       
       const result = await updateDeliveryStatus(orderNo, 'กำลังจัดส่ง', deliveryPerson);
-      
+
       if (result.success) {
         await saveToInbox(userId, text);
-        return { 
-          success: true, 
-          message: `✅ อัปเดตการจัดส่ง\n\n📋 ออเดอร์ #${orderNo}\n🚚 สถานะ: กำลังจัดส่ง${deliveryPerson ? `\n👤 คนส่ง: ${deliveryPerson}` : ''}` 
-        };
+        let msg = `✅ อัปเดตการจัดส่งสำเร็จ\n\n📋 ออเดอร์ #${orderNo}\n👤 ${result.customer}\n🚚 สถานะ: ${result.status}`;
+        if (deliveryPerson) {
+          msg += `\n👨‍💼 คนส่ง: ${deliveryPerson}`;
+        }
+        return { success: true, message: msg };
       } else {
-        return { success: false, message: `❌ ไม่พบออเดอร์ #${orderNo}` };
+        return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
     }
     // Cancel command
