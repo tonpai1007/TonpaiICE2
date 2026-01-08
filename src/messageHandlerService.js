@@ -162,65 +162,6 @@ function formatError(errorType, details = {}) {
 const { CONFIG } = require('./config');
 const { getSheetData, updateSheetData } = require('./googleServices');
 
-async function updateDeliveryStatus(orderNo, status, deliveryPerson = null) {
-  try {
-    const validStatuses = {
-      'รอดำเนินการ': '⏳',
-      'กำลังเตรียม': '📦',
-      'กำลังจัดส่ง': '🚚',
-      'ส่งเสร็จแล้ว': '✅',
-      'ยกเลิก': '❌'
-    };
-    
-    if (!validStatuses[status]) {
-      return { success: false, error: 'สถานะไม่ถูกต้อง' };
-    }
-    
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    let rowIndex = -1;
-    let orderData = null;
-    
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][0] == orderNo) {
-        rowIndex = i + 1;
-        orderData = {
-          customer: rows[i][2],      // C - Customer ✅
-          currentStatus: rows[i][4]  // E - Delivery Status ✅
-          // Removed: items: rows[i][3] - this is deliveryPerson column, not items!
-        };
-        break;
-      }
-    }
-    
-    if (!orderData) {
-      return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
-    }
-    
-    // Update delivery status (Column E)
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${rowIndex}`, [[status]]);
-    
-    // Update delivery person if provided (Column D)
-    if (deliveryPerson) {
-      await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!D${rowIndex}`, [[deliveryPerson]]);
-    }
-    
-    const icon = validStatuses[status];
-    
-    return {
-      success: true,
-      orderNo,
-      customer: orderData.customer,
-      oldStatus: orderData.currentStatus,
-      newStatus: status,
-      icon,
-      deliveryPerson
-    };
-    
-  } catch (error) {
-    Logger.error('updateDeliveryStatus failed', error);
-    return { success: false, error: error.message };
-  }
-}
 
 async function getLastOrderNumber() {
   try {
@@ -637,11 +578,7 @@ async function viewDeliveryStatus() {
   }
 }
 
-module.exports = {
-  handleMessage,
-  updateDeliveryPerson,
-  viewDeliveryStatus
-};
+
 // ============================================================================
 // ORDER PROCESSING HELPERS
 // ============================================================================
@@ -796,5 +733,6 @@ async function handleUnparseableOrder(text, parsed, userId) {
 
 module.exports = {
   handleMessage,
-  updateDeliveryStatus
+  updateDeliveryPerson,
+  viewDeliveryStatus
 };
