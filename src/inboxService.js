@@ -1,9 +1,23 @@
-// inboxService.js - FIXED: Proper inbox structure and cancel order
+// inboxService.js - UPDATED: Match new 9-column structure
+
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
 const { appendSheetData, getSheetData, updateSheetData } = require('./googleServices');
 const { loadStockCache } = require('./cacheManager');
+
+// Column mapping
+const COL = {
+  ORDER_NO: 0,      // A
+  DATE: 1,          // B
+  CUSTOMER: 2,      // C
+  PRODUCT: 3,       // D
+  QUANTITY: 4,      // E
+  NOTES: 5,         // F
+  DELIVERY: 6,      // G
+  PAYMENT: 7,       // H
+  AMOUNT: 8         // I
+};
 
 // ============================================================================
 // INBOX: Simple 2-column format (วันที่/เวลา, ข้อความ)
@@ -11,10 +25,8 @@ const { loadStockCache } = require('./cacheManager');
 
 async function saveToInbox(userId, text, type = 'text', metadata = {}) {
   try {
-    // Simple format: [timestamp] [type] text
     let displayText = text;
     
-    // Add type prefix if needed
     if (type === 'voice_raw') {
       displayText = `🎤 [Voice Input]`;
     } else if (type === 'voice_transcribed') {
@@ -42,7 +54,7 @@ async function saveToInbox(userId, text, type = 'text', metadata = {}) {
 }
 
 // ============================================================================
-// CANCEL ORDER: Fixed to read JSON line items correctly
+// CANCEL ORDER: UPDATED for 9-column structure
 // ============================================================================
 
 async function cancelOrder(orderNo) {
@@ -51,73 +63,62 @@ async function cancelOrder(orderNo) {
 
     // Get order data
     const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    let orderIndex = -1;
-    let orderData = null;
+    const orderItems = [];
+    let customer = '';
 
+    // Collect all items from this order
     for (let i = 1; i < orderRows.length; i++) {
-      if (orderRows[i][0] == orderNo) {
-        orderIndex = i + 1;
-        orderData = {
-          orderNo: orderRows[i][0],
-          customer: orderRows[i][2] || 'ลูกค้า',
-          lineItemsJson: orderRows[i][7] || '[]'  // Column H contains JSON
-        };
-        break;
+      if (orderRows[i][COL.ORDER_NO] == orderNo) {
+        customer = orderRows[i][COL.CUSTOMER];
+        orderItems.push({
+          rowIndex: i + 1,
+          product: orderRows[i][COL.PRODUCT],
+          quantity: parseInt(orderRows[i][COL.QUANTITY] || 0)
+        });
       }
     }
 
-    if (!orderData) {
+    if (orderItems.length === 0) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
-    }
-
-    // Parse line items
-    let lineItems = [];
-    try {
-      lineItems = JSON.parse(orderData.lineItemsJson);
-    } catch (parseError) {
-      Logger.error('Failed to parse line items', parseError);
-      return { success: false, error: 'ข้อมูลออเดอร์ไม่ถูกต้อง' };
-    }
-
-    if (lineItems.length === 0) {
-      return { success: false, error: 'ไม่พบรายการสินค้าในออเดอร์' };
     }
 
     // Restore stock for each item
     const stockRestored = [];
     const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
 
-    for (const line of lineItems) {
-      const productName = (line.item || '').toLowerCase().trim();
-      const quantity = parseInt(line.quantity || 0);
-      const unit = (line.unit || '').toLowerCase().trim();
+    for (const orderItem of orderItems) {
+      const productName = orderItem.product.toLowerCase().trim();
 
       for (let i = 1; i < stockRows.length; i++) {
         const stockName = (stockRows[i][0] || '').toLowerCase().trim();
-        const stockUnit = (stockRows[i][3] || '').toLowerCase().trim();
         
-        if (stockName === productName && stockUnit === unit) {
+        if (stockName === productName) {
           const currentStock = parseInt(stockRows[i][4] || 0);
-          const newStock = currentStock + quantity;
+          const newStock = currentStock + orderItem.quantity;
           
           // Update stock
           await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${i + 1}`, [[newStock]]);
           
           stockRestored.push({ 
-            item: line.item, 
-            restored: quantity, 
+            item: orderItem.product, 
+            restored: orderItem.quantity, 
             newStock 
           });
           
-          Logger.success(`✅ Restored: ${line.item} +${quantity} → ${newStock}`);
+          Logger.success(`✅ Restored: ${orderItem.product} +${orderItem.quantity} → ${newStock}`);
           break;
         }
       }
     }
 
-    // Mark order as cancelled
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!E${orderIndex}`, [['ยกเลิก']]);
-    await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!I${orderIndex}`, [['[ยกเลิกโดยระบบ]']]);
+    // Mark order as cancelled by updating notes (Column F)
+    for (const orderItem of orderItems) {
+      await updateSheetData(
+        CONFIG.SHEET_ID, 
+        `คำสั่งซื้อ!F${orderItem.rowIndex}`, 
+        [['[ยกเลิก]']]
+      );
+    }
 
     // Reload cache
     await loadStockCache(true);
@@ -127,7 +128,7 @@ async function cancelOrder(orderNo) {
     return {
       success: true,
       orderNo,
-      customer: orderData.customer,
+      customer,
       stockRestored
     };
 
