@@ -6,23 +6,23 @@ const { getSheetsList, createSheet, appendSheetData } = require('./googleService
 // ============================================================================
 // REQUIRED SHEETS - SIMPLE STRUCTURE
 // ============================================================================
+// sheetInitializer.js - SIMPLIFIED: Remove delivery status column
 
 const REQUIRED_SHEETS = [
   { 
     name: 'คำสั่งซื้อ', 
     headers: [
-      'รหัส',              // A
-      'วันที่',            // B
-      'ลูกค้า',           // C
-      'สินค้า',           // D
-      'จำนวน',            // E
-      'หมายเหตุ',         // F
-      'ผู้ส่ง',           // G
-      'สถานะ',            // H
-      'จ่ายแล้วหรือยัง',   // I
-      'ยอดเงิน'           // J
+      'รหัส',              // A - Order number
+      'วันที่',            // B - Date/time
+      'ลูกค้า',           // C - Customer name
+      'สินค้า',           // D - Product name
+      'จำนวน',            // E - Quantity
+      'หมายเหตุ',         // F - Notes
+      'ผู้ส่ง',           // G - Delivery person (empty = not delivered, name = delivered)
+      'จ่ายแล้วหรือยัง',   // H - Payment status
+      'ยอดเงิน'           // I - Amount
     ],
-    purpose: 'Simple order tracking - one row per item'
+    purpose: 'Simple order tracking - delivery person indicates completion'
   },
   
   { 
@@ -69,6 +69,22 @@ const REQUIRED_SHEETS = [
     purpose: 'Stock adjustments'
   }
 ];
+
+// NEW COLUMN MAPPING
+const COLUMNS = {
+  ORDER: {
+    ORDER_NO: 0,      // A
+    DATE: 1,          // B
+    CUSTOMER: 2,      // C
+    PRODUCT: 3,       // D
+    QUANTITY: 4,      // E
+    NOTES: 5,         // F
+    DELIVERY: 6,      // G - Delivery person name (empty = not delivered)
+    PAYMENT: 7,       // H - Payment status
+    AMOUNT: 8         // I - Amount
+  }
+};
+
 
 // ============================================================================
 // INITIALIZE SHEETS
@@ -189,5 +205,6 @@ module.exports = {
   validateSheetsStructure,
   getRequiredSheets,
   getSheetPurpose,
-  REQUIRED_SHEETS
+  REQUIRED_SHEETS,
+  COLUMNS
 };
