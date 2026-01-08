@@ -1,15 +1,13 @@
-// sheetInitializer.js - FIXED: Correct column order
+// sheetInitializer.js - Simple Structure (10 columns)
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getSheetsList, createSheet, appendSheetData } = require('./googleServices');
 
 // ============================================================================
-// REQUIRED SHEETS - CORRECT STRUCTURE
+// REQUIRED SHEETS - SIMPLE STRUCTURE
 // ============================================================================
 
 const REQUIRED_SHEETS = [
-  // 1. คำสั่งซื้อ (Orders) - FIXED COLUMN ORDER
- const REQUIRED_SHEETS = [
   { 
     name: 'คำสั่งซื้อ', 
     headers: [
@@ -23,59 +21,52 @@ const REQUIRED_SHEETS = [
       'สถานะ',            // H
       'จ่ายแล้วหรือยัง',   // I
       'ยอดเงิน'           // J
-    ]
-  ,
-    purpose: 'ONE TRUTH for order management - matches orderService.js output'
+    ],
+    purpose: 'Simple order tracking - one row per item'
   },
   
-  // 2. สต็อก (Stock)
   { 
     name: 'สต็อก', 
     headers: [
-      'สินค้า',         // Product name
-      'ต้นทุน',         // Cost
-      'ราคาขาย',        // Selling price
-      'หน่วย',          // Unit
-      'จำนวนคงเหลือ',    // Stock quantity
-      'หมวดหมู่',       // Category
-      'SKU'            // SKU code
+      'สินค้า',
+      'ต้นทุน',
+      'ราคาขาย',
+      'หน่วย',
+      'จำนวนคงเหลือ',
+      'หมวดหมู่',
+      'SKU'
     ],
-    purpose: 'ONE TRUTH for inventory'
+    purpose: 'Inventory management'
   },
   
-  // 3. ลูกค้า (Customers)
   {
     name: 'ลูกค้า',
     headers: ['ชื่อลูกค้า', 'เบอร์โทร', 'ที่อยู่', 'หมายเหตุ'],
     purpose: 'Customer database'
   },
   
-  // 4. Dashboard
   { 
     name: 'Dashboard', 
     headers: ['วันที่', 'จำนวนออเดอร์', 'ต้นทุน', 'ยอดขาย', 'กำไร', 'Top5'],
-    purpose: 'Daily aggregated metrics'
+    purpose: 'Daily metrics'
   },
   
-  // 5. เครดิต (Credit)
   {
     name: 'เครดิต',
     headers: ['วันที่', 'ลูกค้า', 'รหัสคำสั่ง', 'ยอดเงิน', 'สถานะ', 'วันครบกำหนด', 'หมายเหตุ'],
-    purpose: 'Credit/debt tracking'
+    purpose: 'Credit tracking'
   },
   
-  // 6. Inbox
   {
     name: 'Inbox',
     headers: ['วันที่/เวลา', 'ข้อความ'],
-    purpose: 'Simple notebook'
+    purpose: 'Message log'
   },
   
-  // 7. VarianceLog
   {
     name: 'VarianceLog',
     headers: ['วันที่', 'สินค้า', 'สต็อกเก่า', 'สต็อกใหม่', 'ส่วนต่าง', 'เหตุผล'],
-    purpose: 'Stock adjustment history'
+    purpose: 'Stock adjustments'
   }
 ];
 
