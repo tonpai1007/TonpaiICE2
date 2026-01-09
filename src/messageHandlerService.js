@@ -1,4 +1,4 @@
-// messageHandlerService.js - Unified handler for both text and voice messages
+// messageHandlerService.js - ENHANCED: Better UX for cancel, inbox, dashboard
 const { Logger } = require('./logger');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction, updateOrderPaymentStatus } = require('./orderService');
@@ -67,7 +67,7 @@ function formatStockWarnings(checkResult) {
 }
 
 // ============================================================================
-// MESSAGE FORMATTERS
+// ENHANCED MESSAGE FORMATTERS
 // ============================================================================
 
 function formatOrderSuccess(orderNo, customer, items, totalAmount, confidence) {
@@ -90,9 +90,9 @@ function formatOrderSuccess(orderNo, customer, items, totalAmount, confidence) {
          `🎯 ความมั่นใจ: ${confidence}\n\n` +
          `━━━━━━━━━━━━━━━━━━━━\n` +
          `⚡ Quick Actions:\n` +
-         `• "จ่าย #${orderNo}" - จ่ายเงิน\n` +
-         `• "ส่ง #${orderNo}" - อัปเดตการจัดส่ง\n` +
-         `• "ยกเลิก #${orderNo}" - ยกเลิกออเดอร์`;
+         `• "จ่าย" - จ่ายออเดอร์นี้\n` +
+         `• "ส่ง พี่แดง" - อัปเดตการจัดส่ง\n` +
+         `• "ยกเลิก" - ยกเลิกออเดอร์นี้`;
 }
 
 function formatPaymentSuccess(orderNo, customer, totalAmount) {
@@ -101,54 +101,39 @@ function formatPaymentSuccess(orderNo, customer, totalAmount) {
          `💰 ${totalAmount.toLocaleString()}฿\n\n` +
          `━━━━━━━━━━━━━━━━━━━━\n` +
          `⚡ Next Actions:\n` +
-         `• "ส่ง #${orderNo}" - อัปเดตการจัดส่ง\n` +
-         `• "รายงานสต็อก" - ดูสต็อกวันนี้`;
+         `• "ส่ง พี่แดง" - อัปเดตการจัดส่ง\n` +
+         `• "สรุป" - ดูยอดขายวันนี้`;
 }
 
 function formatCancelSuccess(orderNo, customer, stockRestored) {
   const restoredList = stockRestored
-    .map(s => `• ${s.item} +${s.restored} (${s.newStock} เหลือ)`)
+    .map(s => `   ${s.item} +${s.restored} → ${s.newStock} ${s.unit || 'ชิ้น'}`)
     .join('\n');
   
   return `✅ ยกเลิกออเดอร์สำเร็จ\n\n` +
-         `📋 #${orderNo} | ${customer}\n\n` +
+         `📋 ออเดอร์ #${orderNo}\n` +
+         `👤 ${customer}\n\n` +
          `📦 คืนสต็อก:\n${restoredList}\n\n` +
          `━━━━━━━━━━━━━━━━━━━━\n` +
-         `💡 สต็อกถูกคืนกลับแล้ว`;
-}
-
-function formatDeliveryStatus(result) {
-  let msg = `${result.icon} อัปเดตสถานะการจัดส่ง\n\n`;
-  msg += `📋 ออเดอร์ #${result.orderNo}\n`;
-  msg += `👤 ${result.customer}\n\n`;
-  msg += `สถานะ: ${result.oldStatus} → ${result.newStatus}\n`;
-  
-  if (result.deliveryPerson) {
-    msg += `🚚 คนส่ง: ${result.deliveryPerson}\n`;
-  }
-  
-  if (result.newStatus === 'ส่งเสร็จแล้ว') {
-    msg += `\n💡 พิมพ์ "จ่าย #${result.orderNo}" เพื่ออัปเดตการชำระเงิน`;
-  }
-  
-  return msg;
+         `✨ สต็อกถูกคืนกลับเรียบร้อยแล้ว`;
 }
 
 function formatError(errorType, details = {}) {
   const errors = {
-    'order_not_found': `❌ ไม่พบออเดอร์ #${details.orderNo}\n\n` +
+    'order_not_found': `❌ ไม่พบออเดอร์${details.orderNo ? ` #${details.orderNo}` : ''}\n\n` +
                        `━━━━━━━━━━━━━━━━━━━━\n` +
                        `💡 แก้ไข:\n` +
                        `• ตรวจสอบเลขออเดอร์\n` +
-                       `• ออเดอร์อาจถูกยกเลิกไปแล้ว`,
+                       `• ออเดอร์อาจถูกยกเลิกไปแล้ว\n` +
+                       `• พิมพ์ "inbox" เพื่อดูประวัติ`,
     
     'parse_failed': `❌ ไม่เข้าใจคำสั่ง\n\n` +
                     `"${details.input}"\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
                     `💡 ตัวอย่างที่ถูกต้อง:\n` +
-                    `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง" (สั่งซื้อ)\n` +
-                    `• "จ่าย #123" (ชำระเงิน)\n` +
-                    `• "เติมน้ำแข็ง 20" (ปรับสต็อก)\n\n` +
+                    `• "น้ำแข็ง 2 ถุง ร้านเจ๊แดง"\n` +
+                    `• "จ่าย" - จ่ายออเดอร์ล่าสุด\n` +
+                    `• "เติมน้ำแข็ง 20"\n\n` +
                     `พิมพ์ "help" เพื่อดูคำสั่งทั้งหมด`
   };
   
@@ -156,16 +141,15 @@ function formatError(errorType, details = {}) {
 }
 
 // ============================================================================
-// DELIVERY STATUS UPDATE (from app.js)
+// GET LAST ORDER NUMBER (HELPER)
 // ============================================================================
 
 const { CONFIG } = require('./config');
 const { getSheetData, updateSheetData } = require('./googleServices');
 
-
 async function getLastOrderNumber() {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:J');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     if (rows.length <= 1) return null;
     
     // Get the most recent order number (last row)
@@ -175,8 +159,9 @@ async function getLastOrderNumber() {
     return null;
   }
 }
+
 // ============================================================================
-// MAIN MESSAGE HANDLER - Handles both text and voice
+// MAIN MESSAGE HANDLER
 // ============================================================================
 
 async function handleMessage(text, userId) {
@@ -189,7 +174,7 @@ async function handleMessage(text, userId) {
     
     const adjCommand = await parseAdjustmentCommand(text);
     if (adjCommand.isAdjustment) {
-      Logger.info(`🔧 Stock adjustment detected: ${adjCommand.operation} ${adjCommand.item} ${adjCommand.value}`);
+      Logger.info(`🔧 Stock adjustment: ${adjCommand.operation} ${adjCommand.item} ${adjCommand.value}`);
       
       const result = await adjustStock(
         adjCommand.item,
@@ -217,7 +202,7 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================
-    // PAYMENT COMMAND
+    // PAYMENT COMMAND - Enhanced with "last order" support
     // ========================================
     
     const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง)?(?:แล้ว|เเล้ว)?)\s*(?:#?(\d+))?/i);
@@ -229,10 +214,10 @@ async function handleMessage(text, userId) {
         if (!orderNo) {
           return { 
             success: false, 
-            message: '❌ ไม่มีออเดอร์ในระบบ\n\nสร้างออเดอร์ก่อนนะ!' 
+            message: '❌ ไม่มีออเดอร์ในระบบ\n\n💡 สร้างออเดอร์ก่อนนะ!' 
           };
         }
-        Logger.info(`💡 No order # specified, using last order: #${orderNo}`);
+        Logger.info(`💡 Using last order: #${orderNo}`);
       }
       
       const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
@@ -241,7 +226,7 @@ async function handleMessage(text, userId) {
         await saveToInbox(userId, text);
         return { 
           success: true, 
-          message: `✅ อัปเดตการชำระเงินสำเร็จ\n\n📋 ออเดอร์ #${orderNo}\n👤 ${result.customer}\n💰 ${result.totalAmount?.toLocaleString() || 0}฿` 
+          message: formatPaymentSuccess(result.orderNo, result.customer, result.totalAmount)
         };
       } else {
         return { success: false, message: formatError('order_not_found', { orderNo }) };
@@ -249,8 +234,7 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================
-    // DELIVERY COMMAND - SIMPLIFIED
-    // Format: "ส่ง #123 พี่แดง" or just "ส่ง พี่แดง" (uses last order)
+    // DELIVERY COMMAND - Enhanced
     // ========================================
     
     const deliveryMatch = text.match(/ส่ง\s*(?:#?(\d+))?\s*(.+)?/i);
@@ -258,18 +242,16 @@ async function handleMessage(text, userId) {
       let orderNo = deliveryMatch[1];
       const deliveryPerson = deliveryMatch[2]?.trim() || null;
       
-      // No delivery person = error
       if (!deliveryPerson) {
         return {
           success: false,
           message: '❌ กรุณาระบุชื่อคนส่ง\n\n' +
                    '💡 ตัวอย่าง:\n' +
-                   '• "ส่ง #123 พี่แดง"\n' +
-                   '• "ส่ง พี่แดง" (ใช้ออเดอร์ล่าสุด)'
+                   `• "ส่ง พี่แดง" - ส่งออเดอร์ล่าสุด\n` +
+                   `• "ส่ง #123 พี่แดง" - ส่งออเดอร์ระบุ`
         };
       }
       
-      // No order number? Use last order
       if (!orderNo) {
         orderNo = await getLastOrderNumber();
         if (!orderNo) {
@@ -278,10 +260,9 @@ async function handleMessage(text, userId) {
             message: '❌ ไม่มีออเดอร์ในระบบ' 
           };
         }
-        Logger.info(`💡 No order # specified, using last order: #${orderNo}`);
+        Logger.info(`💡 Using last order: #${orderNo}`);
       }
       
-      // Update delivery person (marks as delivered)
       const result = await updateDeliveryPerson(orderNo, deliveryPerson);
 
       if (result.success) {
@@ -293,9 +274,8 @@ async function handleMessage(text, userId) {
         msg += `🚚 ส่งโดย: ${deliveryPerson}\n`;
         msg += `💰 จำนวนเงิน: ${result.totalAmount?.toLocaleString() || 0}฿\n\n`;
         
-        // Check payment status
         if (result.paymentStatus !== 'จ่ายแล้ว') {
-          msg += `⚠️ ยังไม่ได้รับเงิน\n💡 พิมพ์ "จ่าย #${orderNo}" เมื่อรับเงินแล้ว`;
+          msg += `⚠️ ยังไม่ได้รับเงิน\n💡 พิมพ์ "จ่าย" เมื่อรับเงินแล้ว`;
         } else {
           msg += `✅ รับเงินแล้ว`;
         }
@@ -307,18 +287,34 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================
-    // CANCEL COMMAND
+    // CANCEL COMMAND - ENHANCED: Support "ยกเลิก" without number
     // ========================================
     
-    const cancelMatch = text.match(/ยกเลิก\s*#?(\d+)/i);
+    const cancelMatch = text.match(/ยกเลิก\s*(?:#?(\d+))?/i);
     if (cancelMatch) {
-      const orderNo = cancelMatch[1];
+      let orderNo = cancelMatch[1];
+      
+      // If no order number specified, use last order
+      if (!orderNo) {
+        orderNo = await getLastOrderNumber();
+        if (!orderNo) {
+          return { 
+            success: false, 
+            message: '❌ ไม่มีออเดอร์ในระบบ\n\n💡 สร้างออเดอร์ก่อนนะ!' 
+          };
+        }
+        Logger.info(`💡 Cancelling last order: #${orderNo}`);
+      }
+      
       const result = await cancelOrder(orderNo);
 
       if (result.success) {
         await saveToInbox(userId, text);
         monitor.recordCancellation(orderNo, true);
-        return { success: true, message: formatCancelSuccess(orderNo, result.customer, result.stockRestored) };
+        return { 
+          success: true, 
+          message: formatCancelSuccess(orderNo, result.customer, result.stockRestored) 
+        };
       } else {
         return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
@@ -334,7 +330,7 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================
-    // SYSTEM COMMANDS
+    // ENHANCED SYSTEM COMMANDS
     // ========================================
     
     if (lower === 'สรุป' || lower.includes('สรุปวันนี้') || lower === 'summary') {
@@ -342,18 +338,19 @@ async function handleMessage(text, userId) {
       return { success: true, message: summary };
     }
 
-    if (lower === 'inbox' || lower.includes('ดูinbox')) {
-      const inboxSummary = await generateInboxSummary(15);
+    if (lower === 'inbox' || lower.includes('ดูinbox') || lower.includes('ประวัติ')) {
+      const inboxSummary = await generateInboxSummary(20); // Show more items
       return { success: true, message: inboxSummary };
     }
 
-    if (lower === 'help' || lower === 'ช่วยเหลือ') {
+    if (lower === 'help' || lower === 'ช่วยเหลือ' || lower === '?') {
       return { 
         success: true, 
         message: `🤖 คำสั่งที่ใช้ได้\n` +
-                `${'='.repeat(30)}\n\n` +
+                `${'='.repeat(35)}\n\n` +
                 `📦 รับออเดอร์:\n` +
-                `• "น้ำแข็ง 5 ถุง ร้านเจ๊แดง"\n\n` +
+                `• "น้ำแข็ง 5 ถุง ร้านเจ๊แดง"\n` +
+                `• "ลูกค้า: พี่ไก่, น้ำแข็ง 3"\n\n` +
                 `💰 การเงิน:\n` +
                 `• "จ่าย" - จ่ายออเดอร์ล่าสุด\n` +
                 `• "จ่าย #123" - จ่ายออเดอร์ระบุ\n\n` +
@@ -361,13 +358,21 @@ async function handleMessage(text, userId) {
                 `• "ส่ง พี่แดง" - ส่งออเดอร์ล่าสุด\n` +
                 `• "ส่ง #123 พี่แดง" - ส่งออเดอร์ระบุ\n` +
                 `• "สถานะ" - ดูสถานะการส่ง\n\n` +
+                `❌ ยกเลิกออเดอร์:\n` +
+                `• "ยกเลิก" - ยกเลิกออเดอร์ล่าสุด\n` +
+                `• "ยกเลิก #123" - ยกเลิกออเดอร์ระบุ\n\n` +
                 `🔧 จัดการสต็อก:\n` +
                 `• "น้ำแข็ง มี 50" - ตั้งค่าสต็อก\n` +
                 `• "เติมน้ำแข็ง 20" - เพิ่มสต็อก\n` +
                 `• "ลดน้ำแข็ง 10" - ลดสต็อก\n` +
                 `• "สต็อก" - ดูสต็อกทั้งหมด\n\n` +
                 `📊 รายงาน:\n` +
-                `• "สรุป" - สรุปยอดขายวันนี้`
+                `• "สรุป" - สรุปยอดขายวันนี้\n` +
+                `• "inbox" - ดูประวัติคำสั่ง\n` +
+                `• "รายงานสต็อก" - ดูการปรับสต็อก\n\n` +
+                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                `💡 TIP: คำสั่งส่วนใหญ่ทำงานกับ\n` +
+                `    ออเดอร์ล่าสุดถ้าไม่ระบุเลข!`
       };
     }
 
@@ -385,7 +390,7 @@ async function handleMessage(text, userId) {
     if (lower === 'รีเฟรช' || lower === 'refresh') {
       await loadStockCache(true);
       await loadCustomerCache(true);
-      return { success: true, message: '✅ รีเฟรชข้อมูลสำเร็จ' };
+      return { success: true, message: '✅ รีเฟรชข้อมูลสำเร็จ\n\n💡 ข้อมูลสต็อกและลูกค้าอัปเดตแล้ว' };
     }
 
     // ========================================
@@ -434,18 +439,19 @@ async function handleMessage(text, userId) {
   } catch (error) {
     Logger.error('handleMessage error', error);
     await saveToInbox(userId, text, 'error');
-    return { success: false, message: '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง' };
+    return { 
+      success: false, 
+      message: '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง\n\n' +
+               `💡 ถ้าปัญหายังคงอยู่ พิมพ์ "help" เพื่อดูคำสั่งที่ถูกต้อง`
+    };
   }
 }
 
 // ============================================================================
-// NEW: UPDATE DELIVERY PERSON (SIMPLIFIED)
+// UPDATE DELIVERY PERSON
 // ============================================================================
 
 async function updateDeliveryPerson(orderNo, deliveryPerson) {
-  const { CONFIG } = require('./config');
-  const { getSheetData, updateSheetData } = require('./googleServices');
-  
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     const orderRows = [];
@@ -453,13 +459,12 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
     let totalAmount = 0;
     let paymentStatus = '';
     
-    // Find all rows with this order number
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] == orderNo) {
         orderRows.push({ index: i + 1, data: rows[i] });
-        customer = rows[i][2];          // C - Customer
-        totalAmount += parseFloat(rows[i][8] || 0); // I - Amount
-        paymentStatus = rows[i][7];     // H - Payment status
+        customer = rows[i][2];
+        totalAmount += parseFloat(rows[i][8] || 0);
+        paymentStatus = rows[i][7];
       }
     }
 
@@ -467,7 +472,6 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
       return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
     }
 
-    // Update delivery person for all rows (Column G)
     for (const orderRow of orderRows) {
       await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!G${orderRow.index}`, [[deliveryPerson]]);
     }
@@ -489,13 +493,10 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
 }
 
 // ============================================================================
-// NEW: VIEW DELIVERY STATUS
+// VIEW DELIVERY STATUS
 // ============================================================================
 
 async function viewDeliveryStatus() {
-  const { CONFIG } = require('./config');
-  const { getSheetData } = require('./googleServices');
-  
   try {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     
@@ -503,14 +504,13 @@ async function viewDeliveryStatus() {
       return '📦 ไม่มีออเดอร์ในระบบ';
     }
 
-    // Group by order number
     const orders = new Map();
     
     for (let i = 1; i < rows.length; i++) {
       const orderNo = rows[i][0];
       const customer = rows[i][2];
-      const deliveryPerson = rows[i][6] || ''; // G - Delivery person
-      const paymentStatus = rows[i][7];        // H - Payment status
+      const deliveryPerson = rows[i][6] || '';
+      const paymentStatus = rows[i][7];
       const amount = parseFloat(rows[i][8] || 0);
       
       if (!orders.has(orderNo)) {
@@ -529,7 +529,6 @@ async function viewDeliveryStatus() {
       order.itemCount++;
     }
 
-    // Separate delivered and pending
     const delivered = [];
     const pending = [];
     
@@ -543,32 +542,31 @@ async function viewDeliveryStatus() {
 
     let msg = `📦 สถานะการจัดส่ง\n${'='.repeat(40)}\n\n`;
     
-    // Pending deliveries
     if (pending.length > 0) {
       msg += `⏳ รอจัดส่ง (${pending.length} ออเดอร์):\n\n`;
       pending.slice(0, 10).forEach(order => {
         const payIcon = order.paymentStatus === 'จ่ายแล้ว' ? '💰' : '⏳';
-        msg += `${payIcon} #${order.orderNo} | ${order.customer}\n`;
-        msg += `   ${order.totalAmount.toLocaleString()}฿ | ${order.itemCount} รายการ\n\n`;
+        msg += `${payIcon} #${order.orderNo} │ ${order.customer}\n`;
+        msg += `   ${order.totalAmount.toLocaleString()}฿ │ ${order.itemCount} รายการ\n\n`;
       });
       
       if (pending.length > 10) {
-        msg += `... และอีก ${pending.length - 10} ออเดอร์\n\n`;
+        msg += `   ... และอีก ${pending.length - 10} ออเดอร์\n\n`;
       }
     }
 
-    // Recently delivered
     if (delivered.length > 0) {
-      msg += `✅ ส่งแล้ว (${delivered.length} ออเดอร์):\n\n`;
+      msg += `✅ ส่งแล้ว (${delivered.length} ออเดอร์ล่าสุด):\n\n`;
       delivered.slice(-5).reverse().forEach(order => {
         const payIcon = order.paymentStatus === 'จ่ายแล้ว' ? '💰' : '⏳';
-        msg += `${payIcon} #${order.orderNo} | ${order.customer}\n`;
-        msg += `   🚚 ${order.deliveryPerson} | ${order.totalAmount.toLocaleString()}฿\n\n`;
+        msg += `${payIcon} #${order.orderNo} │ ${order.customer}\n`;
+        msg += `   🚚 ${order.deliveryPerson} │ ${order.totalAmount.toLocaleString()}฿\n\n`;
       });
     }
 
-    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `📊 สรุป: ${pending.length} รอส่ง | ${delivered.length} ส่งแล้ว`;
+    msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `📊 สรุป: ${pending.length} รอส่ง │ ${delivered.length} ส่งแล้ว\n\n`;
+    msg += `💡 พิมพ์ "ส่ง พี่แดง" เพื่ออัปเดตออเดอร์ล่าสุด`;
 
     return msg;
 
@@ -577,7 +575,6 @@ async function viewDeliveryStatus() {
     return `❌ ไม่สามารถดูสถานะได้: ${error.message}`;
   }
 }
-
 
 // ============================================================================
 // ORDER PROCESSING HELPERS
@@ -601,26 +598,33 @@ async function createOrderDirectly(customer, items, confidence, successMessage, 
   });
 
   if (result.success) {
-    let msg = `✅ บันทึกออเดอร์สำเร็จ!\n\n`;
+    await saveToInbox(userId, `Order #${result.orderNo}: ${customer}`, 'order_success');
+    
+    const msg = formatOrderSuccess(
+      result.orderNo,
+      result.customer,
+      result.items,
+      result.totalAmount,
+      confidence
+    );
+    
+    let finalMsg = msg;
     if (successMessage) {
-      msg += `🎯 ${successMessage}\n\n`;
+      finalMsg = `🎯 ${successMessage}\n\n` + msg;
     }
-    msg += `📋 คำสั่งซื้อ #${result.orderNo}\n`;
-    msg += `👤 ${result.customer}\n`;
-    msg += `💰 รวม: ${result.totalAmount.toLocaleString()}฿\n\n`;
-    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `⚡ Quick Actions:\n`;
-    msg += `• "จ่าย #${result.orderNo}" - จ่ายเงิน\n`;
-    msg += `• "ส่ง #${result.orderNo}" - อัปเดตการจัดส่ง`;
-
+    
     if (stockCheck.hasWarnings) {
-      msg += `\n\n⚠️ แจ้งเตือนสต็อก:\n${stockCheck.warnings.map(w => w.message).join('\n')}`;
+      const warnings = stockCheck.warnings.map(w => w.message).join('\n');
+      finalMsg += '\n\n━━━━━━━━━━━━━━━━━━━━\n⚠️ แจ้งเตือนสต็อก:\n' + warnings;
     }
 
     Logger.success(`✅ Direct order created: #${result.orderNo}`);
-    return { success: true, message: msg };
+    return { success: true, message: finalMsg };
   } else {
-    return { success: false, message: `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}` };
+    return { 
+      success: false, 
+      message: `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}\n\n💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
+    };
   }
 }
 
@@ -664,7 +668,7 @@ async function processWithAutomationRules(parsed, userId) {
       let finalMsg = msg;
       if (stockCheck.hasWarnings) {
         const warnings = stockCheck.warnings.map(w => w.message).join('\n');
-        finalMsg += '\n\n━━━━━━━━━━━━━━━━━━━━\n' + warnings;
+        finalMsg += '\n\n━━━━━━━━━━━━━━━━━━━━\n⚠️ แจ้งเตือนสต็อก:\n' + warnings;
       }
       
       monitor.recordDecision(decision, result.orderNo);
