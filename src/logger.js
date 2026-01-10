@@ -1,32 +1,29 @@
 // logger.js - Centralized logging and performance monitoring
 
-class Logger {
-  static info(message, ...args) {
-    console.log(`ℹ️ [INFO] ${new Date().toISOString()} - ${message}`, ...args);
-  }
-  
-  static success(message, ...args) {
-    console.log(`✅ [SUCCESS] ${new Date().toISOString()} - ${message}`, ...args);
-  }
-  
-  static warn(message, ...args) {
-    console.warn(`⚠️ [WARN] ${new Date().toISOString()} - ${message}`, ...args);
-  }
-  
-  static error(message, error) {
-    console.error(`❌ [ERROR] ${new Date().toISOString()} - ${message}`, error?.message || error);
-    if (error?.stack) {
-      console.error('Stack trace:', error.stack);
-    }
-  }
-  
-  static debug(message, data) {
-    if (process.env.DEBUG === 'true') {
-      console.log(`🔍 [DEBUG] ${new Date().toISOString()} - ${message}`, data);
-    }
-  }
-}
+const winston = require('winston');
 
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'line-order-bot' },
+  transports: [
+    new winston.transports.File({ 
+      filename: 'error.log', 
+      level: 'error',
+      maxsize: 5242880, // 5MB
+      maxFiles: 5
+    }),
+    new winston.transports.File({ 
+      filename: 'combined.log',
+      maxsize: 5242880,
+      maxFiles: 5
+    })
+  ]
+});
 class PerformanceMonitor {
   constructor() {
     this.timers = new Map();
