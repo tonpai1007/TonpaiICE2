@@ -1,9 +1,10 @@
-// stockAdjustment.js - FIXED: Safe mutex implementation with timeout
+// stockAdjustment.js - FIXED: AI-powered voice correction (no regex!)
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
 const { getSheetData, updateSheetData, appendSheetData } = require('./googleServices');
 const { getStockCache, loadStockCache } = require('./cacheManager');
+const { correctVoiceInput } = require('./aiVoiceCorrector');
 
 // ============================================================================
 // SAFE MUTEX LOCK - WITH TIMEOUT & AUTO-RELEASE
@@ -65,40 +66,46 @@ class SafeMutex {
 const adjustmentMutex = new SafeMutex('StockAdjustment', 10000);
 
 // ============================================================================
-// PARSE ADJUSTMENT COMMAND
+// PARSE ADJUSTMENT COMMAND - AI-POWERED (NO REGEX!)
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
-  const patterns = [
-    { regex: /(?:เติม|เพิ่ม)\s*(.+?)\s*(\d+)/i, operation: 'add' },
-    { regex: /(?:ลด|ตัด|หัก)\s*(.+?)\s*(\d+)/i, operation: 'subtract' },
-    { regex: /ปรับ\s*(.+?)\s*เหลือ\s*(\d+)/i, operation: 'set' },
-    { regex: /(.+?)\s*เหลือ\s*(\d+)/i, operation: 'set' },
-    { regex: /(.+?)\s*มี\s*(\d+)/i, operation: 'set' },
-    { regex: /ปรับ(?:สต็อก)?\s*(.+?)\s*(\d+)/i, operation: 'set' }
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern.regex);
-    if (match) {
-      let itemName = match[1].trim();
-      
-      // Auto-complete common shortcuts
-      if (itemName === 'แข็ง' || itemName === 'เเข็ง') {
-        itemName = 'น้ำแข็ง';
-      }
-      
-      return {
-        isAdjustment: true,
-        item: itemName,
-        value: parseInt(match[2]),
-        operation: pattern.operation,
-        originalText: text
-      };
-    }
+  const stockCache = getStockCache();
+  
+  // Check if it looks like a stock command
+  const stockKeywords = ['มี', 'เหลือ', 'เติม', 'ลด', 'ปรับ', 'แข็ง', 'น้ำ'];
+  const hasStockKeyword = stockKeywords.some(kw => text.includes(kw));
+  
+  if (!hasStockKeyword) {
+    return { isAdjustment: false };
   }
-
-  return { isAdjustment: false };
+  
+  // Use AI to parse the command
+  Logger.info(`🤖 Using AI to parse: "${text}"`);
+  const aiResult = await correctVoiceInput(text, stockCache);
+  
+  if (aiResult.success && aiResult.matched) {
+    Logger.success(`✅ AI parsed: ${aiResult.item} ${aiResult.operation} ${aiResult.quantity}`);
+    
+    return {
+      isAdjustment: true,
+      item: aiResult.item,
+      value: aiResult.quantity,
+      operation: aiResult.operation,
+      originalText: text,
+      confidence: aiResult.confidence,
+      reasoning: aiResult.reasoning,
+      aiParsed: true
+    };
+  }
+  
+  // AI couldn't parse
+  Logger.warn(`⚠️ AI couldn't parse: "${text}"`);
+  return { 
+    isAdjustment: false,
+    aiAttempted: true,
+    suggestions: aiResult.suggestions || []
+  };
 }
 
 // ============================================================================
@@ -188,32 +195,38 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
         return { success: false, error: '❌ จำนวนสูงเกินไป (max: 100,000)' };
       }
 
-      // Find item
+      // Find item (AI already matched it, but double-check)
       const stockCache = getStockCache();
       const matchResult = findBestStockMatch(itemName, stockCache);
       
       if (!matchResult.item) {
-        if (matchResult.ambiguous) {
-          const suggestions = matchResult.suggestions
+        // Generate smart suggestions
+        const suggestions = stockCache
+          .filter(i => {
+            const itemLower = i.item.toLowerCase();
+            const searchLower = itemName.toLowerCase();
+            // Find items with similar characters
+            let matchCount = 0;
+            for (let char of searchLower) {
+              if (itemLower.includes(char)) matchCount++;
+            }
+            return matchCount >= Math.min(3, searchLower.length / 2);
+          })
+          .slice(0, 5);
+        
+        if (matchResult.ambiguous || suggestions.length > 0) {
+          const suggestionList = (matchResult.suggestions || suggestions)
             .map(i => `• ${i.item} (${i.stock} ${i.unit})`)
             .join('\n');
           
           return { 
             success: false, 
-            error: `❓ พบหลายรายการ "${itemName}":\n\n${suggestions}\n\n💡 กรุณาระบุชื่อให้ชัดเจนขึ้น`
+            error: `❓ ไม่แน่ใจว่าคุณหมายถึงอะไร:\n\n${suggestionList}\n\n💡 ลองพูดให้ชัดเจนขึ้น หรือพิมพ์ข้อความมา`
           };
         } else {
-          const suggestions = stockCache
-            .filter(i => i.item.toLowerCase().includes(itemName.substring(0, 3)))
-            .slice(0, 5)
-            .map(i => i.item)
-            .join(', ');
-          
           return { 
             success: false, 
-            error: `❌ ไม่พบสินค้า: "${itemName}"\n\n` +
-                   (suggestions ? `💡 สินค้าที่คล้ายกัน: ${suggestions}\n\n` : '') +
-                   `พิมพ์ "สต็อก" เพื่อดูรายการทั้งหมด`
+            error: `❌ ไม่พบสินค้า: "${itemName}"\n\n💡 ลองพูดว่า "สต็อก" เพื่อฟังรายการทั้งหมด`
           };
         }
       }
