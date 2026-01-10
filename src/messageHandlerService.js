@@ -194,9 +194,17 @@ async function handleMessage(text, userId) {
         msg += `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n`;
         msg += `💡 ${result.operationText}`;
         
-        await saveToInbox(userId, text);
+        // Save to inbox with clear tracking
+        await saveToInbox(
+          userId, 
+          text, 
+          `ปรับสต็อก: ${result.item} ${result.oldStock}→${result.newStock} ${result.unit}`,
+          'stock'
+        );
+        
         return { success: true, message: msg };
       } else {
+        await saveToInbox(userId, text, result.error, 'stock_error');
         return { success: false, message: result.error };
       }
     }
@@ -223,12 +231,18 @@ async function handleMessage(text, userId) {
       const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
 
       if (result.success) {
-        await saveToInbox(userId, text);
+        await saveToInbox(
+          userId, 
+          text, 
+          `ชำระเงิน #${orderNo} - ${result.customer} - ${result.totalAmount?.toLocaleString()}฿`,
+          'payment'
+        );
         return { 
           success: true, 
           message: formatPaymentSuccess(result.orderNo, result.customer, result.totalAmount)
         };
       } else {
+        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'payment_error');
         return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
     }
@@ -266,7 +280,12 @@ async function handleMessage(text, userId) {
       const result = await updateDeliveryPerson(orderNo, deliveryPerson);
 
       if (result.success) {
-        await saveToInbox(userId, text);
+        await saveToInbox(
+          userId, 
+          text, 
+          `จัดส่ง #${orderNo} โดย ${deliveryPerson} - ${result.customer}`,
+          'delivery'
+        );
         
         let msg = `✅ บันทึกการจัดส่งสำเร็จ\n\n`;
         msg += `📋 ออเดอร์ #${orderNo}\n`;
@@ -282,6 +301,7 @@ async function handleMessage(text, userId) {
         
         return { success: true, message: msg };
       } else {
+        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'delivery_error');
         return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
     }
@@ -309,13 +329,19 @@ async function handleMessage(text, userId) {
       const result = await cancelOrder(orderNo);
 
       if (result.success) {
-        await saveToInbox(userId, text);
+        await saveToInbox(
+          userId, 
+          text, 
+          `ยกเลิกออเดอร์ #${orderNo} - ${result.customer} - คืนสต็อก ${result.stockRestored.length} รายการ`,
+          'cancel'
+        );
         monitor.recordCancellation(orderNo, true);
         return { 
           success: true, 
           message: formatCancelSuccess(orderNo, result.customer, result.stockRestored) 
         };
       } else {
+        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'cancel_error');
         return { success: false, message: formatError('order_not_found', { orderNo }) };
       }
     }
@@ -397,16 +423,16 @@ async function handleMessage(text, userId) {
     // ORDER PROCESSING (Last resort)
     // ========================================
     
-    await saveToInbox(userId, text, 'order_attempt');
-    await smartLearner.loadOrderHistory();
-    
     const parsed = await parseOrder(text);
     
     if (!parsed.success || !parsed.items || parsed.items.length === 0) {
+      await saveToInbox(userId, text, 'ไม่เข้าใจคำสั่ง', 'parse_failed');
       return await handleUnparseableOrder(text, parsed, userId);
     }
 
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
+      await smartLearner.loadOrderHistory();
+      
       const exactMatch = smartLearner.findExactOrderMatch(parsed.customer, parsed.items);
       
       if (exactMatch) {
@@ -416,7 +442,8 @@ async function handleMessage(text, userId) {
           parsed.items,
           'high',
           exactMatch.message,
-          userId
+          userId,
+          text
         );
       }
 
@@ -429,12 +456,13 @@ async function handleMessage(text, userId) {
           parsed.items,
           'high',
           prediction.message,
-          userId
+          userId,
+          text
         );
       }
     }
 
-    return await processWithAutomationRules(parsed, userId);
+    return await processWithAutomationRules(parsed, userId, text);
 
   } catch (error) {
     Logger.error('handleMessage error', error);
@@ -633,7 +661,7 @@ async function processWithAutomationRules(parsed, userId) {
   const stockCheck = checkStockWarnings(corrected.items);
   
   if (stockCheck.hasCritical) {
-    await saveToInbox(userId, parsed.rawInput || '', 'insufficient_stock');
+    await saveToInbox(userId, parsed.rawInput || '', 'สต็อกไม่พอ', 'order_failed');
     return { success: false, message: formatStockWarnings(stockCheck) };
   }
 
@@ -655,7 +683,13 @@ async function processWithAutomationRules(parsed, userId) {
     });
 
     if (result.success) {
-      await saveToInbox(userId, parsed.rawInput || '', 'order_auto_success');
+      const itemsSummary = corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ');
+      await saveToInbox(
+        userId, 
+        parsed.rawInput || '', 
+        `สร้างออเดอร์ #${result.orderNo} - ${corrected.customer} - ${itemsSummary} - ${result.totalAmount.toLocaleString()}฿`,
+        'order'
+      );
       
       const msg = formatOrderSuccess(
         result.orderNo,
@@ -676,7 +710,7 @@ async function processWithAutomationRules(parsed, userId) {
       
       return { success: true, message: finalMsg };
     } else {
-      await saveToInbox(userId, parsed.rawInput || '', 'order_auto_failed');
+      await saveToInbox(userId, parsed.rawInput || '', result.error, 'order_failed');
       return { 
         success: false, 
         message: `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}\n\n💡 พิมพ์ "สต็อก" เพื่อดูสต็อกปัจจุบัน`
@@ -685,7 +719,12 @@ async function processWithAutomationRules(parsed, userId) {
   } else {
     // Manual review needed
     const guess = corrected.items.map(i => `${i.stockItem.item} x${i.quantity}`).join(', ');
-    await saveToInbox(userId, parsed.rawInput || '', 'pending_review');
+    await saveToInbox(
+      userId, 
+      parsed.rawInput || '', 
+      `รอตรวจสอบ: ${corrected.customer} - ${guess} - ${orderValue.toLocaleString()}฿`,
+      'pending'
+    );
     
     monitor.recordDecision(decision, 'pending');
     
@@ -709,6 +748,13 @@ async function handleUnparseableOrder(text, parsed, userId) {
         .map(s => `${s.name} (มักสั่ง ${s.avgQuantity})`)
         .join('\n• ');
 
+      await saveToInbox(
+        userId, 
+        text, 
+        `รู้จักลูกค้า: ${prediction.customer} แต่ไม่ระบุสินค้า`,
+        'need_items'
+      );
+
       return { 
         success: true, 
         message: `💡 รู้จัก "${prediction.customer}"!\n\n` +
@@ -722,7 +768,7 @@ async function handleUnparseableOrder(text, parsed, userId) {
   }
 
   // Complete failure
-  await saveToInbox(userId, text, 'unknown_command');
+  await saveToInbox(userId, text, 'ไม่เข้าใจคำสั่ง', 'unknown');
   Logger.warn(`📥 Unparseable: "${text}"`);
   
   return { 
