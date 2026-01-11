@@ -14,6 +14,7 @@ const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { smartLearner } = require('./smartOrderLearning');
 const { handleMessage } = require('./messageHandlerService');
+const { handleVoiceMessage, generateVoiceFeedback } = require('./betterVoiceHandler');
 const { verifyLineSignature } = require('./middleware/webhook-security');
 
 const app = express();
@@ -207,32 +208,63 @@ async function handleTextMessage(text, replyToken, userId) {
   }
 }
 
-async function handleVoiceMessage(messageId, replyToken, userId) {
+async function handleVoiceMessageEvent(messageId, replyToken, userId) {
   try {
     Logger.info(`🎤 Voice from ${userId.substring(0, 8)}`);
     
     // Fetch audio
     const audioBuffer = await fetchAudioFromLine(messageId);
     
-    // Transcribe
-    const { success, text } = await transcribeAudio(audioBuffer);
+    // Process with enhanced voice handler
+    const voiceResult = await handleVoiceMessage(audioBuffer, userId);
     
-    if (!success || !text) {
-      await replyToLine(replyToken, '❌ ฟังไม่ออก กรุณาลองใหม่หรือพิมพ์ข้อความมา');
+    if (!voiceResult.success) {
+      await replyToLine(replyToken, voiceResult.message);
       return;
     }
 
-    Logger.info(`🎤 → 📝 Transcribed: "${text}"`);
+    // Log what we heard and what we understood
+    Logger.info(`🎤 Original: "${voiceResult.originalVoice}"`);
+    Logger.info(`✅ Corrected: "${voiceResult.correctedText}"`);
     
-    // Process transcribed text
-    const result = await handleMessage(text, userId);
+    // Save to inbox
+    const { saveToInbox } = require('./inboxService');
+    await saveToInbox(
+      userId,
+      `🎤 ${voiceResult.originalVoice}`,
+      `แก้เป็น: ${voiceResult.correctedText}`,
+      'voice'
+    );
     
-    await replyToLine(replyToken, result.message);
+    // Generate feedback message
+    const feedback = generateVoiceFeedback(
+      { text: voiceResult.originalVoice },
+      { corrected: voiceResult.correctedText }
+    );
+    
+    // Process the corrected text
+    const result = await handleMessage(voiceResult.correctedText, userId);
+    
+    // Combine feedback with result
+    let finalMessage = result.message;
+    
+    if (feedback && feedback.needsFeedback) {
+      finalMessage = `${feedback.message}\n\n━━━━━━━━━━━━━━━━━━━━\n\n${result.message}`;
+    }
+    
+    await replyToLine(replyToken, finalMessage);
     
   } catch (error) {
     Logger.error('Voice handler error', error);
     
-    await replyToLine(replyToken, '❌ ไม่สามารถประมวลผลเสียงได้\nกรุณาลองใหม่หรือพิมพ์ข้อความมา').catch(() => {
+    await replyToLine(replyToken, 
+      '❌ ไม่สามารถประมวลผลเสียงได้\n\n' +
+      '💡 วิธีแก้:\n' +
+      '• ลองพูดใหม่อีกครั้ง\n' +
+      '• พูดช้าๆ ชัดๆ\n' +
+      '• อยู่ในที่เงียบ\n' +
+      '• หรือพิมพ์ข้อความมาแทน'
+    ).catch(() => {
       Logger.error('Failed to send error message');
     });
   }
@@ -293,7 +325,7 @@ async function processEvent(event) {
     const replyToken = event.replyToken;
 
     if (event.message.type === 'audio') {
-      await handleVoiceMessage(event.message.id, replyToken, userId);
+      await handleVoiceMessageEvent(event.message.id, replyToken, userId);
       return { processed: true, type: 'audio' };
     } else if (event.message.type === 'text') {
       await handleTextMessage(event.message.text, replyToken, userId);
