@@ -14,7 +14,7 @@ const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { smartLearner } = require('./smartOrderLearning');
 const { handleMessage } = require('./messageHandlerService');
-const { handleVoiceMessage, generateVoiceFeedback } = require('./betterVoiceHandler');
+const { correctVoiceInput } = require('./aiVoiceCorrector');
 const { verifyLineSignature } = require('./middleware/webhook-security');
 
 const app = express();
@@ -212,45 +212,56 @@ async function handleVoiceMessageEvent(messageId, replyToken, userId) {
   try {
     Logger.info(`🎤 Voice from ${userId.substring(0, 8)}`);
     
-    // Fetch audio
+    // Fetch and transcribe audio
     const audioBuffer = await fetchAudioFromLine(messageId);
+    const { success, text } = await transcribeAudio(audioBuffer);
     
-    // Process with enhanced voice handler
-    const voiceResult = await handleVoiceMessage(audioBuffer, userId);
-    
-    if (!voiceResult.success) {
-      await replyToLine(replyToken, voiceResult.message);
+    if (!success || !text) {
+      await replyToLine(replyToken, 
+        '❌ ฟังไม่ออก\n\n' +
+        '💡 Tips:\n' +
+        '• พูดช้าๆ ชัดๆ\n' +
+        '• อยู่ในที่เงียบ\n' +
+        '• ถือไมค์ใกล้ปาก\n' +
+        '• หรือพิมพ์ข้อความมาแทน'
+      );
       return;
     }
 
-    // Log what we heard and what we understood
-    Logger.info(`🎤 Original: "${voiceResult.originalVoice}"`);
-    Logger.info(`✅ Corrected: "${voiceResult.correctedText}"`);
+    Logger.info(`📝 Raw transcription: "${text}"`);
+    
+    // Use AI to correct and improve transcription
+    const { getStockCache } = require('./cacheManager');
+    const stockCache = getStockCache();
+    const aiCorrection = await correctVoiceInput(text, stockCache);
+    
+    let finalText = text;
+    let feedbackMessage = '';
+    
+    if (aiCorrection.success && aiCorrection.correctedText) {
+      finalText = aiCorrection.correctedText;
+      
+      // Generate feedback if text was corrected
+      if (text !== finalText) {
+        Logger.success(`✅ AI corrected: "${text}" → "${finalText}"`);
+        feedbackMessage = `💡 ระบบเข้าใจว่า: "${finalText}"\n(จาก: "${text}")\n\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+      }
+    }
     
     // Save to inbox
     const { saveToInbox } = require('./inboxService');
     await saveToInbox(
       userId,
-      `🎤 ${voiceResult.originalVoice}`,
-      `แก้เป็น: ${voiceResult.correctedText}`,
+      `🎤 ${text}`,
+      aiCorrection.success ? `แก้เป็น: ${finalText}` : 'ไม่สามารถแก้ไขได้',
       'voice'
     );
     
-    // Generate feedback message
-    const feedback = generateVoiceFeedback(
-      { text: voiceResult.originalVoice },
-      { corrected: voiceResult.correctedText }
-    );
-    
     // Process the corrected text
-    const result = await handleMessage(voiceResult.correctedText, userId);
+    const result = await handleMessage(finalText, userId);
     
     // Combine feedback with result
-    let finalMessage = result.message;
-    
-    if (feedback && feedback.needsFeedback) {
-      finalMessage = `${feedback.message}\n\n━━━━━━━━━━━━━━━━━━━━\n\n${result.message}`;
-    }
+    const finalMessage = feedbackMessage + result.message;
     
     await replyToLine(replyToken, finalMessage);
     
@@ -443,4 +454,4 @@ const server = app.listen(PORT, async () => {
 });
 
 // Export for testing and admin notifications
-module.exports = { app, pushToAdmin, server };
+module.exports = { app, pushToAdmin, server };;
