@@ -1,20 +1,19 @@
-// app.js - FIXED: Production-ready with proper error handling
+// app.js - UPDATED: Clean voice integration
 const express = require('express');
 const axios = require('axios');
 
 const { configManager, validateConfig } = require('./config');
 const { Logger } = require('./logger');
 
-// Validate config before proceeding
 validateConfig();
 
 const { initializeGoogleServices } = require('./googleServices');
-const { initializeAIServices, transcribeAudio } = require('./aiServices');
+const { initializeAIServices } = require('./aiServices');
 const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { smartLearner } = require('./smartOrderLearning');
 const { handleMessage } = require('./messageHandlerService');
-const { correctVoiceInput } = require('./aiVoiceCorrector');
+const { handleVoiceMessage } = require('./voiceHandler'); // NEW MODULE
 const { verifyLineSignature } = require('./middleware/webhook-security');
 
 const app = express();
@@ -29,19 +28,16 @@ process.on('unhandledRejection', (reason, promise) => {
     reason: reason?.message || reason,
     stack: reason?.stack
   });
-  // Don't exit - log and continue
 });
 
 process.on('uncaughtException', (error) => {
   Logger.error('🔴 Uncaught Exception - CRITICAL', error);
-  // Give time to log, then exit
   setTimeout(() => {
     Logger.error('Exiting due to uncaught exception');
     process.exit(1);
   }, 1000);
 });
 
-// Graceful shutdown
 let isShuttingDown = false;
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -53,13 +49,11 @@ async function gracefulShutdown(signal) {
   
   Logger.warn(`🛑 ${signal} received. Starting graceful shutdown...`);
   
-  // Stop accepting new requests
   server.close(() => {
     Logger.info('✅ HTTP server closed');
     process.exit(0);
   });
   
-  // Force shutdown after 10 seconds
   setTimeout(() => {
     Logger.error('⚠️ Forced shutdown after timeout');
     process.exit(1);
@@ -93,7 +87,7 @@ async function initializeApp() {
 }
 
 // ============================================================================
-// LINE API HELPERS - WITH RETRY LOGIC
+// LINE API HELPERS
 // ============================================================================
 
 async function replyToLine(replyToken, text, retries = 3) {
@@ -109,7 +103,7 @@ async function replyToLine(replyToken, text, retries = 3) {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        timeout: 10000 // 10 second timeout
+        timeout: 10000
       });
       
       return { success: true };
@@ -120,7 +114,6 @@ async function replyToLine(replyToken, text, retries = 3) {
         return { success: false, error: error.message };
       }
       
-      // Exponential backoff: 1s, 2s, 4s
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
     }
   }
@@ -171,7 +164,7 @@ async function fetchAudioFromLine(messageId) {
       {
         headers: { 'Authorization': `Bearer ${token}` },
         responseType: 'arraybuffer',
-        timeout: 30000 // 30 second timeout for audio
+        timeout: 30000
       }
     );
     return Buffer.from(response.data);
@@ -182,7 +175,7 @@ async function fetchAudioFromLine(messageId) {
 }
 
 // ============================================================================
-// MESSAGE HANDLERS - WITH ERROR BOUNDARIES
+// MESSAGE HANDLERS - SIMPLIFIED
 // ============================================================================
 
 async function handleTextMessage(text, replyToken, userId) {
@@ -195,14 +188,14 @@ async function handleTextMessage(text, replyToken, userId) {
     
     if (!replyResult.success) {
       Logger.error('Failed to send reply to LINE', replyResult.error);
-      // Still return success - message was processed
     }
     
   } catch (error) {
     Logger.error('Text handler error', error);
     
-    // Try to inform user
-    await replyToLine(replyToken, '❌ เกิดข้อผิดพลาด ระบบกำลังประมวลผล\nกรุณาลองใหม่อีกครั้ง').catch(() => {
+    await replyToLine(replyToken, 
+      '❌ เกิดข้อผิดพลาด\n\nกรุณาลองใหม่อีกครั้ง'
+    ).catch(() => {
       Logger.error('Failed to send error message to user');
     });
   }
@@ -210,70 +203,30 @@ async function handleTextMessage(text, replyToken, userId) {
 
 async function handleVoiceMessageEvent(messageId, replyToken, userId) {
   try {
-    Logger.info(`🎤 Voice from ${userId.substring(0, 8)}`);
+    Logger.info(`🎤 Voice message from ${userId.substring(0, 8)}`);
     
-    // Fetch and transcribe audio
+    // Fetch audio from LINE
     const audioBuffer = await fetchAudioFromLine(messageId);
-    const { success, text } = await transcribeAudio(audioBuffer);
     
-    if (!success || !text) {
-      await replyToLine(replyToken, 
-        '❌ ฟังไม่ออก\n\n' +
-        '💡 Tips:\n' +
-        '• พูดช้าๆ ชัดๆ\n' +
-        '• อยู่ในที่เงียบ\n' +
-        '• ถือไมค์ใกล้ปาก\n' +
-        '• หรือพิมพ์ข้อความมาแทน'
-      );
-      return;
+    // Process with voice handler module
+    const result = await handleVoiceMessage(audioBuffer, userId);
+    
+    // Send response
+    await replyToLine(replyToken, result.message);
+    
+    // Log performance
+    if (result.processingTime) {
+      Logger.info(`⏱️ Voice processed in ${result.processingTime}ms`);
     }
-
-    Logger.info(`📝 Raw transcription: "${text}"`);
-    
-    // Use AI to correct and improve transcription
-    const { getStockCache } = require('./cacheManager');
-    const stockCache = getStockCache();
-    const aiCorrection = await correctVoiceInput(text, stockCache);
-    
-    let finalText = text;
-    let feedbackMessage = '';
-    
-    if (aiCorrection.success && aiCorrection.correctedText) {
-      finalText = aiCorrection.correctedText;
-      
-      // Generate feedback if text was corrected
-      if (text !== finalText) {
-        Logger.success(`✅ AI corrected: "${text}" → "${finalText}"`);
-        feedbackMessage = `💡 ระบบเข้าใจว่า: "${finalText}"\n(จาก: "${text}")\n\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-      }
-    }
-    
-    // Save to inbox
-    const { saveToInbox } = require('./inboxService');
-    await saveToInbox(
-      userId,
-      `🎤 ${text}`,
-      aiCorrection.success ? `แก้เป็น: ${finalText}` : 'ไม่สามารถแก้ไขได้',
-      'voice'
-    );
-    
-    // Process the corrected text
-    const result = await handleMessage(finalText, userId);
-    
-    // Combine feedback with result
-    const finalMessage = feedbackMessage + result.message;
-    
-    await replyToLine(replyToken, finalMessage);
     
   } catch (error) {
-    Logger.error('Voice handler error', error);
+    Logger.error('Voice message handler error', error);
     
     await replyToLine(replyToken, 
       '❌ ไม่สามารถประมวลผลเสียงได้\n\n' +
       '💡 วิธีแก้:\n' +
       '• ลองพูดใหม่อีกครั้ง\n' +
       '• พูดช้าๆ ชัดๆ\n' +
-      '• อยู่ในที่เงียบ\n' +
       '• หรือพิมพ์ข้อความมาแทน'
     ).catch(() => {
       Logger.error('Failed to send error message');
@@ -282,12 +235,11 @@ async function handleVoiceMessageEvent(messageId, replyToken, userId) {
 }
 
 // ============================================================================
-// WEBHOOK - WITH SIGNATURE VERIFICATION & ERROR BOUNDARIES
+// WEBHOOK
 // ============================================================================
 
 app.post('/webhook', verifyLineSignature, async (req, res) => {
   try {
-    // Immediately respond 200 to LINE
     res.sendStatus(200);
     
     const events = req.body.events || [];
@@ -299,12 +251,10 @@ app.post('/webhook', verifyLineSignature, async (req, res) => {
     
     Logger.info(`📨 Processing ${events.length} event(s)`);
     
-    // Process each event independently with error boundaries
     const results = await Promise.allSettled(
       events.map(event => processEvent(event))
     );
     
-    // Log results
     const succeeded = results.filter(r => r.status === 'fulfilled').length;
     const failed = results.filter(r => r.status === 'rejected').length;
     
@@ -321,7 +271,6 @@ app.post('/webhook', verifyLineSignature, async (req, res) => {
     
   } catch (error) {
     Logger.error('Webhook error', error);
-    // Already sent 200, so just log
   }
 });
 
@@ -348,12 +297,12 @@ async function processEvent(event) {
     }
   } catch (error) {
     Logger.error('Failed to process event', error);
-    throw error; // Re-throw to be caught by Promise.allSettled
+    throw error;
   }
 }
 
 // ============================================================================
-// HEALTH CHECK - WITH DETAILED STATUS
+// HEALTH CHECK
 // ============================================================================
 
 app.get('/health', async (req, res) => {
@@ -366,7 +315,7 @@ app.get('/health', async (req, res) => {
       checks: {}
     };
     
-    // Check Google Sheets connectivity
+    // Check Google Sheets
     try {
       const { getSheetData } = require('./googleServices');
       await getSheetData(configManager.get('SHEET_ID'), 'สต็อก!A1:A1');
@@ -399,7 +348,7 @@ app.get('/health', async (req, res) => {
 });
 
 // ============================================================================
-// MANUAL ADMIN ENDPOINTS (Optional - for debugging)
+// ADMIN ENDPOINTS
 // ============================================================================
 
 app.get('/admin/stats', async (req, res) => {
@@ -426,16 +375,12 @@ app.get('/admin/stats', async (req, res) => {
 });
 
 // ============================================================================
-// 404 HANDLER
+// 404 & ERROR HANDLERS
 // ============================================================================
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
 });
-
-// ============================================================================
-// GLOBAL ERROR HANDLER FOR EXPRESS
-// ============================================================================
 
 app.use((err, req, res, next) => {
   Logger.error('Express error handler', err);
@@ -453,5 +398,4 @@ const server = app.listen(PORT, async () => {
   await initializeApp();
 });
 
-// Export for testing and admin notifications
-module.exports = { app, pushToAdmin, server };;
+module.exports = { app, pushToAdmin, server };
