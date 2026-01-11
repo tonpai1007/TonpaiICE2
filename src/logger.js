@@ -1,29 +1,84 @@
-// logger.js - Centralized logging and performance monitoring
+// logger.js - Simple console logger (no external dependencies)
 
-const winston = require('winston');
+// ============================================================================
+// SIMPLE LOGGER - Works everywhere
+// ============================================================================
 
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.errors({ stack: true }),
-    winston.format.json()
-  ),
-  defaultMeta: { service: 'line-order-bot' },
-  transports: [
-    new winston.transports.File({ 
-      filename: 'error.log', 
-      level: 'error',
-      maxsize: 5242880, // 5MB
-      maxFiles: 5
-    }),
-    new winston.transports.File({ 
-      filename: 'combined.log',
-      maxsize: 5242880,
-      maxFiles: 5
-    })
-  ]
-});
+class SimpleLogger {
+  constructor() {
+    this.level = process.env.LOG_LEVEL || 'info';
+    this.levels = {
+      debug: 0,
+      info: 1,
+      success: 1,
+      warn: 2,
+      error: 3
+    };
+  }
+
+  _shouldLog(level) {
+    const currentLevel = this.levels[this.level] || 1;
+    const messageLevel = this.levels[level] || 1;
+    return messageLevel >= currentLevel;
+  }
+
+  _format(level, message, data) {
+    const timestamp = new Date().toISOString();
+    const levelUpper = level.toUpperCase().padEnd(7);
+    
+    let logMessage = `${levelUpper} [${timestamp}] - ${message}`;
+    
+    if (data) {
+      if (data instanceof Error) {
+        logMessage += `\n  Error: ${data.message}`;
+        if (data.stack && this.level === 'debug') {
+          logMessage += `\n  Stack: ${data.stack}`;
+        }
+      } else if (typeof data === 'object') {
+        logMessage += `\n  ${JSON.stringify(data, null, 2)}`;
+      } else {
+        logMessage += `\n  ${data}`;
+      }
+    }
+    
+    return logMessage;
+  }
+
+  debug(message, data) {
+    if (this._shouldLog('debug')) {
+      console.log(this._format('debug', message, data));
+    }
+  }
+
+  info(message, data) {
+    if (this._shouldLog('info')) {
+      console.log(this._format('info', message, data));
+    }
+  }
+
+  success(message, data) {
+    if (this._shouldLog('success')) {
+      console.log(this._format('success', message, data));
+    }
+  }
+
+  warn(message, data) {
+    if (this._shouldLog('warn')) {
+      console.warn(this._format('warn', message, data));
+    }
+  }
+
+  error(message, data) {
+    if (this._shouldLog('error')) {
+      console.error(this._format('error', message, data));
+    }
+  }
+}
+
+// ============================================================================
+// PERFORMANCE MONITOR
+// ============================================================================
+
 class PerformanceMonitor {
   constructor() {
     this.timers = new Map();
@@ -45,7 +100,16 @@ class PerformanceMonitor {
   }
 }
 
+// ============================================================================
+// SINGLETON INSTANCES
+// ============================================================================
+
+const Logger = new SimpleLogger();
 const performanceMonitor = new PerformanceMonitor();
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
 
 module.exports = {
   Logger,
