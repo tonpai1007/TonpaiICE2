@@ -1,339 +1,206 @@
-// stockAdjustment.js - FIXED: AI-powered voice correction (no regex!)
+// FIXED: stockAdjustment.js - Simplified voice-friendly version
+
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString } = require('./utils');
 const { getSheetData, updateSheetData, appendSheetData } = require('./googleServices');
 const { getStockCache, loadStockCache } = require('./cacheManager');
-const { correctVoiceInput } = require('./aiVoiceCorrector');
 
 // ============================================================================
-// SAFE MUTEX LOCK - WITH TIMEOUT & AUTO-RELEASE
-// ============================================================================
-
-class SafeMutex {
-  constructor(name = 'mutex', timeoutMs = 5000) {
-    this.name = name;
-    this.locked = false;
-    this.timeoutMs = timeoutMs;
-    this.lockTimer = null;
-  }
-
-  async acquire() {
-    let attempts = 0;
-    const maxAttempts = 50;
-    
-    while (this.locked && attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      attempts++;
-    }
-    
-    if (this.locked) {
-      throw new Error(`⏱️ ${this.name}: Failed to acquire lock after ${attempts * 100}ms`);
-    }
-    
-    this.locked = true;
-    
-    // Auto-release after timeout (safety mechanism)
-    this.lockTimer = setTimeout(() => {
-      if (this.locked) {
-        Logger.error(`🚨 ${this.name}: Auto-releasing stuck lock!`);
-        this.release();
-      }
-    }, this.timeoutMs);
-    
-    Logger.debug(`🔒 ${this.name}: Lock acquired`);
-  }
-
-  release() {
-    if (this.lockTimer) {
-      clearTimeout(this.lockTimer);
-      this.lockTimer = null;
-    }
-    this.locked = false;
-    Logger.debug(`🔓 ${this.name}: Lock released`);
-  }
-
-  async executeWithLock(fn) {
-    try {
-      await this.acquire();
-      return await fn();
-    } finally {
-      this.release();
-    }
-  }
-}
-
-const adjustmentMutex = new SafeMutex('StockAdjustment', 10000);
-
-// ============================================================================
-// PARSE ADJUSTMENT COMMAND - AI-POWERED (NO REGEX!)
+// SIMPLE COMMAND PARSER (NO AI NEEDED)
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
   const stockCache = getStockCache();
   
-  // Check if it looks like a stock command
-  const stockKeywords = ['มี', 'เหลือ', 'เติม', 'ลด', 'ปรับ', 'แข็ง', 'น้ำ'];
-  const hasStockKeyword = stockKeywords.some(kw => text.includes(kw));
-  
-  if (!hasStockKeyword) {
-    return { isAdjustment: false };
+  // Must have a number
+  const numberMatch = text.match(/\d+/);
+  if (!numberMatch) {
+    return { isAdjustment: false, reason: 'no_number' };
   }
   
-  // Use AI to parse the command
-  Logger.info(`🤖 Using AI to parse: "${text}"`);
-  const aiResult = await correctVoiceInput(text, stockCache);
+  const value = parseInt(numberMatch[0]);
   
-  if (aiResult.success && aiResult.matched) {
-    Logger.success(`✅ AI parsed: ${aiResult.item} ${aiResult.operation} ${aiResult.quantity}`);
+  // Detect operation
+  let operation = 'set'; // default
+  const lower = text.toLowerCase();
+  
+  if (lower.includes('เติม') || lower.includes('เพิ่ม') || lower.includes('add')) {
+    operation = 'add';
+  } else if (lower.includes('ลด') || lower.includes('subtract')) {
+    operation = 'subtract';
+  } else if (lower.includes('มี') || lower.includes('เหลือ')) {
+    operation = 'set';
+  }
+  
+  // Extract product name (remove operation words and numbers)
+  let productName = text
+    .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม/gi, '')
+    .replace(/\d+/g, '')
+    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง/gi, '')
+    .trim();
+  
+  if (!productName) {
+    return { isAdjustment: false, reason: 'no_product_name' };
+  }
+  
+  // Find matching product
+  const lowerProduct = productName.toLowerCase();
+  
+  // Try exact match first
+  let match = stockCache.find(item => 
+    item.item.toLowerCase() === lowerProduct
+  );
+  
+  // Try contains match
+  if (!match) {
+    const matches = stockCache.filter(item => 
+      item.item.toLowerCase().includes(lowerProduct) ||
+      lowerProduct.includes(item.item.toLowerCase())
+    );
     
-    return {
-      isAdjustment: true,
-      item: aiResult.item,
-      value: aiResult.quantity,
-      operation: aiResult.operation,
-      originalText: text,
-      confidence: aiResult.confidence,
-      reasoning: aiResult.reasoning,
-      aiParsed: true
-    };
+    if (matches.length === 1) {
+      match = matches[0];
+    } else if (matches.length > 1) {
+      // Multiple matches - return suggestions
+      return {
+        isAdjustment: true,
+        ambiguous: true,
+        suggestions: matches,
+        value: value,
+        operation: operation
+      };
+    }
   }
   
-  // AI couldn't parse
-  Logger.warn(`⚠️ AI couldn't parse: "${text}"`);
-  return { 
-    isAdjustment: false,
-    aiAttempted: true,
-    suggestions: aiResult.suggestions || []
+  if (!match) {
+    return { isAdjustment: false, reason: 'product_not_found' };
+  }
+  
+  return {
+    isAdjustment: true,
+    item: match.item,
+    stockItem: match,
+    value: value,
+    operation: operation,
+    originalText: text,
+    confidence: 'high'
   };
 }
 
 // ============================================================================
-// IMPROVED ITEM MATCHING
-// ============================================================================
-
-function findBestStockMatch(itemName, stockCache) {
-  const searchTerm = itemName.toLowerCase().trim();
-  
-  // Priority 1: EXACT match
-  let matches = stockCache.filter(i => 
-    i.item.toLowerCase() === searchTerm
-  );
-  
-  if (matches.length === 1) {
-    return { item: matches[0], confidence: 'exact', ambiguous: false };
-  }
-  
-  // Priority 2: STARTS WITH
-  matches = stockCache.filter(i => 
-    i.item.toLowerCase().startsWith(searchTerm)
-  );
-  
-  if (matches.length === 1) {
-    return { item: matches[0], confidence: 'high', ambiguous: false };
-  } else if (matches.length > 1) {
-    return { 
-      item: null, 
-      confidence: 'low', 
-      ambiguous: true,
-      suggestions: matches.slice(0, 5)
-    };
-  }
-  
-  // Priority 3: CONTAINS
-  matches = stockCache.filter(i => 
-    i.item.toLowerCase().includes(searchTerm)
-  );
-  
-  if (matches.length === 1) {
-    return { item: matches[0], confidence: 'medium', ambiguous: false };
-  } else if (matches.length > 1) {
-    return { 
-      item: null, 
-      confidence: 'low', 
-      ambiguous: true,
-      suggestions: matches.slice(0, 5)
-    };
-  }
-  
-  // Priority 4: FUZZY
-  const normalized = searchTerm.replace(/[^\u0E00-\u0E7F0-9a-z]/g, '');
-  matches = stockCache.filter(i => {
-    const itemNormalized = i.item.toLowerCase().replace(/[^\u0E00-\u0E7F0-9a-z]/g, '');
-    return itemNormalized.includes(normalized) || normalized.includes(itemNormalized);
-  });
-  
-  if (matches.length === 1) {
-    return { item: matches[0], confidence: 'fuzzy', ambiguous: false };
-  } else if (matches.length > 1) {
-    return { 
-      item: null, 
-      confidence: 'low', 
-      ambiguous: true,
-      suggestions: matches.slice(0, 5)
-    };
-  }
-  
-  return { item: null, confidence: 'none', ambiguous: false };
-}
-
-// ============================================================================
-// ADJUST STOCK - WITH SAFE MUTEX
+// ADJUST STOCK - SIMPLIFIED
 // ============================================================================
 
 async function adjustStock(itemName, value, operation = 'set', reason = 'manual') {
-  return adjustmentMutex.executeWithLock(async () => {
-    try {
-      Logger.info(`🔧 Stock adjustment: ${itemName} ${operation} ${value}`);
-
-      // Validate value
-      if (value < 0) {
-        return { success: false, error: '❌ จำนวนต้องเป็นบวก' };
-      }
-      
-      if (value > 100000) {
-        return { success: false, error: '❌ จำนวนสูงเกินไป (max: 100,000)' };
-      }
-
-      // Find item (AI already matched it, but double-check)
-      const stockCache = getStockCache();
-      const matchResult = findBestStockMatch(itemName, stockCache);
-      
-      if (!matchResult.item) {
-        // Generate smart suggestions
-        const suggestions = stockCache
-          .filter(i => {
-            const itemLower = i.item.toLowerCase();
-            const searchLower = itemName.toLowerCase();
-            // Find items with similar characters
-            let matchCount = 0;
-            for (let char of searchLower) {
-              if (itemLower.includes(char)) matchCount++;
-            }
-            return matchCount >= Math.min(3, searchLower.length / 2);
-          })
-          .slice(0, 5);
-        
-        if (matchResult.ambiguous || suggestions.length > 0) {
-          const suggestionList = (matchResult.suggestions || suggestions)
-            .map(i => `• ${i.item} (${i.stock} ${i.unit})`)
-            .join('\n');
-          
-          return { 
-            success: false, 
-            error: `❓ ไม่แน่ใจว่าคุณหมายถึงอะไร:\n\n${suggestionList}\n\n💡 ลองพูดให้ชัดเจนขึ้น หรือพิมพ์ข้อความมา`
-          };
-        } else {
-          return { 
-            success: false, 
-            error: `❌ ไม่พบสินค้า: "${itemName}"\n\n💡 ลองพูดว่า "สต็อก" เพื่อฟังรายการทั้งหมด`
-          };
-        }
-      }
-
-      const item = matchResult.item;
-      const oldStock = item.stock;
-      let newStock = oldStock;
-
-      // Calculate new stock
-      switch (operation) {
-        case 'add':
-          newStock = oldStock + value;
-          break;
-        case 'subtract':
-          newStock = oldStock - value;
-          if (newStock < 0) {
-            return { 
-              success: false, 
-              error: `❌ สต็อกไม่พอลด\n\n` +
-                     `มีอยู่: ${oldStock} ${item.unit}\n` +
-                     `ต้องการลด: ${value} ${item.unit}\n` +
-                     `ผลลัพธ์: ${newStock} (ติดลบ!)`
-            };
-          }
-          break;
-        case 'set':
-          if (value < 0) {
-            return { 
-              success: false, 
-              error: '❌ ไม่สามารถตั้งค่าเป็นจำนวนติดลบได้' 
-            };
-          }
-          newStock = value;
-          break;
-      }
-
-      const difference = newStock - oldStock;
-
-      // Update Google Sheets
-      const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
-      let rowIndex = -1;
-
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i][0].toLowerCase() === item.item.toLowerCase()) {
-          rowIndex = i + 1;
-          break;
-        }
-      }
-
-      if (rowIndex === -1) {
-        return { success: false, error: '❌ ไม่พบสินค้าในระบบ (cache mismatch)' };
-      }
-
-      // Update sheet
-      await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${rowIndex}`, [[newStock]]);
-
-      // Log variance
-      const logSuccess = await logVariance(
-        item.item, 
-        oldStock, 
-        newStock, 
-        difference, 
-        reason, 
-        operation
-      );
-      
-      if (!logSuccess) {
-        Logger.warn('⚠️ VarianceLog failed, but stock updated successfully');
-      }
-
-      // Reload cache
-      await loadStockCache(true);
-
-      Logger.success(`✅ Stock adjusted: ${item.item} (${oldStock} → ${newStock}, ${difference >= 0 ? '+' : ''}${difference})`);
-
-      return {
-        success: true,
-        item: item.item,
-        unit: item.unit,
-        oldStock,
-        newStock,
-        difference,
-        operation,
-        operationText: getOperationText(operation, value),
-        matchConfidence: matchResult.confidence,
-        varianceLogged: logSuccess
+  try {
+    Logger.info(`🔧 Adjusting: ${itemName} ${operation} ${value}`);
+    
+    // Validate
+    if (value < 0 || value > 100000) {
+      return { 
+        success: false, 
+        error: '❌ จำนวนไม่ถูกต้อง (0-100,000)' 
       };
-
-    } catch (error) {
-      Logger.error('❌ adjustStock failed', error);
-      throw error; // Re-throw to be caught by mutex handler
     }
-  }).catch(error => {
-    // Catch any errors (including lock timeout)
-    Logger.error('Stock adjustment error', error);
-    return { 
-      success: false, 
+    
+    // Find item in cache
+    const stockCache = getStockCache();
+    const item = stockCache.find(i => 
+      i.item.toLowerCase() === itemName.toLowerCase()
+    );
+    
+    if (!item) {
+      return { 
+        success: false, 
+        error: `❌ ไม่พบสินค้า: ${itemName}` 
+      };
+    }
+    
+    // Calculate new stock
+    const oldStock = item.stock;
+    let newStock;
+    
+    switch (operation) {
+      case 'add':
+        newStock = oldStock + value;
+        break;
+      case 'subtract':
+        newStock = oldStock - value;
+        if (newStock < 0) {
+          return {
+            success: false,
+            error: `❌ สต็อกไม่พอลด\n\nมี: ${oldStock}\nต้องการลด: ${value}\nขาด: ${Math.abs(newStock)}`
+          };
+        }
+        break;
+      case 'set':
+        newStock = value;
+        break;
+      default:
+        return { success: false, error: '❌ คำสั่งไม่ถูกต้อง' };
+    }
+    
+    const difference = newStock - oldStock;
+    
+    // Update in Google Sheets
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
+    let rowIndex = -1;
+    
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][0].toLowerCase() === item.item.toLowerCase()) {
+        rowIndex = i + 1; // +1 because sheets are 1-indexed
+        break;
+      }
+    }
+    
+    if (rowIndex === -1) {
+      return { 
+        success: false, 
+        error: '❌ ไม่พบสินค้าในระบบ' 
+      };
+    }
+    
+    // Update the stock value
+    await updateSheetData(
+      CONFIG.SHEET_ID, 
+      `สต็อก!E${rowIndex}`, 
+      [[newStock]]
+    );
+    
+    // Log to variance
+    await logVariance(item.item, oldStock, newStock, difference, reason, operation);
+    
+    // Reload cache
+    await loadStockCache(true);
+    
+    Logger.success(`✅ Updated: ${item.item} (${oldStock} → ${newStock})`);
+    
+    return {
+      success: true,
+      item: item.item,
+      unit: item.unit,
+      oldStock: oldStock,
+      newStock: newStock,
+      difference: difference,
+      operation: operation,
+      operationText: getOperationText(operation, value)
+    };
+    
+  } catch (error) {
+    Logger.error('adjustStock failed', error);
+    return {
+      success: false,
       error: `❌ เกิดข้อผิดพลาด: ${error.message}`
     };
-  });
+  }
 }
 
 // ============================================================================
 // LOG VARIANCE
 // ============================================================================
 
-async function logVariance(item, oldStock, newStock, difference, reason, operation = 'set') {
+async function logVariance(item, oldStock, newStock, difference, reason, operation) {
   try {
     const reasonText = getReasonText(reason, operation);
     
@@ -345,26 +212,13 @@ async function logVariance(item, oldStock, newStock, difference, reason, operati
       difference,
       reasonText
     ];
-
+    
     await appendSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F', [row]);
-    Logger.success(`📊 VarianceLog saved: ${item} (${difference >= 0 ? '+' : ''}${difference})`);
+    Logger.success(`📊 Logged variance: ${item} (${difference >= 0 ? '+' : ''}${difference})`);
     
     return true;
   } catch (error) {
-    Logger.error('❌ logVariance failed', error);
-    
-    try {
-      const { pushToAdmin } = require('./app');
-      await pushToAdmin(
-        `⚠️ VarianceLog Failed\n\n` +
-        `Item: ${item}\n` +
-        `Change: ${oldStock} → ${newStock}\n` +
-        `Error: ${error.message}`
-      );
-    } catch (notifyError) {
-      Logger.error('Failed to notify admin', notifyError);
-    }
-    
+    Logger.error('logVariance failed', error);
     return false;
   }
 }
@@ -388,7 +242,7 @@ function getReasonText(reason, operation) {
     'subtract': 'ลดสต็อก',
     'set': 'ปรับสต็อก'
   };
-
+  
   const reasonMap = {
     'manual': 'ปรับด้วยมือ',
     'manual_adjustment': 'ปรับด้วยมือ',
@@ -396,10 +250,9 @@ function getReasonText(reason, operation) {
     'text_adjustment': 'ปรับผ่านข้อความ',
     'restock': 'เติมสินค้า',
     'damage': 'สินค้าเสียหาย',
-    'loss': 'สินค้าสูญหาย',
-    'inventory_check': 'ตรวจนับสต็อก'
+    'loss': 'สินค้าสูญหาย'
   };
-
+  
   const opText = operationMap[operation] || 'ปรับสต็อก';
   const reasonText = reasonMap[reason] || reason;
   
@@ -407,7 +260,7 @@ function getReasonText(reason, operation) {
 }
 
 // ============================================================================
-// VIEW CURRENT STOCK
+// VIEW STOCK
 // ============================================================================
 
 async function viewCurrentStock(searchTerm = null) {
@@ -415,9 +268,9 @@ async function viewCurrentStock(searchTerm = null) {
     const stockCache = getStockCache();
     
     if (stockCache.length === 0) {
-      return '❌ ไม่มีข้อมูลสต็อก\n\n💡 กรุณารีเฟรช: พิมพ์ "รีเฟรช"';
+      return '❌ ไม่มีข้อมูลสต็อก';
     }
-
+    
     let items = stockCache;
     
     if (searchTerm) {
@@ -428,31 +281,29 @@ async function viewCurrentStock(searchTerm = null) {
       );
       
       if (items.length === 0) {
-        return `❌ ไม่พบสินค้า "${searchTerm}"\n\n💡 ลองค้นหาด้วยชื่ออื่น`;
+        return `❌ ไม่พบ "${searchTerm}"`;
       }
     }
-
+    
     const displayItems = items.slice(0, 20);
     
     let report = `📦 สต็อกสินค้า\n${'='.repeat(40)}\n\n`;
     
     displayItems.forEach(item => {
-      const stockIcon = item.stock === 0 ? '🔴' : item.stock < 10 ? '🟡' : '🟢';
-      report += `${stockIcon} ${item.item}\n`;
-      report += `   ${item.stock} ${item.unit} │ ${item.price}฿ │ ${item.category}\n\n`;
+      const icon = item.stock === 0 ? '🔴' : item.stock < 10 ? '🟡' : '🟢';
+      report += `${icon} ${item.item}\n`;
+      report += `   ${item.stock} ${item.unit} │ ${item.price}฿\n\n`;
     });
-
+    
     if (items.length > 20) {
-      report += `... และอีก ${items.length - 20} รายการ\n\n`;
+      report += `... และอีก ${items.length - 20} รายการ\n`;
     }
-
-    report += `รวม: ${items.length} รายการ`;
-
+    
     return report;
-
+    
   } catch (error) {
-    Logger.error('❌ viewCurrentStock failed', error);
-    return `❌ ไม่สามารถดูสต็อกได้\n\n${error.message}`;
+    Logger.error('viewCurrentStock failed', error);
+    return `❌ เกิดข้อผิดพลาด: ${error.message}`;
   }
 }
 
@@ -465,15 +316,15 @@ async function generateVarianceReport(period = 'today') {
     const rows = await getSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F');
     
     if (rows.length <= 1) {
-      return '📊 ยังไม่มีการปรับสต็อก\n\n💡 ลองใช้คำสั่ง:\n• "เติมน้ำแข็ง 20"\n• "ลดน้ำแข็ง 10"\n• "น้ำแข็ง มี 50"';
+      return '📊 ยังไม่มีการปรับสต็อก';
     }
-
+    
     const today = new Date().toLocaleDateString('en-CA');
     const variances = rows.slice(1)
       .filter(row => {
         if (period === 'today') {
           const rowDate = row[0].split(' ')[0];
-          return rowDate === today;
+          return rowDate.includes(today);
         }
         return true;
       })
@@ -485,13 +336,12 @@ async function generateVarianceReport(period = 'today') {
         difference: parseInt(row[4] || 0),
         reason: row[5] || '-'
       }));
-
+    
     if (variances.length === 0) {
-      return `📊 ไม่มีการปรับสต็อกวันนี้ (${today})\n\n✅ สต็อกไม่มีการเปลี่ยนแปลง`;
+      return `📊 ไม่มีการปรับสต็อกวันนี้`;
     }
-
-    let report = `📊 รายงานการปรับสต็อก\n${'='.repeat(40)}\n`;
-    report += period === 'today' ? `📅 วันนี้ (${today})\n\n` : `📅 ทั้งหมด\n\n`;
+    
+    let report = `📊 รายงานการปรับสต็อก\n${'='.repeat(40)}\n\n`;
     
     const itemMap = new Map();
     variances.forEach(v => {
@@ -500,50 +350,34 @@ async function generateVarianceReport(period = 'today') {
       }
       itemMap.get(v.item).push(v);
     });
-
+    
     itemMap.forEach((changes, itemName) => {
       const totalDiff = changes.reduce((sum, c) => sum + c.difference, 0);
       const icon = totalDiff === 0 ? '➖' : totalDiff > 0 ? '📈' : '📉';
       
-      report += `${icon} **${itemName}**\n`;
+      report += `${icon} ${itemName}\n`;
       
       changes.forEach(v => {
-        const time = v.date.split(' ')[1];
+        const time = v.date.split(' ')[1] || '';
         const sign = v.difference >= 0 ? '+' : '';
         report += `   ${time} │ ${v.oldStock} → ${v.newStock} (${sign}${v.difference})\n`;
-        report += `   └─ ${v.reason}\n`;
       });
       
       report += `\n`;
     });
-
-    const totalAdjustments = variances.length;
-    const totalIncrease = variances.filter(v => v.difference > 0).length;
-    const totalDecrease = variances.filter(v => v.difference < 0).length;
-
-    report += `${'='.repeat(40)}\n`;
-    report += `📊 สรุป: ${totalAdjustments} รายการ\n`;
-    report += `   📈 เพิ่ม: ${totalIncrease} ครั้ง\n`;
-    report += `   📉 ลด: ${totalDecrease} ครั้ง\n`;
-
+    
     return report;
-
+    
   } catch (error) {
-    Logger.error('❌ generateVarianceReport failed', error);
-    return `❌ ไม่สามารถสร้างรายงานได้\n\n${error.message}`;
+    Logger.error('generateVarianceReport failed', error);
+    return `❌ เกิดข้อผิดพลาด: ${error.message}`;
   }
 }
-
-// ============================================================================
-// EXPORTS
-// ============================================================================
 
 module.exports = {
   parseAdjustmentCommand,
   adjustStock,
   logVariance,
   generateVarianceReport,
-  viewCurrentStock,
-  findBestStockMatch,
-  SafeMutex
+  viewCurrentStock
 };
