@@ -1,67 +1,86 @@
-// aiVoiceCorrector.js - Use AI to fix voice transcription errors
+// aiVoiceCorrector.js - IMPROVED: Better prompt for Thai voice recognition
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
-const { getStockCache } = require('./cacheManager');
+const { getStockCache, getCustomerCache } = require('./cacheManager');
 
 // ============================================================================
-// AI-POWERED VOICE CORRECTION
+// ENHANCED VOICE CORRECTION - Better AI prompt
 // ============================================================================
 
 async function correctVoiceInput(transcribedText, stockCache) {
   try {
-    Logger.info(`🎤 Correcting voice input: "${transcribedText}"`);
+    Logger.info(`🎤 Correcting voice: "${transcribedText}"`);
     
-    // Build stock list for AI context
+    const customerCache = getCustomerCache();
+    
+    // Build comprehensive context
     const stockList = stockCache
-      .map((item, idx) => `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿`)
+      .slice(0, 100) // More products for better matching
+      .map((item, idx) => `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | ${item.stock} คงเหลือ`)
       .join('\n');
+    
+    const customerList = customerCache
+      .slice(0, 50)
+      .map(c => c.name)
+      .join(', ');
 
-    const prompt = `You are a Thai language expert fixing voice transcription errors for inventory management.
+    const prompt = `คุณเป็นผู้เชี่ยวชาญระบบรับคำสั่งซื้อภาษาไทยผ่านเสียง ช่วยแก้ไขข้อความจากการฟังเสียงให้ถูกต้อง
 
-AVAILABLE PRODUCTS:
+สินค้าที่มีในระบบ:
 ${stockList}
 
-VOICE TRANSCRIPTION (may have errors):
+ลูกค้าที่รู้จัก:
+${customerList}
+
+ข้อความจากการฟังเสียง (อาจมีข้อผิดพลาด):
 "${transcribedText}"
 
-COMMON THAI VOICE ERRORS:
-- "แข็ง" is often "น้ำแข็ง" (ice)
-- "แข็งลอด" → "น้ำแข็งหลอด" (tube ice)
-- "แข่งรอด" → "น้ำแข็งหลอด" (tube ice)
-- "แข็งก้อน" → "น้ำแข็งก้อน" (ice cubes)
-- "โคก" → "โค้ก" (Coke)
-- "เบีย" → "เบียร์" (beer)
-- Missing spaces between words
-- Wrong tone marks
-- "ล" vs "ร" confusion
+ข้อผิดพลาดทั่วไปจากเสียงพูดภาษาไทย:
+1. คำว่า "แข็ง", "แข่ง", "เข็ง" มักหมายถึง "น้ำแข็ง"
+2. คำว่า "ลอด", "รอด" มักหมายถึง "หลอด" (ในบริบทน้ำแข็งหลอด)
+3. คำว่า "โคก", "โคค" มักหมายถึง "โค้ก" (Coca-Cola)
+4. คำว่า "เบีย", "เบียะ" มักหมายถึง "เบียร์"
+5. ขาดเว้นวรรคระหว่างคำ (เช่น "น้ำแข็งห้า" = "น้ำแข็ง ห้า")
+6. ตัวเลข: "ห้า"=5, "สิบ"=10, "ยี่สิบ"=20
+7. "ล" กับ "ร" มักสับสน
 
-YOUR TASK:
-1. Identify what product the user is talking about
-2. Match it to the EXACT product name from the list above
-3. Extract quantity and operation (มี/เหลือ = set stock, เติม = add, ลด = subtract)
+รูปแบบคำสั่งที่ถูกต้อง:
+- สั่งซื้อ: "สินค้า จำนวน ลูกค้า" → "น้ำแข็งหลอดใหญ่ 5 ถุง ร้านเจ๊แดง"
+- ปรับสต็อก: "สินค้า มี/เหลือ/เติม/ลด จำนวน" → "น้ำแข็ง มี 20", "เติมน้ำแข็ง 10"
+- ชำระเงิน: "จ่าย เลขออเดอร์" → "จ่าย #123" หรือ "จ่าย"
+- จัดส่ง: "ส่ง เลขออเดอร์ คนส่ง" → "ส่ง พี่แดง" หรือ "ส่ง #123 พี่แดง"
 
-CRITICAL RULES:
-- MUST use EXACT product names from the list (including size: ใหญ่/เล็ก/กลาง)
-- If unsure between multiple products, choose the most common one
-- Return ONLY JSON, no explanation
+วิธีทำงาน:
+1. อ่านข้อความที่ได้จากการฟัง
+2. จับคู่กับสินค้าในระบบ (ใช้ชื่อเต็มที่ถูกต้อง)
+3. แก้ไขคำผิดตามข้อผิดพลาดทั่วไป
+4. เติมคำที่ขาดหายไป (เช่น "ถุง", "ขวด")
+5. แยกคำให้ถูกต้อง
 
-OUTPUT JSON:
+สำคัญ:
+- ใช้ชื่อสินค้าที่ตรงกับรายการข้างบน (ตัวอักษรเท่ากันทุกตัว)
+- ถ้าพูดถึงขนาด (ใหญ่/เล็ก/กลาง) ต้องรวมกับชื่อสินค้า
+- เติมหน่วย (ถุง, ขวด, กล่อง) ให้ครบถ้วน
+- ถ้าไม่แน่ใจ เลือกสินค้าที่ใกล้เคียงที่สุด
+
+ตอบเป็น JSON เท่านั้น:
 {
-  "matched": true or false,
-  "productId": 0,
-  "productName": "exact name from list",
-  "quantity": 5,
-  "operation": "set" or "add" or "subtract",
-  "confidence": "high" or "medium" or "low",
-  "reasoning": "why this match"
+  "matched": true,
+  "productId": เลข index จากรายการ (ถ้ามีสินค้า),
+  "productName": "ชื่อเต็มของสินค้าตามรายการ",
+  "quantity": จำนวน,
+  "operation": "set" หรือ "add" หรือ "subtract",
+  "confidence": "high" หรือ "medium" หรือ "low",
+  "correctedText": "ข้อความที่แก้ไขแล้ว",
+  "reasoning": "อธิบายว่าแก้อะไรบ้าง"
 }
 
-If no match found:
+ถ้าไม่ใช่คำสั่งเกี่ยวกับสต็อก:
 {
   "matched": false,
-  "originalText": "${transcribedText}",
-  "possibleProducts": ["suggestion1", "suggestion2"],
-  "confidence": "none"
+  "isStockCommand": false,
+  "correctedText": "ข้อความที่แก้ไขแล้ว",
+  "type": "order" หรือ "payment" หรือ "delivery" หรือ "other"
 }`;
 
     const result = await generateWithGroq(prompt, true);
@@ -70,7 +89,8 @@ If no match found:
       const item = stockCache[result.productId];
       
       Logger.success(`✅ AI matched: "${transcribedText}" → "${item.item}" (${result.confidence})`);
-      Logger.info(`💡 AI reasoning: ${result.reasoning}`);
+      Logger.info(`💡 Corrected: "${result.correctedText}"`);
+      Logger.info(`🔍 Reasoning: ${result.reasoning}`);
       
       return {
         success: true,
@@ -80,7 +100,20 @@ If no match found:
         quantity: result.quantity,
         operation: result.operation,
         confidence: result.confidence,
+        correctedText: result.correctedText,
         reasoning: result.reasoning,
+        originalText: transcribedText
+      };
+    } else if (!result.isStockCommand) {
+      // Not a stock command, but we corrected the text
+      Logger.info(`ℹ️ Not stock command: "${result.correctedText}" (${result.type})`);
+      
+      return {
+        success: true,
+        matched: false,
+        isStockCommand: false,
+        correctedText: result.correctedText,
+        type: result.type,
         originalText: transcribedText
       };
     } else {
@@ -90,7 +123,7 @@ If no match found:
         success: false,
         matched: false,
         originalText: transcribedText,
-        suggestions: result.possibleProducts || [],
+        correctedText: result.correctedText || transcribedText,
         confidence: 'none'
       };
     }
@@ -101,7 +134,8 @@ If no match found:
       success: false,
       matched: false,
       error: error.message,
-      originalText: transcribedText
+      originalText: transcribedText,
+      correctedText: transcribedText
     };
   }
 }
