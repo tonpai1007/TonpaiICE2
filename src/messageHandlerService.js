@@ -171,6 +171,11 @@ async function handleMessage(text, userId) {
     // ========================================
     // STOCK ADJUSTMENT (Priority #1)
     // ========================================
+      const { handleBusinessCommand } = require('./businessCommands');
+    const businessResult = await handleBusinessCommand(text, userId);
+    if (businessResult !== null) {
+      return businessResult;
+    }
     
     const adjCommand = await parseAdjustmentCommand(text);
     if (adjCommand.isAdjustment) {
