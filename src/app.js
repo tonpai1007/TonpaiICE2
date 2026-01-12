@@ -224,12 +224,8 @@ async function handleVoiceMessageEvent(messageId, replyToken, userId) {
   try {
     Logger.info(`🎤 Voice message from ${userId.substring(0, 8)}`);
     
-    // Fetch audio from LINE
     const audioBuffer = await fetchAudioFromLine(messageId);
-    
-    // Process with voice handler module
-    const result = await handleVoiceMessage(audioBuffer, userId);
-    
+    const result = await processVoiceMessage(audioBuffer, userId);
     // Send response
     await replyToLine(replyToken, result.message);
     
