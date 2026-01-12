@@ -1,372 +1,313 @@
-// enhancedOrderService.js - Order processing with full business logic
-const { CONFIG } = require('./config');
+// orderParser.js - COMPLETE: With all required imports
 const { Logger } = require('./logger');
-const { getThaiDateTimeString } = require('./utils');
-const { getSheetData, appendSheetData, updateSheetData } = require('./googleServices');
-const { loadStockCache } = require('./cacheManager');
-const { 
-  pricingEngine, 
-  inventoryManager, 
-  creditManager,
-  businessRules 
-} = require('./businessLogic');
+const { generateWithGroq } = require('./aiServices');
+const { getStockCache, getCustomerCache } = require('./cacheManager');
+const { normalizeText } = require('./utils');
 
 // ============================================================================
-// ENHANCED ORDER CREATION
+// INPUT NORMALIZATION
 // ============================================================================
 
-async function createEnhancedOrder(orderData) {
-  const { customer, items, paymentStatus = 'unpaid', deliveryPerson = '' } = orderData;
+function normalizeOrderInput(text) {
+  // Transform "น้ำแข็งมี 5 ถุง" → "น้ำแข็ง 5 ถุง"
+  // Transform "น้ำแข็ง มี 5" → "น้ำแข็ง 5"
+  let normalized = text.replace(/\s*มี\s*/g, ' ').trim();
   
-  if (!customer || !items || !Array.isArray(items) || items.length === 0) {
-    return {
-      success: false,
-      error: 'ข้อมูลไม่ครบถ้วน: ต้องมีลูกค้าและรายการสินค้า'
-    };
+  // Remove extra spaces
+  normalized = normalized.replace(/\s+/g, ' ');
+  
+  Logger.info(`📝 Normalized: "${text}" → "${normalized}"`);
+  return normalized;
+}
+
+// ============================================================================
+// EXTRACT PRICE HINTS
+// ============================================================================
+
+function extractPriceHints(text) {
+  const hints = [];
+  
+  // Pattern: "บด 40 บาท" → {keyword: "บด", price: 40}
+  const matches = text.matchAll(/([ก-๙a-z]+)\s+(\d+)\s*(?:บาท|฿)/gi);
+  
+  for (const match of matches) {
+    hints.push({
+      keyword: match[1].toLowerCase(),
+      price: parseInt(match[2])
+    });
+  }
+  
+  if (hints.length > 0) {
+    Logger.info(`💡 Price hints extracted: ${JSON.stringify(hints)}`);
+  }
+  
+  return hints;
+}
+
+// ============================================================================
+// BUILD SMART STOCK LIST
+// ============================================================================
+
+function buildSmartStockList(stockCache, priceHints) {
+  // Group items by price when hints exist
+  const grouped = new Map();
+  
+  stockCache.forEach((item, idx) => {
+    const key = `${item.price}฿`;
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push({ item, idx });
+  });
+  
+  let stockList = '';
+  
+  // If price hints exist, prioritize those prices
+  if (priceHints.length > 0) {
+    stockList += '🎯 PRICE-MATCHED ITEMS (use these first):\n';
+    
+    priceHints.forEach(hint => {
+      const matchingItems = grouped.get(`${hint.price}฿`) || [];
+      matchingItems.forEach(({ item, idx }) => {
+        if (item.item.toLowerCase().includes(hint.keyword)) {
+          stockList += `[${idx}] ⭐ ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+        }
+      });
+    });
+    
+    stockList += '\nALL OTHER ITEMS:\n';
+  }
+  
+  // Regular list
+  stockCache.forEach((item, idx) => {
+    stockList += `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+  });
+  
+  return stockList;
+}
+
+// ============================================================================
+// MAIN PARSE ORDER FUNCTION
+// ============================================================================
+
+async function parseOrder(userInput) {
+  const stockCache = getStockCache();
+  const customerCache = getCustomerCache();
+  
+  if (stockCache.length === 0) {
+    return { success: false, error: '❌ ไม่มีข้อมูลสต็อก' };
   }
 
   try {
-    // Step 1: Calculate pricing with all business rules
-    const pricingResults = [];
-    let totalAmount = 0;
-    let totalCost = 0;
-
-    for (const item of items) {
-      const pricing = pricingEngine.calculatePrice(
-        item.stockItem,
-        item.quantity,
-        customer,
-        paymentStatus === 'credit' ? 'credit' : 'cash'
-      );
-
-      if (!pricing.valid) {
-        return {
-          success: false,
-          error: pricing.error,
-          details: pricing
-        };
-      }
-
-      pricingResults.push({
-        item: item.stockItem,
-        quantity: item.quantity,
-        pricing: pricing
-      });
-
-      totalAmount += pricing.finalPrice;
-      totalCost += item.stockItem.cost * item.quantity;
-    }
-
-    // Step 2: Validate order against business rules
-    const orderContext = {
-      customer,
-      items,
-      totalAmount,
-      totalCost,
-      paymentStatus
-    };
-
-    const validation = await businessRules.validateOrder(orderContext);
+    // Normalize input
+    const normalizedInput = normalizeOrderInput(userInput);
     
-    if (!validation.valid) {
-      Logger.warn(`Order validation failed: ${validation.violations.length} violations`);
-      return {
-        success: false,
-        error: validation.violations[0].message,
-        violations: validation.violations
-      };
-    }
-
-    // Step 3: Check credit limit if applicable
-    if (paymentStatus === 'credit') {
-      const creditCheck = await creditManager.checkCreditLimit(customer, totalAmount);
-      
-      if (!creditCheck.allowed) {
-        return {
-          success: false,
-          error: creditCheck.message,
-          creditInfo: creditCheck
-        };
-      }
-
-      Logger.info(`💳 Credit check passed: ${customer} (${creditCheck.available}฿ available)`);
-    }
-
-    // Step 4: Get next order number
-    const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    const orderNo = orderRows.length || 1;
-
-    // Step 5: Verify and update stock
-    const stockRows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
-    const stockMap = new Map();
+    // Extract price hints from input
+    const priceHints = extractPriceHints(userInput);
     
-    for (let i = 1; i < stockRows.length; i++) {
-      const name = (stockRows[i][0] || '').toLowerCase().trim();
-      const unit = (stockRows[i][3] || '').toLowerCase().trim();
-      const stock = parseInt(stockRows[i][4] || 0);
-      const key = `${name}|${unit}`;
-      stockMap.set(key, { stock, rowIndex: i + 1 });
-    }
+    // Build smart stock list with price-based grouping
+    const stockList = buildSmartStockList(stockCache, priceHints);
 
-    // Verify stock one more time (race condition protection)
-    for (const result of pricingResults) {
-      const key = `${result.item.item.toLowerCase().trim()}|${result.item.unit.toLowerCase().trim()}`;
-      const stockInfo = stockMap.get(key);
-      
-      if (!stockInfo || stockInfo.stock < result.quantity) {
-        return {
-          success: false,
-          error: `❌ สต็อกเปลี่ยนแปลง: ${result.item.item}\nกรุณาลองใหม่อีกครั้ง`
-        };
+    const customerList = customerCache.slice(0, 50).map(c => c.name).join(', ');
+
+    const prompt = `You are an expert Thai order parser with SMART PRICE MATCHING.
+
+STOCK CATALOG WITH PRICE HINTS:
+${stockList}
+
+KNOWN CUSTOMERS: ${customerList}
+
+USER INPUT: "${normalizedInput}"
+
+CRITICAL PRICE MATCHING RULES:
+1. If user mentions price (e.g., "บด 40 บาท"), find the stock item that EXACTLY matches that price
+2. Example: "บด 40" should match "บดหยาบ" (40฿) NOT "บดละเอียด" (30฿)
+3. If no exact price match, use closest match by name
+4. Set "priceMatchUsed": true if you used price to disambiguate
+
+IMPORTANT PATTERNS TO RECOGNIZE:
+- "น้ำแข็ง 2 ถุง" = ice 2 bags
+- "น้ำแข็งมี 5" = ice 5 (quantity)
+- "เอา 3 น้ำแข็ง" = take 3 ice
+
+CONFIDENCE RULES (return "high" if ALL true):
+1. Customer name is clearly mentioned (even if not in known customers list)
+2. Item name matches stock catalog clearly (fuzzy match OK)
+3. Quantity is explicitly stated with number
+4. No ambiguous words like "บางที", "คิดว่า", "อาจจะ"
+
+CUSTOMER MATCHING RULES:
+- If customer name is mentioned at the start → USE IT (even if not in known customers)
+- Examples: "แฟน", "พี่ใหม่", "คุณสมชาย", "ร้านป้าไก่"
+- ONLY use "ไม่ระบุ" if absolutely NO customer name is mentioned
+
+FUZZY MATCHING:
+- "น้ำแข็ง" matches "น้ำแข็งหลอด", "น้ำแข็งก้อน"
+- "เบียร์" matches "เบียร์ลีโอ", "เบียร์ช้าง"
+- Numbers: "ห้า"=5, "สิบ"=10
+
+OUTPUT JSON:
+{
+  "customer": "ชื่อลูกค้าที่พูดมา หรือ ไม่ระบุ ถ้าไม่มีเลย",
+  "items": [
+    {
+      "stockId": 0,
+      "quantity": 2,
+      "matchConfidence": "exact|fuzzy|guess",
+      "priceMatchUsed": false,
+      "mentionedPrice": 40
+    }
+  ],
+  "paymentStatus": "unpaid or credit",
+  "confidence": "high or medium or low",
+  "reasoning": "why this confidence level"
+}`;
+
+    const result = await generateWithGroq(prompt, true);
+    result.rawInput = userInput; 
+
+    const mappedItems = [];
+    const matchDetails = [];
+    
+    if (result.items && Array.isArray(result.items)) {
+      for (const item of result.items) {
+        if (item.stockId >= 0 && item.stockId < stockCache.length) {
+          const stockItem = stockCache[item.stockId];
+          
+          // Track how item was matched
+          const matchInfo = {
+            item: stockItem.item,
+            method: item.priceMatchUsed ? 'price' : 'name',
+            confidence: item.matchConfidence
+          };
+          
+          if (item.mentionedPrice) {
+            matchInfo.mentionedPrice = item.mentionedPrice;
+            matchInfo.actualPrice = stockItem.price;
+            matchInfo.priceMatch = item.mentionedPrice === stockItem.price;
+          }
+          
+          matchDetails.push(matchInfo);
+          
+          mappedItems.push({
+            stockItem: stockItem,
+            quantity: item.quantity || 1,
+            matchConfidence: item.matchConfidence || 'exact'
+          });
+        }
       }
     }
 
-    // Step 6: Create order rows and update stock
-    const rowsToAdd = [];
-    const timestamp = getThaiDateTimeString();
-    const paymentText = paymentStatus === 'paid' ? 'จ่ายแล้ว' : 
-                       paymentStatus === 'credit' ? 'เครดิต' : 'ยังไม่จ่าย';
-    
-    for (const result of pricingResults) {
-      const key = `${result.item.item.toLowerCase().trim()}|${result.item.unit.toLowerCase().trim()}`;
-      const stockInfo = stockMap.get(key);
-      const newStock = stockInfo.stock - result.quantity;
-      
-      // Update stock
-      await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${stockInfo.rowIndex}`, [[newStock]]);
-      
-      // Build notes with pricing breakdown if discounts applied
-      let notes = '';
-      if (result.pricing.appliedRules.length > 0) {
-        notes = result.pricing.appliedRules
-          .map(r => r.description)
-          .filter(Boolean)
-          .join(', ');
-      }
-      
-      // Create order row (9 columns)
-      const row = [
-        orderNo,                      // A - รหัส
-        timestamp,                    // B - วันที่
-        customer,                     // C - ลูกค้า
-        result.item.item,            // D - สินค้า
-        result.quantity,             // E - จำนวน
-        notes,                       // F - หมายเหตุ
-        deliveryPerson,              // G - ผู้ส่ง
-        paymentText,                 // H - จ่ายแล้วหรือยัง
-        result.pricing.finalPrice    // I - ยอดเงิน
-      ];
-      
-      rowsToAdd.push(row);
-      
-      Logger.success(
-        `📦 ${result.item.item}: ${stockInfo.stock} → ${newStock} ` +
-        `(${result.pricing.finalPrice}฿${result.pricing.savings > 0 ? ` save ${result.pricing.savings}฿` : ''})`
-      );
+    const boostedConfidence = boostConfidence(result, mappedItems, normalizedInput, customerCache);
+
+    if (matchDetails.length > 0) {
+      Logger.info(`🎯 Match details: ${JSON.stringify(matchDetails)}`);
     }
 
-    // Step 7: Add all rows at once
-    await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I', rowsToAdd);
-    
-    // Step 8: Record credit if applicable
-    if (paymentStatus === 'credit') {
-      await creditManager.recordCredit(orderNo, customer, totalAmount);
-    }
-
-    // Step 9: Check for low stock alerts
-    const lowStockItems = pricingResults.filter(r => {
-      const key = `${r.item.item.toLowerCase().trim()}|${r.item.unit.toLowerCase().trim()}`;
-      const stockInfo = stockMap.get(key);
-      const newStock = stockInfo.stock - r.quantity;
-      return newStock <= inventoryManager.getReorderPoint(r.item.item);
-    });
-
-    // Step 10: Reload cache
-    await loadStockCache(true);
-
-    // Step 11: Prepare detailed response
-    const profit = totalAmount - totalCost;
-    const profitMargin = totalAmount > 0 ? (profit / totalAmount * 100).toFixed(1) : 0;
-
-    Logger.success(
-      `✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿ ` +
-      `(profit: ${profit}฿, margin: ${profitMargin}%)`
+    Logger.info(
+      `📝 Parsed: ${mappedItems.length} items | ` +
+      `Base: ${result.confidence} → Boosted: ${boostedConfidence} | ` +
+      `Reason: ${result.reasoning}`
     );
 
     return {
-      success: true,
-      orderNo,
-      customer,
-      totalAmount,
-      totalCost,
-      profit,
-      profitMargin,
-      paymentStatus,
-      items: pricingResults.map((r, idx) => ({
-        productName: r.item.item,
-        quantity: r.quantity,
-        unit: r.item.unit,
-        basePrice: r.pricing.basePrice,
-        finalPrice: r.pricing.finalPrice,
-        savings: r.pricing.savings,
-        discounts: r.pricing.appliedRules.filter(rule => rule.amount < 0),
-        fees: r.pricing.appliedRules.filter(rule => rule.amount > 0),
-        newStock: stockMap.get(
-          `${r.item.item.toLowerCase().trim()}|${r.item.unit.toLowerCase().trim()}`
-        ).stock - r.quantity,
-        stockItem: r.item
-      })),
-      lowStockAlerts: lowStockItems.map(r => ({
-        item: r.item.item,
-        stock: stockMap.get(
-          `${r.item.item.toLowerCase().trim()}|${r.item.unit.toLowerCase().trim()}`
-        ).stock - r.quantity,
-        reorderPoint: inventoryManager.getReorderPoint(r.item.item)
-      }))
+      success: mappedItems.length > 0,
+      customer: result.customer || 'ไม่ระบุ',
+      items: mappedItems,
+      paymentStatus: result.paymentStatus || 'unpaid',
+      confidence: boostedConfidence,
+      baseConfidence: result.confidence,
+      reasoning: result.reasoning,
+      matchDetails: matchDetails,
+      rawInput: userInput,
+      action: 'order'
     };
 
   } catch (error) {
-    Logger.error('Enhanced order creation failed', error);
+    Logger.error('Parse failed', error);
     return {
       success: false,
-      error: `❌ ไม่สามารถสร้างออเดอร์ได้: ${error.message}`
+      error: '❌ AI ไม่เข้าใจคำสั่ง',
+      confidence: 'low'
     };
   }
 }
 
 // ============================================================================
-// FORMAT ORDER SUCCESS MESSAGE
+// BOOST CONFIDENCE
 // ============================================================================
 
-function formatEnhancedOrderMessage(result) {
-  let msg = `✅ บันทึกออเดอร์สำเร็จ!\n\n`;
-  msg += `📋 คำสั่งซื้อ #${result.orderNo}\n`;
-  msg += `👤 ${result.customer}\n`;
-  msg += `${'='.repeat(35)}\n\n`;
+function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
+  let confidence = aiResult.confidence || 'low';
+  const boostReasons = [];
 
-  // Items with pricing details
-  result.items.forEach(item => {
-    const stockIcon = item.newStock === 0 ? '🔴' : 
-                     item.newStock < 10 ? '🟡' : '🟢';
-    
-    msg += `${stockIcon} ${item.productName} x${item.quantity}\n`;
-    
-    // Show pricing breakdown if there are discounts/fees
-    if (item.savings > 0) {
-      msg += `   ราคาปกติ: ${item.basePrice}฿\n`;
-      msg += `   ส่วนลด: -${item.savings}฿\n`;
-      msg += `   ราคาสุทธิ: ${item.finalPrice}฿\n`;
-      
-      if (item.discounts.length > 0) {
-        item.discounts.forEach(d => {
-          msg += `   💡 ${d.description}\n`;
-        });
-      }
-    } else {
-      msg += `   ${item.finalPrice}฿\n`;
-    }
-    
-    msg += `   สต็อกเหลือ: ${item.newStock} ${item.unit}\n\n`;
-  });
-
-  msg += `${'='.repeat(35)}\n`;
-  msg += `💰 ยอดรวม: ${result.totalAmount.toLocaleString()}฿\n`;
-  
-  if (result.totalAmount !== result.items.reduce((sum, i) => sum + i.basePrice, 0)) {
-    const totalSavings = result.items.reduce((sum, i) => sum + i.savings, 0);
-    msg += `🎉 ประหยัด: ${totalSavings.toLocaleString()}฿\n`;
-  }
-  
-  msg += `💵 กำไร: ${result.profit.toLocaleString()}฿ (${result.profitMargin}%)\n`;
-
-  // Payment status
-  if (result.paymentStatus === 'credit') {
-    msg += `\n⚠️ เครดิต - ยังไม่ได้รับเงิน\n`;
-  } else if (result.paymentStatus === 'paid') {
-    msg += `\n✅ รับเงินแล้ว\n`;
+  // Check for exact matches
+  const allExactMatch = mappedItems.every(item => 
+    item.matchConfidence === 'exact'
+  );
+  if (allExactMatch && mappedItems.length > 0) {
+    boostReasons.push('exact_match');
   }
 
-  // Low stock alerts
-  if (result.lowStockAlerts && result.lowStockAlerts.length > 0) {
-    msg += `\n⚠️ แจ้งเตือนสต็อกต่ำ:\n`;
-    result.lowStockAlerts.forEach(alert => {
-      msg += `  • ${alert.item}: เหลือ ${alert.stock} (ควรสั่งเมื่อเหลือ ${alert.reorderPoint})\n`;
-    });
+  // Check customer mentioned
+  const customerMentioned = aiResult.customer && aiResult.customer !== 'ไม่ระบุ';
+  if (customerMentioned) {
+    boostReasons.push('customer_mentioned');
+    
+    const customerExists = customerCache.some(c => 
+      c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
+    );
+    if (customerExists) {
+      boostReasons.push('known_customer');
+    }
   }
 
-  msg += `\n${'━'.repeat(35)}\n`;
-  msg += `⚡ คำสั่งด่วน:\n`;
-  msg += `• "จ่าย" - จ่ายออเดอร์นี้\n`;
-  msg += `• "ส่ง ชื่อ" - อัปเดตการจัดส่ง\n`;
-  msg += `• "ยกเลิก" - ยกเลิกออเดอร์นี้\n`;
-
-  return msg;
-}
-
-// ============================================================================
-// PAYMENT MANAGEMENT
-// ============================================================================
-
-async function processPayment(orderNo, paymentMethod = 'cash') {
-  try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
-    const orderRows = [];
-    let totalAmount = 0;
-    let customer = '';
-    let currentStatus = '';
-    
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][0] == orderNo) {
-        orderRows.push({ index: i + 1, data: rows[i] });
-        totalAmount += parseFloat(rows[i][8] || 0);
-        customer = rows[i][2];
-        currentStatus = rows[i][7];
-      }
-    }
-
-    if (orderRows.length === 0) {
-      return { success: false, error: `ไม่พบออเดอร์ #${orderNo}` };
-    }
-
-    // Update payment status
-    const newStatus = 'จ่ายแล้ว';
-    
-    for (const orderRow of orderRows) {
-      await updateSheetData(
-        CONFIG.SHEET_ID, 
-        `คำสั่งซื้อ!H${orderRow.index}`, 
-        [[newStatus]]
-      );
-    }
-
-    // If was credit, update credit record
-    if (currentStatus === 'เครดิต') {
-      await creditManager.payCredit(customer, totalAmount, orderNo);
-    }
-    
-    Logger.success(`💰 Payment processed: #${orderNo} → ${newStatus}`);
-
-    return {
-      success: true,
-      orderNo,
-      customer,
-      totalAmount,
-      previousStatus: currentStatus,
-      newStatus,
-      paymentMethod
-    };
-  } catch (error) {
-    Logger.error('Payment processing failed', error);
-    return { success: false, error: error.message };
+  // Check stock availability
+  const allInStock = mappedItems.every(item => 
+    item.stockItem.stock >= item.quantity
+  );
+  if (allInStock) {
+    boostReasons.push('stock_available');
   }
+
+  // Check clear quantity
+  const hasQuantityWords = /\d+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ/.test(userInput);
+  if (hasQuantityWords) {
+    boostReasons.push('clear_quantity');
+  }
+
+  // Check negative signals
+  const negativeWords = ['บางที', 'คิดว่า', 'อาจจะ', 'ไม่แน่ใจ', 'หรือเปล่า'];
+  const hasNegativeSignal = negativeWords.some(word => 
+    userInput.toLowerCase().includes(word)
+  );
+
+  // Apply boosts
+  if (confidence === 'medium' && boostReasons.length >= 3) {
+    Logger.info(`🚀 Confidence boosted: medium → high (${boostReasons.join(', ')})`);
+    return 'high';
+  }
+
+  if (confidence === 'low' && boostReasons.length >= 4 && !hasNegativeSignal) {
+    Logger.info(`🚀 Confidence boosted: low → medium (${boostReasons.join(', ')})`);
+    return 'medium';
+  }
+
+  if (hasNegativeSignal && confidence === 'high') {
+    Logger.warn(`⚠️ Confidence downgraded: high → medium (negative words)`);
+    return 'medium';
+  }
+
+  return confidence;
 }
 
 // ============================================================================
 // EXPORTS
 // ============================================================================
 
-module.exports = {
-  createEnhancedOrder,
-  formatEnhancedOrderMessage,
-  processPayment
+module.exports = { 
+  parseOrder,
+  normalizeOrderInput,
+  extractPriceHints,
+  buildSmartStockList
 };
