@@ -52,7 +52,7 @@ async function createOrderTransaction(orderData) {
       stockMap.set(key, { stock, rowIndex: i + 1 });
     }
 
-    // Verify stock availability
+    // Verify stock availability BEFORE any updates
     for (const item of items) {
       const key = `${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`;
       const stockInfo = stockMap.get(key);
@@ -72,7 +72,7 @@ async function createOrderTransaction(orderData) {
       }
     }
 
-    // Create rows (one per item)
+    // Create rows and update stock
     const rowsToAdd = [];
     const timestamp = getThaiDateTimeString();
     const paymentText = paymentStatus === 'paid' ? 'จ่ายแล้ว' : 'ยังไม่จ่าย';
@@ -85,21 +85,20 @@ async function createOrderTransaction(orderData) {
       // Update stock
       await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${stockInfo.rowIndex}`, [[newStock]]);
       
-      // Create order row (9 columns)
+      // Create order row (9 columns total)
       const row = [
-        orderNo,                    // A - รหัส
-        timestamp,                  // B - วันที่
-        customer,                   // C - ลูกค้า
-        item.stockItem.item,        // D - สินค้า
-        item.quantity,              // E - จำนวน
-        '',                         // F - หมายเหตุ
-        deliveryPerson,             // G - ผู้ส่ง (empty by default)
-        paymentText,                // H - จ่ายแล้วหรือยัง
+        orderNo,                              // A - รหัส
+        timestamp,                            // B - วันที่
+        customer,                             // C - ลูกค้า
+        item.stockItem.item,                  // D - สินค้า
+        item.quantity,                        // E - จำนวน
+        '',                                   // F - หมายเหตุ
+        deliveryPerson,                       // G - ผู้ส่ง
+        paymentText,                          // H - จ่ายแล้วหรือยัง
         item.quantity * item.stockItem.price  // I - ยอดเงิน
       ];
       
       rowsToAdd.push(row);
-      
       Logger.success(`📦 ${item.stockItem.item}: ${stockInfo.stock} → ${newStock}`);
     }
 
@@ -107,7 +106,7 @@ async function createOrderTransaction(orderData) {
     await appendSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I', rowsToAdd);
     await loadStockCache(true);
 
-    const totalAmount = rowsToAdd.reduce((sum, row) => sum + row[COL.AMOUNT], 0);
+    const totalAmount = rowsToAdd.reduce((sum, row) => sum + row[8], 0);
     
     Logger.success(`✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿`);
 
@@ -121,7 +120,7 @@ async function createOrderTransaction(orderData) {
         quantity: item.quantity,
         unit: item.stockItem.unit,
         unitPrice: item.stockItem.price,
-        lineTotal: rowsToAdd[idx][COL.AMOUNT],
+        lineTotal: rowsToAdd[idx][8],
         newStock: stockMap.get(`${item.stockItem.item.toLowerCase().trim()}|${item.stockItem.unit.toLowerCase().trim()}`).stock - item.quantity,
         stockItem: item.stockItem
       }))
