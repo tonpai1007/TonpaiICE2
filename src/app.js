@@ -13,7 +13,7 @@ const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { smartLearner } = require('./smartOrderLearning');
 const { handleMessage } = require('./messageHandlerService');
-const { handleVoiceMessage } = require('./voiceHandler');
+const { processVoiceMessage } = require('./voiceProcessor');
 const { verifyLineSignature } = require('./middleware/webhook-security');
 
 const app = express();
