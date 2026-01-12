@@ -1,4 +1,4 @@
-
+// src/accessControl.js - FIXED: Proper initialization
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 
@@ -72,24 +72,30 @@ class UserStore {
     this.initializeDefaultUsers();
   }
 
- initializeDefaultUsers() {
-    // Fix: Change ADMIN_USER_ID to ADMIN_USER_IDS
+  initializeDefaultUsers() {
     const adminIds = CONFIG.ADMIN_USER_IDS || [];
     
+    if (adminIds.length === 0) {
+      Logger.warn('⚠️ No admin users configured in ADMIN_USER_IDS');
+      return;
+    }
+    
     adminIds.forEach(adminId => {
-      this.users.set(adminId, {
-        userId: adminId,
-        role: ROLES.ADMIN,
-        name: 'Admin',
-        createdAt: new Date().toISOString()
-      });
-      Logger.success(`Admin user initialized: ${adminId}`);
+      if (adminId && adminId.trim()) {
+        this.users.set(adminId, {
+          userId: adminId,
+          role: ROLES.ADMIN,
+          name: 'Admin',
+          createdAt: new Date().toISOString()
+        });
+        Logger.success(`✅ Admin user initialized: ${adminId.substring(0, 8)}...`);
+      }
     });
   }
 
   addUser(userId, role = ROLES.USER, name = null) {
     if (this.users.has(userId)) {
-      Logger.warn(`User ${userId} already exists`);
+      Logger.warn(`User ${userId.substring(0, 8)}... already exists`);
       return false;
     }
 
@@ -100,7 +106,7 @@ class UserStore {
       createdAt: new Date().toISOString()
     });
 
-    Logger.success(`User added: ${userId} (${role})`);
+    Logger.success(`User added: ${userId.substring(0, 8)}... (${role})`);
     return true;
   }
 
@@ -121,7 +127,7 @@ class UserStore {
     }
 
     user.role = newRole;
-    Logger.success(`User ${userId} role updated to ${newRole}`);
+    Logger.success(`User ${userId.substring(0, 8)}... role updated to ${newRole}`);
     return true;
   }
 
@@ -131,7 +137,7 @@ class UserStore {
     }
 
     this.users.delete(userId);
-    Logger.success(`User ${userId} removed`);
+    Logger.success(`User ${userId.substring(0, 8)}... removed`);
     return true;
   }
 
@@ -156,7 +162,7 @@ class UserStore {
     }
 
     if (!granted) {
-      Logger.warn(`Access denied: ${userId} tried ${action}`);
+      Logger.warn(`Access denied: ${userId.substring(0, 8)}... tried ${action}`);
     }
   }
 
