@@ -1,4 +1,4 @@
-// app.js - UPDATED: Clean voice integration
+// app.js - FIXED: Complete with all integrations
 const express = require('express');
 const axios = require('axios');
 
@@ -13,7 +13,7 @@ const { initializeSheets } = require('./sheetInitializer');
 const { loadStockCache, loadCustomerCache } = require('./cacheManager');
 const { smartLearner } = require('./smartOrderLearning');
 const { handleMessage } = require('./messageHandlerService');
-const { handleVoiceMessage } = require('./voiceHandler'); // NEW MODULE
+const { handleVoiceMessage } = require('./voiceHandler');
 const { verifyLineSignature } = require('./middleware/webhook-security');
 
 const app = express();
@@ -68,16 +68,30 @@ async function initializeApp() {
   try {
     Logger.info('🚀 Starting Order Bot...');
     
+    // Initialize services
     initializeGoogleServices();
     initializeAIServices();
     
+    // Initialize sheets
     await initializeSheets();
+    
+    // Initialize inbox sheet structure
+    const { initializeInboxSheet } = require('./inboxService');
+    await initializeInboxSheet();
+    
+    // Load caches
     await loadStockCache(true);
     await loadCustomerCache(true);
     
+    // Initialize smart learning
     await smartLearner.loadOrderHistory();
     const stats = smartLearner.getStats();
     Logger.success(`🧠 Smart Learning: ${stats.customersLearned} customers, ${stats.totalPatterns} patterns`);
+    
+    // Start cleanup scheduler
+    const { scheduleCleanup } = require('./cleanupService');
+    scheduleCleanup();
+    Logger.success('✅ Cleanup scheduler initialized (runs at 3 AM daily)');
     
     Logger.success('✅ System Ready');
   } catch (error) {
@@ -123,6 +137,11 @@ async function pushToAdmin(text, retries = 3) {
   const adminIds = configManager.get('ADMIN_USER_IDS');
   const token = configManager.get('LINE_TOKEN');
   
+  if (!adminIds || adminIds.length === 0) {
+    Logger.warn('No admin users configured');
+    return { succeeded: 0, total: 0 };
+  }
+  
   const promises = adminIds.map(async (adminId) => {
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
@@ -140,7 +159,7 @@ async function pushToAdmin(text, retries = 3) {
         return { success: true, adminId };
       } catch (error) {
         if (attempt === retries) {
-          Logger.error(`Push to admin ${adminId} failed after ${retries} attempts`, error);
+          Logger.error(`Push to admin ${adminId.substring(0, 8)}... failed after ${retries} attempts`, error);
           return { success: false, adminId, error: error.message };
         }
         await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
@@ -175,7 +194,7 @@ async function fetchAudioFromLine(messageId) {
 }
 
 // ============================================================================
-// MESSAGE HANDLERS - SIMPLIFIED
+// MESSAGE HANDLERS
 // ============================================================================
 
 async function handleTextMessage(text, replyToken, userId) {
@@ -398,4 +417,13 @@ const server = app.listen(PORT, async () => {
   await initializeApp();
 });
 
-module.exports = { app, pushToAdmin, server };
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+module.exports = { 
+  app, 
+  pushToAdmin,
+  notifyAdmin: pushToAdmin, // Alias for cleanup service
+  server 
+};
