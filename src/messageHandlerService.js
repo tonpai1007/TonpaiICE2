@@ -163,321 +163,92 @@ async function getLastOrderNumber() {
 // ============================================================================
 // MAIN MESSAGE HANDLER
 // ============================================================================
-
 async function handleMessage(text, userId) {
   try {
     const lower = text.toLowerCase().trim();
 
-    // ========================================
-    // STOCK ADJUSTMENT (Priority #1)
-    // ========================================
-      const { handleBusinessCommand } = require('./businessCommands');
-    const businessResult = await handleBusinessCommand(text, userId);
-    if (businessResult !== null) {
-      return businessResult;
+    // 1. [PRIORITY] SYSTEM COMMANDS (เช็คแบบด่วน ไม่ต้องผ่าน AI)
+    if (lower === 'สรุป' || lower.includes('สรุปวันนี้')) return { success: true, message: await generateDailySummary() };
+    if (lower === 'inbox' || lower.includes('ประวัติ')) return { success: true, message: await generateInboxSummary(20) };
+    if (lower === 'สต็อก') return { success: true, message: await viewCurrentStock() };
+    if (lower === 'รีเฟรช') {
+      await loadStockCache(true); await loadCustomerCache(true);
+      return { success: true, message: '✅ รีเฟรชข้อมูลสำเร็จ' };
     }
+
+    // 2. [CORE] MULTI-INTENT AI PROCESSING
+    // เรียกใช้ parseOrder ตัวใหม่ที่คืนค่าเป็น ARRAY ของคำสั่ง
+    const aiResults = await parseOrder(text); 
     
-    const adjCommand = await parseAdjustmentCommand(text);
-    if (adjCommand.isAdjustment) {
-      Logger.info(`🔧 Stock adjustment: ${adjCommand.operation} ${adjCommand.item} ${adjCommand.value}`);
-      
-      const result = await adjustStock(
-        adjCommand.item,
-        adjCommand.value,
-        adjCommand.operation,
-        'manual_adjustment'
-      );
+    if (!aiResults || aiResults.length === 0) {
+      return { success: false, message: "❌ ไม่เข้าใจคำสั่ง ลองพูดใหม่ชัดๆ นะคะ" };
+    }
 
-      if (result.success) {
-        const icon = result.difference === 0 ? '➖' : result.difference > 0 ? '📈' : '📉';
-        
-        let msg = `✅ ปรับสต็อกสำเร็จ\n\n`;
-        msg += `📦 ${result.item}\n`;
-        msg += `━━━━━━━━━━━━━━\n`;
-        msg += `เดิม: ${result.oldStock} ${result.unit}\n`;
-        msg += `ใหม่: ${result.newStock} ${result.unit}\n`;
-        msg += `${icon} ส่วนต่าง: ${result.difference >= 0 ? '+' : ''}${result.difference}\n\n`;
-        msg += `💡 ${result.operationText}`;
-        
-        // Save to inbox with clear tracking
-        await saveToInbox(
-          userId, 
-          text, 
-          `ปรับสต็อก: ${result.item} ${result.oldStock}→${result.newStock} ${result.unit}`,
-          'stock'
-        );
-        
-        return { success: true, message: msg };
-      } else {
-        await saveToInbox(userId, text, result.error, 'stock_error');
-        return { success: false, message: result.error };
+    let finalResponses = [];
+
+    for (const res of aiResults) {
+      Logger.info(`🤖 Processing AI Intent: ${res.intent} for ${res.customer}`);
+
+      switch (res.intent) {
+        case 'order':
+          finalResponses.push(await executeOrderLogic(res, userId, text));
+          break;
+
+        case 'payment':
+          finalResponses.push(await executePaymentLogic(res, userId, text));
+          break;
+
+        case 'stock_adj':
+          finalResponses.push(await executeStockAdjLogic(res, userId, text));
+          break;
+
+        case 'cancel':
+          finalResponses.push(await executeCancelLogic(res, userId, text));
+          break;
       }
     }
 
-    // ========================================
-    // PAYMENT COMMAND - Enhanced with "last order" support
-    // ========================================
-    
-    const paymentMatch = text.match(/(?:จ่าย(?:เงิน|ตัง)?(?:แล้ว|เเล้ว)?)\s*(?:#?(\d+))?/i);
-    if (paymentMatch && paymentMatch[0].length >= 3) {
-      let orderNo = paymentMatch[1];
-      
-      if (!orderNo) {
-        orderNo = await getLastOrderNumber();
-        if (!orderNo) {
-          return { 
-            success: false, 
-            message: '❌ ไม่มีออเดอร์ในระบบ\n\n💡 สร้างออเดอร์ก่อนนะ!' 
-          };
-        }
-        Logger.info(`💡 Using last order: #${orderNo}`);
-      }
-      
-      const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
-
-      if (result.success) {
-        await saveToInbox(
-          userId, 
-          text, 
-          `ชำระเงิน #${orderNo} - ${result.customer} - ${result.totalAmount?.toLocaleString()}฿`,
-          'payment'
-        );
-        return { 
-          success: true, 
-          message: formatPaymentSuccess(result.orderNo, result.customer, result.totalAmount)
-        };
-      } else {
-        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'payment_error');
-        return { success: false, message: formatError('order_not_found', { orderNo }) };
-      }
-    }
-
-    // ========================================
-    // DELIVERY COMMAND - Enhanced
-    // ========================================
-    
-    const deliveryMatch = text.match(/ส่ง\s*(?:#?(\d+))?\s*(.+)?/i);
-    if (deliveryMatch && deliveryMatch[0].length >= 2) {
-      let orderNo = deliveryMatch[1];
-      const deliveryPerson = deliveryMatch[2]?.trim() || null;
-      
-      if (!deliveryPerson) {
-        return {
-          success: false,
-          message: '❌ กรุณาระบุชื่อคนส่ง\n\n' +
-                   '💡 ตัวอย่าง:\n' +
-                   `• "ส่ง พี่แดง" - ส่งออเดอร์ล่าสุด\n` +
-                   `• "ส่ง #123 พี่แดง" - ส่งออเดอร์ระบุ`
-        };
-      }
-      
-      if (!orderNo) {
-        orderNo = await getLastOrderNumber();
-        if (!orderNo) {
-          return { 
-            success: false, 
-            message: '❌ ไม่มีออเดอร์ในระบบ' 
-          };
-        }
-        Logger.info(`💡 Using last order: #${orderNo}`);
-      }
-      
-      const result = await updateDeliveryPerson(orderNo, deliveryPerson);
-
-      if (result.success) {
-        await saveToInbox(
-          userId, 
-          text, 
-          `จัดส่ง #${orderNo} โดย ${deliveryPerson} - ${result.customer}`,
-          'delivery'
-        );
-        
-        let msg = `✅ บันทึกการจัดส่งสำเร็จ\n\n`;
-        msg += `📋 ออเดอร์ #${orderNo}\n`;
-        msg += `👤 ลูกค้า: ${result.customer}\n`;
-        msg += `🚚 ส่งโดย: ${deliveryPerson}\n`;
-        msg += `💰 จำนวนเงิน: ${result.totalAmount?.toLocaleString() || 0}฿\n\n`;
-        
-        if (result.paymentStatus !== 'จ่ายแล้ว') {
-          msg += `⚠️ ยังไม่ได้รับเงิน\n💡 พิมพ์ "จ่าย" เมื่อรับเงินแล้ว`;
-        } else {
-          msg += `✅ รับเงินแล้ว`;
-        }
-        
-        return { success: true, message: msg };
-      } else {
-        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'delivery_error');
-        return { success: false, message: formatError('order_not_found', { orderNo }) };
-      }
-    }
-
-    // ========================================
-    // CANCEL COMMAND - ENHANCED: Support "ยกเลิก" without number
-    // ========================================
-    
-    const cancelMatch = text.match(/ยกเลิก\s*(?:#?(\d+))?/i);
-    if (cancelMatch) {
-      let orderNo = cancelMatch[1];
-      
-      // If no order number specified, use last order
-      if (!orderNo) {
-        orderNo = await getLastOrderNumber();
-        if (!orderNo) {
-          return { 
-            success: false, 
-            message: '❌ ไม่มีออเดอร์ในระบบ\n\n💡 สร้างออเดอร์ก่อนนะ!' 
-          };
-        }
-        Logger.info(`💡 Cancelling last order: #${orderNo}`);
-      }
-      
-      const result = await cancelOrder(orderNo);
-
-      if (result.success) {
-        await saveToInbox(
-          userId, 
-          text, 
-          `ยกเลิกออเดอร์ #${orderNo} - ${result.customer} - คืนสต็อก ${result.stockRestored.length} รายการ`,
-          'cancel'
-        );
-        monitor.recordCancellation(orderNo, true);
-        return { 
-          success: true, 
-          message: formatCancelSuccess(orderNo, result.customer, result.stockRestored) 
-        };
-      } else {
-        await saveToInbox(userId, text, `ไม่พบออเดอร์ #${orderNo}`, 'cancel_error');
-        return { success: false, message: formatError('order_not_found', { orderNo }) };
-      }
-    }
-
-    // ========================================
-    // VIEW DELIVERY STATUS
-    // ========================================
-    
-    if (lower.includes('สถานะ') || lower.includes('ดูการส่ง')) {
-      const deliveryStatus = await viewDeliveryStatus();
-      return { success: true, message: deliveryStatus };
-    }
-
-    // ========================================
-    // ENHANCED SYSTEM COMMANDS
-    // ========================================
-    
-    if (lower === 'สรุป' || lower.includes('สรุปวันนี้') || lower === 'summary') {
-      const summary = await generateDailySummary();
-      return { success: true, message: summary };
-    }
-
-    if (lower === 'inbox' || lower.includes('ดูinbox') || lower.includes('ประวัติ')) {
-      const inboxSummary = await generateInboxSummary(20); // Show more items
-      return { success: true, message: inboxSummary };
-    }
-
-    if (lower === 'help' || lower === 'ช่วยเหลือ' || lower === '?') {
-      return { 
-        success: true, 
-        message: `🤖 คำสั่งที่ใช้ได้\n` +
-                `${'='.repeat(35)}\n\n` +
-                `📦 รับออเดอร์:\n` +
-                `• "น้ำแข็ง 5 ถุง ร้านเจ๊แดง"\n` +
-                `• "ลูกค้า: พี่ไก่, น้ำแข็ง 3"\n\n` +
-                `💰 การเงิน:\n` +
-                `• "จ่าย" - จ่ายออเดอร์ล่าสุด\n` +
-                `• "จ่าย #123" - จ่ายออเดอร์ระบุ\n\n` +
-                `🚚 การส่ง:\n` +
-                `• "ส่ง พี่แดง" - ส่งออเดอร์ล่าสุด\n` +
-                `• "ส่ง #123 พี่แดง" - ส่งออเดอร์ระบุ\n` +
-                `• "สถานะ" - ดูสถานะการส่ง\n\n` +
-                `❌ ยกเลิกออเดอร์:\n` +
-                `• "ยกเลิก" - ยกเลิกออเดอร์ล่าสุด\n` +
-                `• "ยกเลิก #123" - ยกเลิกออเดอร์ระบุ\n\n` +
-                `🔧 จัดการสต็อก:\n` +
-                `• "น้ำแข็ง มี 50" - ตั้งค่าสต็อก\n` +
-                `• "เติมน้ำแข็ง 20" - เพิ่มสต็อก\n` +
-                `• "ลดน้ำแข็ง 10" - ลดสต็อก\n` +
-                `• "สต็อก" - ดูสต็อกทั้งหมด\n\n` +
-                `📊 รายงาน:\n` +
-                `• "สรุป" - สรุปยอดขายวันนี้\n` +
-                `• "inbox" - ดูประวัติคำสั่ง\n` +
-                `• "รายงานสต็อก" - ดูการปรับสต็อก\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                `💡 TIP: คำสั่งส่วนใหญ่ทำงานกับ\n` +
-                `    ออเดอร์ล่าสุดถ้าไม่ระบุเลข!`
-      };
-    }
-
-    if (lower.includes('สต็อก') && !lower.includes('รายงาน')) {
-      const searchTerm = text.replace(/สต็อก|ดู/gi, '').trim();
-      const stockList = await viewCurrentStock(searchTerm || null);
-      return { success: true, message: stockList };
-    }
-
-    if (lower.includes('รายงานสต็อก')) {
-      const report = await generateVarianceReport('today');
-      return { success: true, message: report };
-    }
-
-    if (lower === 'รีเฟรช' || lower === 'refresh') {
-      await loadStockCache(true);
-      await loadCustomerCache(true);
-      return { success: true, message: '✅ รีเฟรชข้อมูลสำเร็จ\n\n💡 ข้อมูลสต็อกและลูกค้าอัปเดตแล้ว' };
-    }
-
-    // ========================================
-    // ORDER PROCESSING (Last resort)
-    // ========================================
-    
-    const parsed = await parseOrder(text);
-    
-    if (!parsed.success || !parsed.items || parsed.items.length === 0) {
-      await saveToInbox(userId, text, 'ไม่เข้าใจคำสั่ง', 'parse_failed');
-      return await handleUnparseableOrder(text, parsed, userId);
-    }
-
-    if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
-      await smartLearner.loadOrderHistory();
-      
-      const exactMatch = smartLearner.findExactOrderMatch(parsed.customer, parsed.items);
-      
-      if (exactMatch) {
-        Logger.success(`🎯 EXACT REPEAT ORDER: ${exactMatch.customer}`);
-        return await createOrderDirectly(
-          exactMatch.customer,
-          parsed.items,
-          'high',
-          exactMatch.message,
-          userId,
-          text
-        );
-      }
-
-      const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
-      
-      if (prediction.success && prediction.confidence === 'high' && prediction.matchRate >= 0.8) {
-        Logger.success(`🧠 HIGH CONFIDENCE from history: ${(prediction.matchRate * 100).toFixed(0)}%`);
-        return await createOrderDirectly(
-          prediction.customer,
-          parsed.items,
-          'high',
-          prediction.message,
-          userId,
-          text
-        );
-      }
-    }
-
-    return await processWithAutomationRules(parsed, userId, text);
+    return { 
+      success: true, 
+      message: finalResponses.join('\n\n' + '━'.repeat(15) + '\n\n') 
+    };
 
   } catch (error) {
     Logger.error('handleMessage error', error);
-    await saveToInbox(userId, text, 'error');
-    return { 
-      success: false, 
-      message: '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง\n\n' +
-               `💡 ถ้าปัญหายังคงอยู่ พิมพ์ "help" เพื่อดูคำสั่งที่ถูกต้อง`
-    };
+    return { success: false, message: '❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้งค่ะ' };
   }
+}
+
+// ============================================================================
+// EXECUTION HELPERS (ผสานสมอง AI เข้ากับ Logic เดิมของนาย)
+// ============================================================================
+
+async function executeOrderLogic(parsed, userId, rawInput) {
+  // ตรวจสอบ Smart Learning ก่อน (ฟีเจอร์เดิมของนาย)
+  if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
+    await smartLearner.loadOrderHistory();
+    const exactMatch = smartLearner.findExactOrderMatch(parsed.customer, parsed.items);
+    if (exactMatch) return (await createOrderDirectly(parsed.customer, parsed.items, 'high', exactMatch.message, userId, rawInput)).message;
+  }
+  
+  // เข้าสู่ระบบ Automation Rules (Decision Engine เดิม)
+  return (await processWithAutomationRules(parsed, userId)).message;
+}
+
+async function executePaymentLogic(res, userId, rawInput) {
+  const { getLastOrderNumber } = require('./orderService');
+  let orderNo = res.orderNo || await getLastOrderNumber();
+  const result = await updateOrderPaymentStatus(orderNo, 'จ่ายแล้ว');
+  return result.success ? `✅ จ่ายเงินออเดอร์ #${orderNo} (${result.customer}) แล้ว` : `❌ ไม่พบออเดอร์ที่จะจ่ายเงิน`;
+}
+
+async function executeStockAdjLogic(res, userId, rawInput) {
+  let reports = [];
+  for (const item of res.items) {
+    const adj = await adjustStock(item.stockItem.item, item.quantity, res.operation || 'set', 'AI_Adjustment');
+    if (adj.success) reports.push(`📦 ${adj.item}: ${adj.oldStock} → ${adj.newStock}`);
+  }
+  return `✅ ปรับสต็อกสำเร็จ:\n${reports.join('\n')}`;
 }
 
 // ============================================================================
