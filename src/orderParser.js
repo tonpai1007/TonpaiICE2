@@ -94,73 +94,34 @@ async function parseOrder(userInput) {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
-  if (stockCache.length === 0) {
-    return { success: false, error: '❌ ไม่มีข้อมูลสต็อก' };
-  }
+  if (stockCache.length === 0) return { success: false, error: '❌ สต็อกว่างเปล่าเหมือนสมองนายเลย!' };
 
   try {
-    // Normalize input
-    const normalizedInput = normalizeOrderInput(userInput);
-    
-    // Extract price hints from input
-    const priceHints = extractPriceHints(userInput);
-    
-    // Build smart stock list with price-based grouping
-    const stockList = buildSmartStockList(stockCache, priceHints);
+    const stockContext = stockCache.map((item, idx) => 
+      `ID:${idx} | ${item.item} | ราคา:${item.price}฿ | สต็อก:${item.stock}`
+    ).join('\n');
 
-    const customerList = customerCache.slice(0, 50).map(c => c.name).join(', ');
+    const prompt = `คุณเป็น AI อัจฉริยะที่ทำหน้าที่แยกแยะคำสั่งซื้อจาก "คำพูด" หรือ "ข้อความ" ของคนไทย
+และนี่คือข้อมูลสต็อกปัจจุบัน:
+${stockContext}
 
-    const prompt = `You are an expert Thai order parser with SMART PRICE MATCHING.
+ลูกค้าที่รู้จัก: ${customerCache.map(c => c.name).join(', ')}
 
-STOCK CATALOG WITH PRICE HINTS:
-${stockList}
+ข้อความจากผู้ใช้: "${userInput}"
 
-KNOWN CUSTOMERS: ${customerList}
+หน้าที่ของคุณ:
+1. วิเคราะห์เจตนา (Intent): เขาสั่งของ, ปรับสต็อก หรือแค่ทักทาย?
+2. ใช้ Fuzzy Matching ขั้นสูง: "บด" อาจหมายถึง "น้ำแข็งบด", "ลีโอ" หมายถึง "เบียร์ลีโอ"
+3. แยกแยะราคา: ถ้าเขาบอกว่า "บด 40" ให้หาอันที่ราคา 40฿ จริงๆ
+4. เข้าใจภาษาพูด: "เอาถุงใหญ่สอง" = { quantity: 2, item: "ถุงใหญ่" }
 
-USER INPUT: "${normalizedInput}"
-
-CRITICAL PRICE MATCHING RULES:
-1. If user mentions price (e.g., "บด 40 บาท"), find the stock item that EXACTLY matches that price
-2. Example: "บด 40" should match "บดหยาบ" (40฿) NOT "บดละเอียด" (30฿)
-3. If no exact price match, use closest match by name
-4. Set "priceMatchUsed": true if you used price to disambiguate
-
-IMPORTANT PATTERNS TO RECOGNIZE:
-- "น้ำแข็ง 2 ถุง" = ice 2 bags
-- "น้ำแข็งมี 5" = ice 5 (quantity)
-- "เอา 3 น้ำแข็ง" = take 3 ice
-
-CONFIDENCE RULES (return "high" if ALL true):
-1. Customer name is clearly mentioned (even if not in known customers list)
-2. Item name matches stock catalog clearly (fuzzy match OK)
-3. Quantity is explicitly stated with number
-4. No ambiguous words like "บางที", "คิดว่า", "อาจจะ"
-
-CUSTOMER MATCHING RULES:
-- If customer name is mentioned at the start → USE IT (even if not in known customers)
-- Examples: "แฟน", "พี่ใหม่", "คุณสมชาย", "ร้านป้าไก่"
-- ONLY use "ไม่ระบุ" if absolutely NO customer name is mentioned
-
-FUZZY MATCHING:
-- "น้ำแข็ง" matches "น้ำแข็งหลอด", "น้ำแข็งก้อน"
-- "เบียร์" matches "เบียร์ลีโอ", "เบียร์ช้าง"
-- Numbers: "ห้า"=5, "สิบ"=10
-
-OUTPUT JSON:
+ตอบกลับเป็น JSON เท่านั้น:
 {
-  "customer": "ชื่อลูกค้าที่พูดมา หรือ ไม่ระบุ ถ้าไม่มีเลย",
-  "items": [
-    {
-      "stockId": 0,
-      "quantity": 2,
-      "matchConfidence": "exact|fuzzy|guess",
-      "priceMatchUsed": false,
-      "mentionedPrice": 40
-    }
-  ],
-  "paymentStatus": "unpaid or credit",
-  "confidence": "high or medium or low",
-  "reasoning": "why this confidence level"
+  "customer": "ชื่อลูกค้า (ถ้ามี)",
+  "items": [{ "stockId": index, "quantity": number, "matchConfidence": "exact/fuzzy" }],
+  "paymentStatus": "unpaid/credit",
+  "confidence": "high/medium/low",
+  "reasoning": "อธิบายสั้นๆ ว่าทำไมถึงเข้าใจแบบนั้น"
 }`;
 
     const result = await generateWithGroq(prompt, true);
