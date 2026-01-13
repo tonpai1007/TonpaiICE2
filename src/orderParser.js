@@ -1,169 +1,98 @@
-// orderParser.js - COMPLETE: With all required imports
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
-const { normalizeText } = require('./utils');
 
-// ============================================================================
-// INPUT NORMALIZATION
-// ============================================================================
+// --- Helper Functions ที่คุณต้องการ (ย้ายมาไว้ที่นี่เพื่อให้เรียกใช้ง่าย) ---
 
 function normalizeOrderInput(text) {
-  // Transform "น้ำแข็งมี 5 ถุง" → "น้ำแข็ง 5 ถุง"
-  // Transform "น้ำแข็ง มี 5" → "น้ำแข็ง 5"
+  // เปลี่ยน "น้ำแข็งมี 5" -> "น้ำแข็ง 5" เพื่อลด Noise ให้ AI
   let normalized = text.replace(/\s*มี\s*/g, ' ').trim();
-  
-  // Remove extra spaces
   normalized = normalized.replace(/\s+/g, ' ');
-  
-  Logger.info(`📝 Normalized: "${text}" → "${normalized}"`);
   return normalized;
 }
 
-// ============================================================================
-// EXTRACT PRICE HINTS
-// ============================================================================
-
 function extractPriceHints(text) {
   const hints = [];
-  
-  // Pattern: "บด 40 บาท" → {keyword: "บด", price: 40}
   const matches = text.matchAll(/([ก-๙a-z]+)\s+(\d+)\s*(?:บาท|฿)/gi);
-  
   for (const match of matches) {
-    hints.push({
-      keyword: match[1].toLowerCase(),
-      price: parseInt(match[2])
-    });
+    hints.push({ keyword: match[1].toLowerCase(), price: parseInt(match[2]) });
   }
-  
-  if (hints.length > 0) {
-    Logger.info(`💡 Price hints extracted: ${JSON.stringify(hints)}`);
-  }
-  
   return hints;
 }
 
-// ============================================================================
-// BUILD SMART STOCK LIST
-// ============================================================================
-
 function buildSmartStockList(stockCache, priceHints) {
-  // Group items by price when hints exist
-  const grouped = new Map();
-  
-  stockCache.forEach((item, idx) => {
-    const key = `${item.price}฿`;
-    if (!grouped.has(key)) {
-      grouped.set(key, []);
-    }
-    grouped.get(key).push({ item, idx });
-  });
-  
+  // จัดลำดับสินค้าที่มีราคาตรงกับคำใบ้ (Price Hints) ขึ้นก่อน
   let stockList = '';
-  
-  // If price hints exist, prioritize those prices
   if (priceHints.length > 0) {
-    stockList += '🎯 PRICE-MATCHED ITEMS (use these first):\n';
-    
+    stockList += '🎯 [PRIORITY MATCHES - รายการที่ราคาตรงกับที่พูด]:\n';
     priceHints.forEach(hint => {
-      const matchingItems = grouped.get(`${hint.price}฿`) || [];
-      matchingItems.forEach(({ item, idx }) => {
-        if (item.item.toLowerCase().includes(hint.keyword)) {
-          stockList += `[${idx}] ⭐ ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+      stockCache.forEach((item, idx) => {
+        if (item.price === hint.price && item.item.includes(hint.keyword)) {
+          stockList += `ID:${idx} | ⭐ ${item.item} | ${item.price}฿ | สต็อก:${item.stock}\n`;
         }
       });
     });
-    
-    stockList += '\nALL OTHER ITEMS:\n';
+    stockList += '\n[ALL OTHER ITEMS]:\n';
   }
   
-  // Regular list
   stockCache.forEach((item, idx) => {
-    stockList += `[${idx}] ${item.item} | ${item.unit} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+    stockList += `ID:${idx} | ${item.item} | ${item.price}฿ | สต็อก:${item.stock}\n`;
   });
-  
   return stockList;
 }
 
-// ============================================================================
-// MAIN PARSE ORDER FUNCTION
-// ============================================================================
+// --- ฟังก์ชันหลักที่รองรับ Multi-order ---
 
 async function parseOrder(userInput) {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
-  if (stockCache.length === 0) return { success: false, error: '❌ สต็อกว่างเปล่าเหมือนสมองนายเลย!' };
+  // 1. เตรียมข้อมูลด้วย Helpers
+  const normalizedInput = normalizeOrderInput(userInput);
+  const priceHints = extractPriceHints(userInput);
+  const smartCatalog = buildSmartStockList(stockCache, priceHints);
 
-  try {
-    const stockContext = stockCache.map((item, idx) => 
-      `ID:${idx} | ${item.item} | ราคา:${item.price}฿ | สต็อก:${item.stock}`
-    ).join('\n');
-
-    const prompt = `คุณเป็น AI อัจฉริยะที่ทำหน้าที่แยกแยะคำสั่งซื้อจาก "คำพูด" หรือ "ข้อความ" ของคนไทย
-และนี่คือข้อมูลสต็อกปัจจุบัน:
-${stockContext}
+  const prompt = `คุณคือ AI อัจฉริยะวิเคราะห์คำสั่งซื้อไทย (Multi-Order Parser)
+คลังสินค้า (จัดลำดับตามราคาที่ระบุมา):
+${smartCatalog}
 
 ลูกค้าที่รู้จัก: ${customerCache.map(c => c.name).join(', ')}
 
-ข้อความจากผู้ใช้: "${userInput}"
+ข้อความดิบ: "${userInput}"
+ข้อความที่ปรับแต่ง: "${normalizedInput}"
 
-หน้าที่ของคุณ:
-1. วิเคราะห์เจตนา (Intent): เขาสั่งของ, ปรับสต็อก หรือแค่ทักทาย?
-2. ใช้ Fuzzy Matching ขั้นสูง: "บด" อาจหมายถึง "น้ำแข็งบด", "ลีโอ" หมายถึง "เบียร์ลีโอ"
-3. แยกแยะราคา: ถ้าเขาบอกว่า "บด 40" ให้หาอันที่ราคา 40฿ จริงๆ
-4. เข้าใจภาษาพูด: "เอาถุงใหญ่สอง" = { quantity: 2, item: "ถุงใหญ่" }
+หน้าที่:
+1. แยกข้อความออกเป็น "ARRAY ของชุดคำสั่ง"
+2. รองรับหลายร้าน/หลายไอเทม เช่น "น้ำแข็ง 2 ถุง เจ๊แดง แล้วก็โค้ก 5 ขวด พี่ใหม่"
+3. วิเคราะห์ Intent: 'order', 'payment', 'stock_adj'
+4. ใช้ Price Hints: ถ้ามีระบุราคามา ให้จับคู่ ID สินค้าที่มีราคานั้นเท่านั้น
 
-ตอบกลับเป็น JSON เท่านั้น:
-{
-  "customer": "ชื่อลูกค้า (ถ้ามี)",
-  "items": [{ "stockId": index, "quantity": number, "matchConfidence": "exact/fuzzy" }],
-  "paymentStatus": "unpaid/credit",
-  "confidence": "high/medium/low",
-  "reasoning": "อธิบายสั้นๆ ว่าทำไมถึงเข้าใจแบบนั้น"
-}`;
+ตอบเป็น JSON ARRAY เท่านั้น:
+[
+  {
+    "intent": "order|payment|stock_adj",
+    "customer": "ชื่อลูกค้า",
+    "items": [{"stockId": 0, "quantity": 1}],
+    "confidence": "high|medium|low",
+    "reasoning": "อธิบายสั้นๆ"
+  }
+]`;
 
-    const result = await generateWithGroq(prompt, true);
-    return Array.isArray(results) ? results : [results];
-    result.rawInput = userInput; 
+  try {
+    const results = await generateWithGroq(prompt, true);
+    const parsedArray = Array.isArray(results) ? results : [results];
 
-    const mappedItems = [];
-    const matchDetails = [];
-    
- 
-    const boostedConfidence = boostConfidence(result, mappedItems, normalizedInput, customerCache);
-
-    if (matchDetails.length > 0) {
-      Logger.info(`🎯 Match details: ${JSON.stringify(matchDetails)}`);
-    }
-
-    Logger.info(
-      `📝 Parsed: ${mappedItems.length} items | ` +
-      `Base: ${result.confidence} → Boosted: ${boostedConfidence} | ` +
-      `Reason: ${result.reasoning}`
-    );
-
-    return {
-      success: mappedItems.length > 0,
-      customer: result.customer || 'ไม่ระบุ',
-      items: mappedItems,
-      paymentStatus: result.paymentStatus || 'unpaid',
-      confidence: boostedConfidence,
-      baseConfidence: result.confidence,
-      reasoning: result.reasoning,
-      matchDetails: matchDetails,
-      rawInput: userInput,
-      action: 'order'
-    };
-
+    return parsedArray.map(res => ({
+      ...res,
+      items: (res.items || []).map(i => ({
+        stockItem: stockCache[i.stockId],
+        quantity: i.quantity || 1
+      })).filter(i => i.stockItem),
+      rawInput: userInput
+    }));
   } catch (error) {
-    Logger.error('Parse failed', error);
-    return {
-      success: false,
-      error: '❌ AI ไม่เข้าใจคำสั่ง',
-      confidence: 'low'
-    };
+    Logger.error('Multi-parse failed', error);
+    return [{ success: false, error: 'AI Error' }];
   }
 }
 
@@ -245,3 +174,4 @@ module.exports = {
   extractPriceHints,
   buildSmartStockList
 };
+
