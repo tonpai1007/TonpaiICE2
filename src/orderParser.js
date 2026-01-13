@@ -125,40 +125,13 @@ ${stockContext}
 }`;
 
     const result = await generateWithGroq(prompt, true);
+    return Array.isArray(results) ? results : [results];
     result.rawInput = userInput; 
 
     const mappedItems = [];
     const matchDetails = [];
     
-    if (result.items && Array.isArray(result.items)) {
-      for (const item of result.items) {
-        if (item.stockId >= 0 && item.stockId < stockCache.length) {
-          const stockItem = stockCache[item.stockId];
-          
-          // Track how item was matched
-          const matchInfo = {
-            item: stockItem.item,
-            method: item.priceMatchUsed ? 'price' : 'name',
-            confidence: item.matchConfidence
-          };
-          
-          if (item.mentionedPrice) {
-            matchInfo.mentionedPrice = item.mentionedPrice;
-            matchInfo.actualPrice = stockItem.price;
-            matchInfo.priceMatch = item.mentionedPrice === stockItem.price;
-          }
-          
-          matchDetails.push(matchInfo);
-          
-          mappedItems.push({
-            stockItem: stockItem,
-            quantity: item.quantity || 1,
-            matchConfidence: item.matchConfidence || 'exact'
-          });
-        }
-      }
-    }
-
+ 
     const boostedConfidence = boostConfidence(result, mappedItems, normalizedInput, customerCache);
 
     if (matchDetails.length > 0) {
