@@ -1,4 +1,4 @@
-// inboxService.js - BETTER: Track user speech and show clear results
+// inboxService.js - SIMPLIFIED: Only timestamp + raw transcript (2 columns)
 
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
@@ -7,31 +7,20 @@ const { appendSheetData, getSheetData, updateSheetData } = require('./googleServ
 const { loadStockCache } = require('./cacheManager');
 
 // ============================================================================
-// INBOX STRUCTURE: Track what user said and what happened
-// Columns: วันที่/เวลา | คำพูด/ข้อความ | ผลลัพธ์ | ประเภท
+// INBOX STRUCTURE: Only 2 columns - วันที่/เวลา | ข้อความดิบ
 // ============================================================================
 
-async function saveToInbox(userId, userInput, result, type = 'text') {
+async function saveToInbox(userId, userInput) {
   try {
     const timestamp = getThaiDateTimeString();
-    let userMessage = userInput;
-    let systemResult = result;
-    let category = type;
-    
-    // Clean and format
-    if (typeof result === 'object' && result.message) {
-      systemResult = result.message.substring(0, 200); // Limit length
-    }
     
     const row = [
       timestamp,           // A - วันที่/เวลา
-      userMessage,         // B - คำพูด/ข้อความ
-      systemResult,        // C - ผลลัพธ์
-      category            // D - ประเภท
+      userInput           // B - ข้อความดิบจากผู้ใช้
     ];
 
-    await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A:D', [row]);
-    Logger.success(`📥 Saved to Inbox: ${category}`);
+    await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A:B', [row]);
+    Logger.success(`📥 Saved to Inbox: "${userInput.substring(0, 50)}..."`);
     return true;
   } catch (error) {
     Logger.error('saveToInbox failed', error);
@@ -40,7 +29,7 @@ async function saveToInbox(userId, userInput, result, type = 'text') {
 }
 
 // ============================================================================
-// CANCEL ORDER - With better tracking
+// CANCEL ORDER - With stock restoration
 // ============================================================================
 
 async function cancelOrder(orderNo) {
@@ -107,14 +96,6 @@ async function cancelOrder(orderNo) {
 
     await loadStockCache(true);
 
-    // Save to inbox
-    await saveToInbox(
-      'system', 
-      `ยกเลิก #${orderNo}`,
-      `ยกเลิกออเดอร์ #${orderNo} (${customer}) สำเร็จ - คืนสต็อก ${stockRestored.length} รายการ`,
-      'cancel'
-    );
-
     Logger.success(`✅ Cancelled order #${orderNo}`);
 
     return {
@@ -131,64 +112,45 @@ async function cancelOrder(orderNo) {
 }
 
 // ============================================================================
-// GENERATE INBOX SUMMARY - Human readable
+// GENERATE INBOX SUMMARY - Simple transcript view
 // ============================================================================
 
 async function generateInboxSummary(limit = 30) {
   try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'Inbox!A:D');
+    const rows = await getSheetData(CONFIG.SHEET_ID, 'Inbox!A:B');
     
     if (rows.length <= 1) {
       return '📝 Inbox ว่างเปล่า\n\n' +
              '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n' +
              '💡 ยังไม่มีกิจกรรมในระบบ\n' +
-             'ประวัติคำสั่งจะแสดงที่นี่';
+             'บันทึกการสนทนาจะแสดงที่นี่';
     }
 
     const messages = rows.slice(1)
       .slice(-limit)
       .reverse();
 
-    let msg = `📝 ประวัติการใช้งาน\n`;
+    let msg = `📝 บันทึกการสนทนา\n`;
     msg += `${'='.repeat(40)}\n`;
     msg += `แสดง ${messages.length} รายการล่าสุด\n\n`;
 
     messages.forEach((row, idx) => {
       const timestamp = row[0] || '';
       const userInput = row[1] || '';
-      const result = row[2] || '';
-      const type = row[3] || '';
       
       // Extract time only
-      const time = timestamp.split(' ')[1]?.substring(0, 5) || timestamp;
+      const time = timestamp.split(' ')[1]?.substring(0, 5) || timestamp.substring(11, 16);
+      const date = timestamp.split(' ')[0] || '';
       
-      // Get icon based on type and result
-      let icon = '📝';
-      if (type === 'order' || result.includes('บันทึกออเดอร์สำเร็จ')) {
-        icon = '✅';
-      } else if (type === 'cancel' || result.includes('ยกเลิก')) {
-        icon = '❌';
-      } else if (type === 'stock' || userInput.includes('เติม') || userInput.includes('มี')) {
-        icon = '📦';
-      } else if (type === 'payment' || userInput.includes('จ่าย')) {
-        icon = '💰';
-      } else if (type === 'delivery' || userInput.includes('ส่ง')) {
-        icon = '🚚';
-      } else if (result.includes('ไม่') || result.includes('❌')) {
-        icon = '⚠️';
+      msg += `[${time}] ${userInput}\n`;
+      
+      // Add separator every 5 messages for readability
+      if ((idx + 1) % 5 === 0 && idx < messages.length - 1) {
+        msg += `\n`;
       }
-      
-      msg += `${icon} [${time}]\n`;
-      msg += `   พูด: "${userInput}"\n`;
-      
-      // Show result (truncated)
-      const resultShort = result.length > 60 
-        ? result.substring(0, 60) + '...' 
-        : result;
-      msg += `   → ${resultShort}\n\n`;
     });
 
-    msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `📊 ทั้งหมด ${rows.length - 1} รายการในระบบ`;
 
     return msg;
@@ -200,7 +162,7 @@ async function generateInboxSummary(limit = 30) {
 }
 
 // ============================================================================
-// INITIALIZE INBOX SHEET (if needed)
+// INITIALIZE INBOX SHEET (2 columns only)
 // ============================================================================
 
 async function initializeInboxSheet() {
@@ -210,13 +172,11 @@ async function initializeInboxSheet() {
     
     if (!sheets.includes('Inbox')) {
       await createSheet(CONFIG.SHEET_ID, 'Inbox');
-      await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A1:D1', [[
+      await appendSheetData(CONFIG.SHEET_ID, 'Inbox!A1:B1', [[
         'วันที่/เวลา',
-        'คำพูด/ข้อความ',
-        'ผลลัพธ์',
-        'ประเภท'
+        'ข้อความ'
       ]]);
-      Logger.success('✅ Created Inbox sheet with new structure');
+      Logger.success('✅ Created Inbox sheet (2 columns: timestamp + message)');
     }
   } catch (error) {
     Logger.warn('Inbox sheet init warning', error);
