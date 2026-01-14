@@ -1,4 +1,4 @@
-// stockAdjustment.js - ENHANCED: Better keyword matching + price hints
+// stockAdjustment.js - FIXED: Price hint extraction & better pattern matching
 
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
@@ -16,7 +16,6 @@ function extractStockKeywords(itemName) {
   
   keywords.add(normalized);
   
-  // Add word tokens
   const tokens = itemName.split(/\s+/);
   tokens.forEach(token => {
     const norm = normalizeText(token);
@@ -25,7 +24,6 @@ function extractStockKeywords(itemName) {
     }
   });
   
-  // Thai number words
   const thaiNumbers = {
     'หนึ่ง': '1', 'สอง': '2', 'สาม': '3', 'สี่': '4', 'ห้า': '5',
     'หก': '6', 'เจ็ด': '7', 'แปด': '8', 'เก้า': '9', 'สิบ': '10'
@@ -37,7 +35,6 @@ function extractStockKeywords(itemName) {
     }
   }
   
-  // Common item variations
   const variations = {
     'น้ำแข็ง': ['นำเข็ง', 'น้ำแข็ง', 'ice', 'แข็ง'],
     'หลอด': ['tube', 'ท่อ'],
@@ -67,6 +64,9 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
   const keywords = extractStockKeywords(searchTerm);
   
   Logger.info(`🔍 Searching: "${searchTerm}" (keywords: ${keywords.join(', ')})`);
+  if (priceHint) {
+    Logger.info(`💰 Price hint: ${priceHint}฿`);
+  }
   
   const matches = [];
   
@@ -90,15 +90,16 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
     const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
     score += overlap * 20;
     
-    // Price hint match (BOOST)
+    // Price hint match (HEAVY BOOST)
     if (priceHint && item.price === priceHint) {
-      score += 200; // Heavy boost for price match
-      Logger.success(`🎯 Price match: ${item.item} @ ${priceHint}฿`);
+      score += 200;
+      Logger.success(`🎯 Exact price match: ${item.item} @ ${priceHint}฿`);
     }
     
     // Fuzzy price match (within 10%)
     if (priceHint && Math.abs(item.price - priceHint) <= (priceHint * 0.1)) {
       score += 100;
+      Logger.info(`💡 Close price match: ${item.item} @ ${item.price}฿ (hint: ${priceHint}฿)`);
     }
     
     if (score > 0) {
@@ -106,7 +107,6 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
     }
   }
   
-  // Sort by score
   matches.sort((a, b) => b.score - a.score);
   
   if (matches.length > 0) {
@@ -117,19 +117,19 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
 }
 
 // ============================================================================
-// ENHANCED COMMAND PARSER
+// ENHANCED COMMAND PARSER (FIXED)
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
   const stockCache = getStockCache();
   
-  // Must have at least one number
+  // Extract all numbers
   const numbers = text.match(/\d+/g);
   if (!numbers || numbers.length === 0) {
     return { isAdjustment: false, reason: 'no_number' };
   }
   
-  // Detect operation keywords (boost score if found)
+  // Detect operation keywords
   let operation = 'set';
   let hasOperationKeyword = false;
   const lower = text.toLowerCase();
@@ -145,32 +145,54 @@ async function parseAdjustmentCommand(text) {
     hasOperationKeyword = true;
   }
   
-  // If no operation keyword found, this might not be a stock adjustment
+  // If no operation keyword, check if it looks like an order
   if (!hasOperationKeyword) {
-    // Check if it looks more like an order
     if (lower.includes('สั่ง') || lower.includes('จำนวน') || 
-        lower.includes('ถุง') || lower.includes('ขวด')) {
+        lower.includes('ถุง') || lower.includes('ขวด') ||
+        lower.includes('ร้าน') || lower.includes('คุณ') || lower.includes('พี่')) {
       return { isAdjustment: false, reason: 'looks_like_order' };
     }
   }
   
-  // Extract product name and values
+  // ✅ FIX: Better price hint detection
   let productName = text;
-  let value = parseInt(numbers[numbers.length - 1]); // Last number is usually quantity
+  let value = null;
   let priceHint = null;
   
-  // Check if there's a price hint (pattern: [item] [price] [quantity])
-  if (numbers.length >= 2) {
-    const possiblePrice = parseInt(numbers[numbers.length - 2]);
-    const possibleQty = parseInt(numbers[numbers.length - 1]);
+  const parsedNumbers = numbers.map(n => parseInt(n));
+  
+  // Pattern 1: "เติม [สินค้า] [ราคา] [จำนวน]"
+  // Pattern 2: "มี [สินค้า] [จำนวน]"
+  // Pattern 3: "เติม [สินค้า] [จำนวน]"
+  
+  if (parsedNumbers.length >= 2) {
+    // Assume last number is quantity
+    value = parsedNumbers[parsedNumbers.length - 1];
     
-    // If second-to-last number is large (likely a price)
-    if (possiblePrice > 20 && possibleQty <= 100) {
+    // If second-to-last number looks like a price (> 10 and quantity is reasonable)
+    const possiblePrice = parsedNumbers[parsedNumbers.length - 2];
+    
+    if (possiblePrice > 10 && value <= 1000) {
+      // Likely: [price] [quantity]
       priceHint = possiblePrice;
-      value = possibleQty;
-      
-      Logger.info(`💡 Detected price hint: ${priceHint}฿, qty: ${value}`);
+      Logger.info(`💡 Detected pattern: price=${priceHint}฿, qty=${value}`);
+    } else if (possiblePrice <= 1000 && value > 10) {
+      // Maybe reversed: [quantity] [price]
+      const temp = value;
+      value = possiblePrice;
+      priceHint = temp;
+      Logger.info(`💡 Detected reversed pattern: qty=${value}, price=${priceHint}฿`);
     }
+  } else if (parsedNumbers.length === 1) {
+    // Only one number - assume it's quantity
+    value = parsedNumbers[0];
+  }
+  
+  // ✅ FIX: Fallback if value is too large (likely a price)
+  if (value && value > 1000) {
+    Logger.warn(`⚠️ Value ${value} seems too large for quantity, treating as price`);
+    priceHint = value;
+    value = 1; // Default quantity
   }
   
   // Clean product name
@@ -184,6 +206,10 @@ async function parseAdjustmentCommand(text) {
     return { isAdjustment: false, reason: 'no_product_name' };
   }
   
+  if (!value || value <= 0) {
+    return { isAdjustment: false, reason: 'invalid_value' };
+  }
+  
   // Find matching product with price hint
   const matches = fuzzyMatchStock(productName, stockCache, priceHint);
   
@@ -191,7 +217,7 @@ async function parseAdjustmentCommand(text) {
     return { isAdjustment: false, reason: 'product_not_found' };
   }
   
-  // If multiple matches without clear winner, ask for clarification
+  // If multiple matches with same score, ask for clarification
   if (matches.length > 1 && matches[0].score === matches[1].score) {
     return {
       isAdjustment: true,
@@ -199,7 +225,8 @@ async function parseAdjustmentCommand(text) {
       suggestions: matches.slice(0, 5).map(m => m.item),
       value: value,
       operation: operation,
-      productName: productName
+      productName: productName,
+      priceHint: priceHint
     };
   }
   
@@ -227,7 +254,6 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
   try {
     Logger.info(`🔧 Adjusting: ${itemName} ${operation} ${value}`);
     
-    // Validate
     if (value < 0 || value > 100000) {
       return { 
         success: false, 
@@ -235,7 +261,6 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
       };
     }
     
-    // Find item in cache
     const stockCache = getStockCache();
     const item = stockCache.find(i => 
       i.item.toLowerCase() === itemName.toLowerCase()
@@ -248,7 +273,6 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
       };
     }
     
-    // Calculate new stock
     const oldStock = item.stock;
     let newStock;
     
@@ -274,7 +298,6 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
     
     const difference = newStock - oldStock;
     
-    // Update in Google Sheets
     const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
     let rowIndex = -1;
     
@@ -292,17 +315,13 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
       };
     }
     
-    // Update the stock value
     await updateSheetData(
       CONFIG.SHEET_ID, 
       `สต็อก!E${rowIndex}`, 
       [[newStock]]
     );
     
-    // Log to variance
     await logVariance(item.item, oldStock, newStock, difference, reason, operation);
-    
-    // Reload cache
     await loadStockCache(true);
     
     Logger.success(`✅ Updated: ${item.item} (${oldStock} → ${newStock})`);
