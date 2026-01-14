@@ -1,95 +1,226 @@
-// FIXED: stockAdjustment.js - Simplified voice-friendly version
+// stockAdjustment.js - ENHANCED: Better keyword matching + price hints
 
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-const { getThaiDateTimeString } = require('./utils');
+const { getThaiDateTimeString, normalizeText } = require('./utils');
 const { getSheetData, updateSheetData, appendSheetData } = require('./googleServices');
 const { getStockCache, loadStockCache } = require('./cacheManager');
 
 // ============================================================================
-// SIMPLE COMMAND PARSER (NO AI NEEDED)
+// ENHANCED KEYWORD EXTRACTION
+// ============================================================================
+
+function extractStockKeywords(itemName) {
+  const keywords = new Set();
+  const normalized = normalizeText(itemName);
+  
+  keywords.add(normalized);
+  
+  // Add word tokens
+  const tokens = itemName.split(/\s+/);
+  tokens.forEach(token => {
+    const norm = normalizeText(token);
+    if (norm.length >= 2) {
+      keywords.add(norm);
+    }
+  });
+  
+  // Thai number words
+  const thaiNumbers = {
+    'หนึ่ง': '1', 'สอง': '2', 'สาม': '3', 'สี่': '4', 'ห้า': '5',
+    'หก': '6', 'เจ็ด': '7', 'แปด': '8', 'เก้า': '9', 'สิบ': '10'
+  };
+  
+  for (const [thai, num] of Object.entries(thaiNumbers)) {
+    if (itemName.includes(thai)) {
+      keywords.add(num);
+    }
+  }
+  
+  // Common item variations
+  const variations = {
+    'น้ำแข็ง': ['นำเข็ง', 'น้ำแข็ง', 'ice', 'แข็ง'],
+    'หลอด': ['tube', 'ท่อ'],
+    'แผ่น': ['sheet', 'เเผ่น'],
+    'บด': ['crushed', 'บด'],
+    'ถุง': ['bag', 'ถุง'],
+    'โค้ก': ['coke', 'โคก', 'coca'],
+    'เปปซี่': ['pepsi', 'เป๊ปซี่'],
+    'น้ำดื่ม': ['water', 'น้ำ', 'drinking']
+  };
+  
+  for (const [key, vars] of Object.entries(variations)) {
+    if (normalized.includes(normalizeText(key))) {
+      vars.forEach(v => keywords.add(normalizeText(v)));
+    }
+  }
+  
+  return Array.from(keywords);
+}
+
+// ============================================================================
+// SMART FUZZY MATCHING
+// ============================================================================
+
+function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
+  const normalized = normalizeText(searchTerm);
+  const keywords = extractStockKeywords(searchTerm);
+  
+  Logger.info(`🔍 Searching: "${searchTerm}" (keywords: ${keywords.join(', ')})`);
+  
+  const matches = [];
+  
+  for (const item of stockCache) {
+    const itemNorm = normalizeText(item.item);
+    const itemKeywords = extractStockKeywords(item.item);
+    
+    let score = 0;
+    
+    // Exact match
+    if (itemNorm === normalized) {
+      score += 100;
+    }
+    
+    // Contains match
+    if (itemNorm.includes(normalized) || normalized.includes(itemNorm)) {
+      score += 50;
+    }
+    
+    // Keyword overlap
+    const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
+    score += overlap * 20;
+    
+    // Price hint match (BOOST)
+    if (priceHint && item.price === priceHint) {
+      score += 200; // Heavy boost for price match
+      Logger.success(`🎯 Price match: ${item.item} @ ${priceHint}฿`);
+    }
+    
+    // Fuzzy price match (within 10%)
+    if (priceHint && Math.abs(item.price - priceHint) <= (priceHint * 0.1)) {
+      score += 100;
+    }
+    
+    if (score > 0) {
+      matches.push({ item, score });
+    }
+  }
+  
+  // Sort by score
+  matches.sort((a, b) => b.score - a.score);
+  
+  if (matches.length > 0) {
+    Logger.info(`📊 Found ${matches.length} matches (best: ${matches[0].item.item} - ${matches[0].score} points)`);
+  }
+  
+  return matches;
+}
+
+// ============================================================================
+// ENHANCED COMMAND PARSER
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
   const stockCache = getStockCache();
   
-  // Must have a number
-  const numberMatch = text.match(/\d+/);
-  if (!numberMatch) {
+  // Must have at least one number
+  const numbers = text.match(/\d+/g);
+  if (!numbers || numbers.length === 0) {
     return { isAdjustment: false, reason: 'no_number' };
   }
   
-  const value = parseInt(numberMatch[0]);
-  
-  // Detect operation
-  let operation = 'set'; // default
+  // Detect operation keywords (boost score if found)
+  let operation = 'set';
+  let hasOperationKeyword = false;
   const lower = text.toLowerCase();
   
   if (lower.includes('เติม') || lower.includes('เพิ่ม') || lower.includes('add')) {
     operation = 'add';
-  } else if (lower.includes('ลด') || lower.includes('subtract')) {
+    hasOperationKeyword = true;
+  } else if (lower.includes('ลด') || lower.includes('ลบ') || lower.includes('subtract')) {
     operation = 'subtract';
-  } else if (lower.includes('มี') || lower.includes('เหลือ')) {
+    hasOperationKeyword = true;
+  } else if (lower.includes('มี') || lower.includes('เหลือ') || lower.includes('set')) {
     operation = 'set';
+    hasOperationKeyword = true;
   }
   
-  // Extract product name (remove operation words and numbers)
-  let productName = text
-    .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม/gi, '')
+  // If no operation keyword found, this might not be a stock adjustment
+  if (!hasOperationKeyword) {
+    // Check if it looks more like an order
+    if (lower.includes('สั่ง') || lower.includes('จำนวน') || 
+        lower.includes('ถุง') || lower.includes('ขวด')) {
+      return { isAdjustment: false, reason: 'looks_like_order' };
+    }
+  }
+  
+  // Extract product name and values
+  let productName = text;
+  let value = parseInt(numbers[numbers.length - 1]); // Last number is usually quantity
+  let priceHint = null;
+  
+  // Check if there's a price hint (pattern: [item] [price] [quantity])
+  if (numbers.length >= 2) {
+    const possiblePrice = parseInt(numbers[numbers.length - 2]);
+    const possibleQty = parseInt(numbers[numbers.length - 1]);
+    
+    // If second-to-last number is large (likely a price)
+    if (possiblePrice > 20 && possibleQty <= 100) {
+      priceHint = possiblePrice;
+      value = possibleQty;
+      
+      Logger.info(`💡 Detected price hint: ${priceHint}฿, qty: ${value}`);
+    }
+  }
+  
+  // Clean product name
+  productName = text
+    .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม|ลบ|set|add|subtract/gi, '')
     .replace(/\d+/g, '')
-    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง/gi, '')
+    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|บาท|฿/gi, '')
     .trim();
   
   if (!productName) {
     return { isAdjustment: false, reason: 'no_product_name' };
   }
   
-  // Find matching product
-  const lowerProduct = productName.toLowerCase();
+  // Find matching product with price hint
+  const matches = fuzzyMatchStock(productName, stockCache, priceHint);
   
-  // Try exact match first
-  let match = stockCache.find(item => 
-    item.item.toLowerCase() === lowerProduct
-  );
-  
-  // Try contains match
-  if (!match) {
-    const matches = stockCache.filter(item => 
-      item.item.toLowerCase().includes(lowerProduct) ||
-      lowerProduct.includes(item.item.toLowerCase())
-    );
-    
-    if (matches.length === 1) {
-      match = matches[0];
-    } else if (matches.length > 1) {
-      // Multiple matches - return suggestions
-      return {
-        isAdjustment: true,
-        ambiguous: true,
-        suggestions: matches,
-        value: value,
-        operation: operation
-      };
-    }
-  }
-  
-  if (!match) {
+  if (matches.length === 0) {
     return { isAdjustment: false, reason: 'product_not_found' };
   }
   
+  // If multiple matches without clear winner, ask for clarification
+  if (matches.length > 1 && matches[0].score === matches[1].score) {
+    return {
+      isAdjustment: true,
+      ambiguous: true,
+      suggestions: matches.slice(0, 5).map(m => m.item),
+      value: value,
+      operation: operation,
+      productName: productName
+    };
+  }
+  
+  // Best match found
+  const bestMatch = matches[0].item;
+  
   return {
     isAdjustment: true,
-    item: match.item,
-    stockItem: match,
+    item: bestMatch.item,
+    stockItem: bestMatch,
     value: value,
     operation: operation,
+    priceHint: priceHint,
     originalText: text,
-    confidence: 'high'
+    confidence: matches[0].score > 150 ? 'high' : 'medium',
+    matchScore: matches[0].score
   };
 }
 
 // ============================================================================
-// ADJUST STOCK - SIMPLIFIED
+// ADJUST STOCK
 // ============================================================================
 
 async function adjustStock(itemName, value, operation = 'set', reason = 'manual') {
@@ -149,7 +280,7 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
     
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0].toLowerCase() === item.item.toLowerCase()) {
-        rowIndex = i + 1; // +1 because sheets are 1-indexed
+        rowIndex = i + 1;
         break;
       }
     }
@@ -180,6 +311,7 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
       success: true,
       item: item.item,
       unit: item.unit,
+      price: item.price,
       oldStock: oldStock,
       newStock: newStock,
       difference: difference,
@@ -274,11 +406,8 @@ async function viewCurrentStock(searchTerm = null) {
     let items = stockCache;
     
     if (searchTerm) {
-      const term = searchTerm.toLowerCase();
-      items = stockCache.filter(item => 
-        item.item.toLowerCase().includes(term) ||
-        item.category.toLowerCase().includes(term)
-      );
+      const matches = fuzzyMatchStock(searchTerm, stockCache);
+      items = matches.map(m => m.item);
       
       if (items.length === 0) {
         return `❌ ไม่พบ "${searchTerm}"`;
@@ -379,5 +508,7 @@ module.exports = {
   adjustStock,
   logVariance,
   generateVarianceReport,
-  viewCurrentStock
+  viewCurrentStock,
+  fuzzyMatchStock,
+  extractStockKeywords
 };
