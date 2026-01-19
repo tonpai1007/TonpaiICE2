@@ -1,4 +1,4 @@
-// orderParser.js - FIXED: Integrated confidence boosting
+// src/orderParser.js - FIXED: Support [Item] [Price] [Quantity] pattern
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
@@ -8,34 +8,56 @@ const { getStockCache, getCustomerCache } = require('./cacheManager');
 // ============================================================================
 
 function normalizeOrderInput(text) {
+  // ลบคำเชื่อมที่ไม่จำเป็น เพื่อให้ Pattern จับง่ายขึ้น
   let normalized = text.replace(/\s*มี\s*/g, ' ').trim();
-  normalized = normalized.replace(/\s+/g, ' ');
+  normalized = normalized.replace(/\s+/g, ' '); // ลดช่องว่างซ้ำซ้อน
   return normalized;
 }
 
 function extractPriceHints(text) {
   const hints = [];
-  const matches = text.matchAll(/([ก-๙a-z]+)\s+(\d+)\s*(?:บาท|฿)/gi);
-  for (const match of matches) {
+  
+  // Pattern 1: ระบุคำว่า "บาท" ชัดเจน (เช่น "น้ำแข็ง 20 บาท")
+  const explicitMatches = text.matchAll(/([ก-๙a-z0-9\.\-\(\)]+)\s+(\d+)\s*(?:บาท|฿)/gi);
+  for (const match of explicitMatches) {
     hints.push({ keyword: match[1].toLowerCase(), price: parseInt(match[2]) });
   }
+
+  // Pattern 2: ระบุแบบ "ชื่อ ราคา จำนวน" (เช่น "น้ำแข็ง 20 2 ถุง", "โค้ก 350 1 ลัง")
+  // Regex นี้จะหา: [คำ] [เว้นวรรค] [เลขราคา] [เว้นวรรค] [เลขจำนวน]
+  const patternMatches = text.matchAll(/([ก-๙a-z0-9\.\-\(\)]+)\s+(\d+)\s+(\d+)/gi);
+  for (const match of patternMatches) {
+    // match[1] = ชื่อ, match[2] = ราคา, match[3] = จำนวน (เราเอาแค่ราคาไปเป็น Hint)
+    hints.push({ keyword: match[1].toLowerCase(), price: parseInt(match[2]) });
+  }
+
   return hints;
 }
 
 function buildSmartStockList(stockCache, priceHints) {
   let stockList = '';
+  
+  // ถ้ามี Price Hints (ราคาที่จับได้จากเสียง) ให้เอารายการที่ราคาตรงกันขึ้นก่อน
   if (priceHints.length > 0) {
     stockList += '🎯 [PRIORITY MATCHES - รายการที่ราคาตรงกับที่พูด]:\n';
+    let foundPriority = false;
+    
     priceHints.forEach(hint => {
       stockCache.forEach((item, idx) => {
-        if (item.price === hint.price && item.item.includes(hint.keyword)) {
+        // เช็คว่าชื่อคล้าย และ ราคาตรงเป๊ะ
+        if (item.price === hint.price && item.item.toLowerCase().includes(hint.keyword)) {
           stockList += `ID:${idx} | ⭐ ${item.item} | ${item.price}฿ | สต็อก:${item.stock}\n`;
+          foundPriority = true;
         }
       });
     });
-    stockList += '\n[ALL OTHER ITEMS]:\n';
+    
+    if (foundPriority) {
+      stockList += '\n[ALL OTHER ITEMS - รายการอื่นๆ]:\n';
+    }
   }
   
+  // แสดงรายการทั้งหมด (หรือรายการที่เหลือ)
   stockCache.forEach((item, idx) => {
     stockList += `ID:${idx} | ${item.item} | ${item.price}฿ | สต็อก:${item.stock}\n`;
   });
@@ -43,67 +65,44 @@ function buildSmartStockList(stockCache, priceHints) {
 }
 
 // ============================================================================
-// BOOST CONFIDENCE (Now properly integrated)
+// BOOST CONFIDENCE
 // ============================================================================
 
 function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
   let confidence = aiResult.confidence || 'low';
   const boostReasons = [];
 
-  // Check for exact matches
-  const allExactMatch = mappedItems.every(item => 
-    item.matchConfidence === 'exact'
-  );
-  if (allExactMatch && mappedItems.length > 0) {
-    boostReasons.push('exact_match');
-  }
+  // 1. Exact Price Match (ราคาตรงเป๊ะ)
+  const allExactMatch = mappedItems.every(item => item.matchConfidence === 'exact');
+  if (allExactMatch && mappedItems.length > 0) boostReasons.push('exact_price_match');
 
-  // Check customer mentioned
-  const customerMentioned = aiResult.customer && aiResult.customer !== 'ไม่ระบุ';
-  if (customerMentioned) {
+  // 2. Customer Mentioned (ระบุลูกค้า)
+  if (aiResult.customer && aiResult.customer !== 'ไม่ระบุ') {
     boostReasons.push('customer_mentioned');
-    
     const customerExists = customerCache.some(c => 
       c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
     );
-    if (customerExists) {
-      boostReasons.push('known_customer');
-    }
+    if (customerExists) boostReasons.push('known_customer');
   }
 
-  // Check stock availability
-  const allInStock = mappedItems.every(item => 
-    item.stockItem.stock >= item.quantity
-  );
-  if (allInStock) {
-    boostReasons.push('stock_available');
+  // 3. Stock Available (มีของ)
+  const allInStock = mappedItems.every(item => item.stockItem.stock >= item.quantity);
+  if (allInStock) boostReasons.push('stock_available');
+
+  // 4. Clear Quantity Pattern (มีตัวเลขจำนวนชัดเจน)
+  // เช็คว่ามีเลขที่เป็นจำนวน (Pattern: ราคาตามด้วยจำนวน หรือเลขเดี่ยวๆ)
+  if (/\d+\s+\d+/.test(userInput) || /\d+/.test(userInput)) {
+    boostReasons.push('clear_quantity_pattern');
   }
 
-  // Check clear quantity
-  const hasQuantityWords = /\d+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ/.test(userInput);
-  if (hasQuantityWords) {
-    boostReasons.push('clear_quantity');
-  }
-
-  // Check negative signals
-  const negativeWords = ['บางที', 'คิดว่า', 'อาจจะ', 'ไม่แน่ใจ', 'หรือเปล่า'];
-  const hasNegativeSignal = negativeWords.some(word => 
-    userInput.toLowerCase().includes(word)
-  );
-
-  // Apply boosts
-  if (confidence === 'medium' && boostReasons.length >= 3) {
+  // Logic การเพิ่มความมั่นใจ
+  if (confidence === 'medium' && boostReasons.length >= 2) {
     Logger.info(`🚀 Confidence boosted: medium → high (${boostReasons.join(', ')})`);
     return 'high';
   }
 
-  if (confidence === 'low' && boostReasons.length >= 4 && !hasNegativeSignal) {
+  if (confidence === 'low' && boostReasons.length >= 3) {
     Logger.info(`🚀 Confidence boosted: low → medium (${boostReasons.join(', ')})`);
-    return 'medium';
-  }
-
-  if (hasNegativeSignal && confidence === 'high') {
-    Logger.warn(`⚠️ Confidence downgraded: high → medium (negative words)`);
     return 'medium';
   }
 
@@ -115,35 +114,27 @@ function boostConfidence(aiResult, mappedItems, userInput, customerCache) {
 // ============================================================================
 
 function calculateMatchConfidence(stockItem, priceHint) {
-  // If price hint matches exactly, it's exact match
-  if (priceHint && stockItem.price === priceHint) {
-    return 'exact';
-  }
-  
-  // If price hint is within 10%, it's fuzzy match
-  if (priceHint && Math.abs(stockItem.price - priceHint) <= (priceHint * 0.1)) {
-    return 'fuzzy';
-  }
-  
-  // Otherwise, partial match
+  if (priceHint && stockItem.price === priceHint) return 'exact';
+  if (priceHint && Math.abs(stockItem.price - priceHint) <= (priceHint * 0.1)) return 'fuzzy';
   return 'partial';
 }
 
 // ============================================================================
-// MAIN PARSE ORDER FUNCTION (FIXED)
+// MAIN PARSE ORDER FUNCTION
 // ============================================================================
 
 async function parseOrder(userInput) {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
-  // Prepare data with helpers
+  // 1. เตรียมข้อมูล
   const normalizedInput = normalizeOrderInput(userInput);
-  const priceHints = extractPriceHints(userInput);
-  const smartCatalog = buildSmartStockList(stockCache, priceHints);
+  const priceHints = extractPriceHints(normalizedInput); // หา Pattern ราคา
+  const smartCatalog = buildSmartStockList(stockCache, priceHints); // สร้างแคตตาล็อกที่เน้นสินค้าตามราคา
 
-  const prompt = `คุณคือ AI อัจฉริยะวิเคราะห์คำสั่งซื้อไทย (Multi-Order Parser)
-คลังสินค้า (จัดลำดับตามราคาที่ระบุมา):
+  // 2. สร้าง Prompt สำหรับ AI
+  const prompt = `คุณคือ AI อัจฉริยะวิเคราะห์คำสั่งซื้อ (Strict Pattern Matching)
+คลังสินค้า (รายการที่มี ⭐ คือรายการที่ราคาตรงกับเสียงพูด - จงเลือกก่อน):
 ${smartCatalog}
 
 ลูกค้าที่รู้จัก: ${customerCache.map(c => c.name).join(', ')}
@@ -151,11 +142,13 @@ ${smartCatalog}
 ข้อความดิบ: "${userInput}"
 ข้อความที่ปรับแต่ง: "${normalizedInput}"
 
-หน้าที่:
-1. แยกข้อความออกเป็น "ARRAY ของชุดคำสั่ง"
-2. รองรับหลายร้าน/หลายไอเทม เช่น "น้ำแข็ง 2 ถุง เจ๊แดง แล้วก็โค้ก 5 ขวด พี่ใหม่"
-3. วิเคราะห์ Intent: 'order', 'payment', 'stock_adj'
-4. ใช้ Price Hints: ถ้ามีระบุราคามา ให้จับคู่ ID สินค้าที่มีราคานั้นเท่านั้น
+🎯 กฏสำคัญ (Pattern Rules):
+1. รูปแบบ "ชื่อสินค้า ราคา จำนวน" (สำคัญที่สุด):
+   - ถ้าเจอเลข 2 ตัวติดกัน เช่น "น้ำแข็ง 20 2" -> หมายถึง ราคา=20, จำนวน=2
+   - ต้องเลือก ID สินค้าที่มีราคาตรงกับเลขแรก (20) เท่านั้น!
+2. ถ้ามีแค่ "ชื่อสินค้า จำนวน" (ไม่มีราคา):
+   - ให้เลือกสินค้าที่ชื่อตรงที่สุด (ถ้ามีหลายราคา ให้เลือกตัวที่ขายนิยมสุดหรือตัวแรก)
+3. แยกข้อความได้หลายคำสั่ง เช่น "น้ำแข็ง 20 5 เจ๊แดง แล้วก็ โค้ก 350 1 ลัง"
 
 ตอบเป็น JSON ARRAY เท่านั้น:
 [
@@ -164,7 +157,7 @@ ${smartCatalog}
     "customer": "ชื่อลูกค้า",
     "items": [{"stockId": 0, "quantity": 1}],
     "confidence": "high|medium|low",
-    "reasoning": "อธิบายสั้นๆ"
+    "reasoning": "เช่น: เจอน้ำแข็งราคา 20 บาทตามที่ระบุ"
   }
 ]`;
 
@@ -172,14 +165,13 @@ ${smartCatalog}
     const results = await generateWithGroq(prompt, true);
     const parsedArray = Array.isArray(results) ? results : [results];
 
-    // ✅ FIX: Properly map items and boost confidence
     return parsedArray.map(res => {
-      // Map items with match confidence
+      // Map items กลับไปหา Stock จริง
       const mappedItems = (res.items || []).map(i => {
         const stockItem = stockCache[i.stockId];
         if (!stockItem) return null;
         
-        // Find if this item had a price hint
+        // เช็คว่าสินค้านี้ตรงกับราคาที่เรา Hint ไปไหม
         const priceHint = priceHints.find(h => 
           stockItem.item.toLowerCase().includes(h.keyword)
         );
@@ -191,15 +183,14 @@ ${smartCatalog}
         };
       }).filter(i => i !== null);
 
-      // ✅ FIX: Apply confidence boosting
-      const boostedConfidence = boostConfidence(res, mappedItems, userInput, customerCache);
+      // Boost confidence
+      const boostedConfidence = boostConfidence(res, mappedItems, normalizedInput, customerCache);
 
       return {
         ...res,
         items: mappedItems,
         confidence: boostedConfidence,
-        rawInput: userInput,
-        priceHints: priceHints // Include for reference
+        rawInput: userInput
       };
     });
   } catch (error) {
