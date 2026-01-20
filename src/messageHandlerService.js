@@ -456,90 +456,99 @@ async function handleMessage(text, userId) {
 
 async function executeOrderLogic(parsed, userId) {
   try {
-    // ✅ FIX 1: Apply smart correction (aggressive mode)
+    // 1. Smart Correction & Learning (เหมือนเดิม)
     parsed = applySmartCorrection(parsed);
-
-    // ✅ FIX 2: Use smart learning to enhance order
     const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
-    
     if (prediction.success && prediction.confidence === 'high') {
-      Logger.success(`🧠 Smart Learning: Found ${prediction.matchRate * 100}% match for ${prediction.customer}`);
-      
-      // Enhance items with historical data
       parsed.items = prediction.items || parsed.items;
     }
 
-    // ✅ FIX 3: Auto-add customer if needed
+    // 2. Auto-add customer (เหมือนเดิม)
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
       const { getCustomerCache } = require('./cacheManager');
       const customerCache = getCustomerCache();
-      
       const customerExists = customerCache.some(c => 
         c.name.toLowerCase() === parsed.customer.toLowerCase()
       );
-      
       if (!customerExists) {
-        const autoAddResult = await autoAddCustomer(parsed.customer);
-        
-        if (autoAddResult.success) {
-          Logger.success(`👤 Auto-added new customer: ${parsed.customer}`);
-        }
+        await autoAddCustomer(parsed.customer);
       }
     }
 
+    // 3. เตรียมข้อมูลสร้างออเดอร์
     const orderData = {
       customer: parsed.customer || 'ไม่ระบุ',
       items: parsed.items,
-      deliveryPerson: '',
-      paymentStatus: 'unpaid'
+      deliveryPerson: parsed.deliveryPerson || '', // ✅ รับค่าคนส่งทันทีถ้ามี
+      paymentStatus: parsed.isPaid ? 'จ่ายแล้ว' : 'unpaid' // ✅ รับสถานะจ่ายเงินทันทีถ้ามี
     };
     
-    // Calculate total value for auto-process decision
+    // คำนวณยอดรวม
     const totalValue = parsed.items.reduce((sum, item) => 
       sum + (item.quantity * item.stockItem.price), 0
     );
 
-    // ✅ FIX 4: Check if should auto-process
+    // เช็ค Auto Process
     const autoDecision = shouldAutoProcess(parsed, totalValue);
-    
-    // Record decision for monitoring
     monitor.recordDecision(autoDecision, 'pending');
 
-    if (autoDecision.shouldAuto) {
-      Logger.success(`⚡ Auto-processing order: ${autoDecision.reason}`);
-    } else {
-      Logger.info(`📋 Manual review required: ${autoDecision.reason}`);
-    }
-    
+    // 4. 🔥 สร้างออเดอร์ (Create Order)
     const result = await createOrderTransaction(orderData);
     
     if (result.success) {
-      // Record order number for monitoring
       monitor.recordDecision(autoDecision, result.orderNo);
+
+      // ==========================================================
+      // ✅ EXTRA ACTIONS: จัดการสถานะเพิ่มเติมทันที (ถ้ามี)
+      // ==========================================================
       
+      let extraMessages = [];
+
+      // A. ถ้าสั่งว่า "จ่ายแล้ว" ให้ไปอัปเดตสถานะใน Sheet ทันที (เพื่อความชัวร์)
+      if (parsed.isPaid) {
+        const { updateOrderPaymentStatus } = require('./orderService');
+        await updateOrderPaymentStatus(result.orderNo, 'จ่ายแล้ว');
+        extraMessages.push('💸 บันทึกรับเงินแล้ว');
+      }
+
+      // B. ถ้าระบุคนส่ง "ส่งพี่แดง"
+      if (parsed.deliveryPerson) {
+        // (Function updateDeliveryPerson จะไปแก้ใน Google Sheet)
+        // บันทึก Log หรือแจ้งเตือนเพิ่มได้ตรงนี้
+        extraMessages.push(`🚚 ฝากส่งโดย: ${parsed.deliveryPerson}`);
+      }
+
+      // ==========================================================
+
+      // สร้างข้อความตอบกลับ
+      let responseMsg = formatOrderSuccess(
+        result.orderNo,
+        result.customer,
+        result.items,
+        result.totalAmount,
+        parsed.confidence,
+        autoDecision.shouldAuto
+      );
+
+      // เติมข้อความสถานะพิเศษต่อท้าย
+      if (extraMessages.length > 0) {
+        responseMsg += `\n\n✨ อัปเดตเพิ่มเติม:\n• ${extraMessages.join('\n• ')}`;
+      }
+
       return {
         success: true,
-        message: formatOrderSuccess(
-          result.orderNo,
-          result.customer,
-          result.items,
-          result.totalAmount,
-          parsed.confidence,
-          autoDecision.shouldAuto
-        )
+        message: responseMsg
       };
+
     } else {
       return {
         success: false,
-        message: `❌ ไม่สามารถสร้างออเดอร์ได้\n\n${result.error}`
+        message: `❌ สร้างออเดอร์ไม่สำเร็จ: ${result.error}`
       };
     }
   } catch (error) {
     Logger.error('executeOrderLogic failed', error);
-    return {
-      success: false,
-      message: '❌ เกิดข้อผิดพลาดในการสร้างออเดอร์'
-    };
+    return { success: false, message: '❌ ระบบขัดข้อง' };
   }
 }
 
