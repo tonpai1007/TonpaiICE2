@@ -132,8 +132,11 @@ function getHelpMessage(userId) {
     msg += `👑 **คำสั่งแอดมิน**\n\n`;
     msg += `📊 "สรุป" - สรุปยอดขายวันนี้\n`;
     msg += `📝 "inbox" - ดูประวัติการสนทนา\n`;
-    msg += `💳 "เครดิต" - รายงานเครดิตค้าง\n`;
     msg += `🔄 "รีเฟรช" - โหลดข้อมูลใหม่\n\n`;
+    msg += `💳 **เครดิต**\n`;
+    msg += `• "เครดิต" - รายงานเครดิตทั้งหมด\n`;
+    msg += `• "เครดิต [ชื่อ]" - เช็คเครดิตลูกค้า\n`;
+    msg += `• "จ่าย" - จ่ายออเดอร์ล่าสุด (อัปเดตเครดิตอัตโนมัติ)\n\n`;
   }
   
   return msg;
@@ -397,6 +400,46 @@ async function handleMessage(text, userId) {
         return { success: false, message: result.error };
       }
     }
+    if (lower.includes('เครดิต') || lower === 'credit') {
+      const { generateEnhancedCreditReport } = require('./creditService');
+      const report = await generateEnhancedCreditReport();
+      return { success: true, message: report };
+    }
+
+    // Quick credit check for specific customer
+    if (lower.startsWith('เครดิต ')) {
+      const { getCreditSummaryWithAlerts } = require('./creditService');
+      const customerName = text.replace(/เครดิต/i, '').trim();
+      
+      const summary = await getCreditSummaryWithAlerts();
+      const customer = summary.customers.find(c => 
+        c.name.toLowerCase().includes(customerName.toLowerCase())
+      );
+      
+      if (!customer) {
+        return {
+          success: false,
+          message: `❌ ไม่พบเครดิตของ ${customerName}\n\nลูกค้ารายนี้อาจจ่ายเงินหมดแล้ว หรือยังไม่เคยมีเครดิตค้าง`
+        };
+      }
+      
+      let msg = `💳 เครดิตของ ${customer.name}\n${'='.repeat(40)}\n\n`;
+      msg += `ยอดรวม: ${customer.totalAmount.toLocaleString()}฿\n\n`;
+      
+      customer.orders.forEach(order => {
+        let status = '';
+        if (order.isOverdue) {
+          status = `🔴 เกิน ${Math.abs(order.daysUntilDue)} วัน`;
+        } else if (order.daysUntilDue <= 7) {
+          status = `⏰ เหลือ ${order.daysUntilDue} วัน`;
+        }
+        
+        msg += `#${order.orderNo}: ${order.amount.toLocaleString()}฿ ${status}\n`;
+      });
+      
+      return { success: true, message: msg };
+    }
+
 
     // ========================================================================
     // ORDER PARSING (With Smart Learning & Auto-Process)
