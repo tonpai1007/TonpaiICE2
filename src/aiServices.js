@@ -1,4 +1,4 @@
-// aiServices.js - COMPLETE: Full Ollama support with fallbacks
+// aiServices.js - FIXED: Proper error handling and initialization
 const OpenAI = require('openai');
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
@@ -12,6 +12,7 @@ const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:3b';
 
 let groqClient = null;
+let isInitialized = false;
 
 // ============================================================================
 // INITIALIZATION
@@ -23,20 +24,27 @@ function initializeAIServices() {
     
     switch (AI_PROVIDER) {
       case 'groq':
-        return initializeGroq();
+        initializeGroq();
+        break;
       
       case 'ollama':
-        return initializeOllama();
+        initializeOllama();
+        break;
       
       case 'openrouter':
-        return initializeOpenRouter();
+        initializeOpenRouter();
+        break;
       
       default:
         Logger.warn(`Unknown AI_PROVIDER: ${AI_PROVIDER}, defaulting to Groq`);
-        return initializeGroq();
+        initializeGroq();
     }
+    
+    isInitialized = true;
+    return { success: true };
   } catch (error) {
     Logger.error('❌ AI init failed', error);
+    isInitialized = false;
     throw error;
   }
 }
@@ -50,16 +58,23 @@ function initializeGroq() {
     throw new Error('Missing GROQ_API_KEY');
   }
 
-  groqClient = new OpenAI({
-    apiKey: CONFIG.GROQ_API_KEY,
-    baseURL: 'https://api.groq.com/openai/v1'
-  });
+  try {
+    groqClient = new OpenAI({
+      apiKey: CONFIG.GROQ_API_KEY,
+      baseURL: 'https://api.groq.com/openai/v1',
+      timeout: 30000,
+      maxRetries: 2
+    });
 
-  Logger.success('✅ Groq AI initialized');
-  Logger.info('   Model: llama-3.3-70b-versatile');
-  Logger.info('   Audio: whisper-large-v3');
-  
-  return { groq: groqClient };
+    Logger.success('✅ Groq AI initialized');
+    Logger.info('   Model: llama-3.3-70b-versatile');
+    Logger.info('   Audio: whisper-large-v3');
+    
+    return { groq: groqClient };
+  } catch (error) {
+    Logger.error('Failed to initialize Groq client', error);
+    throw error;
+  }
 }
 
 // ============================================================================
@@ -69,7 +84,9 @@ function initializeGroq() {
 async function initializeOllama() {
   try {
     // Test connection
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
+      signal: AbortSignal.timeout(5000)
+    });
     
     if (!response.ok) {
       throw new Error('Ollama not responding');
@@ -92,11 +109,17 @@ async function initializeOllama() {
     
     // Setup Groq for audio fallback if available
     if (CONFIG.GROQ_API_KEY) {
-      groqClient = new OpenAI({
-        apiKey: CONFIG.GROQ_API_KEY,
-        baseURL: 'https://api.groq.com/openai/v1'
-      });
-      Logger.success('   ✅ Groq Whisper available for audio');
+      try {
+        groqClient = new OpenAI({
+          apiKey: CONFIG.GROQ_API_KEY,
+          baseURL: 'https://api.groq.com/openai/v1',
+          timeout: 30000,
+          maxRetries: 2
+        });
+        Logger.success('   ✅ Groq Whisper available for audio');
+      } catch (error) {
+        Logger.warn('   ⚠️  Groq client init failed:', error.message);
+      }
     } else {
       Logger.warn('   ⚠️  No GROQ_API_KEY - voice messages will fail');
       Logger.info('   Add GROQ_API_KEY to .env for voice support');
@@ -121,26 +144,39 @@ function initializeOpenRouter() {
     throw new Error('Missing OPENROUTER_API_KEY');
   }
 
-  groqClient = new OpenAI({
-    apiKey: apiKey,
-    baseURL: 'https://openrouter.ai/api/v1',
-    defaultHeaders: {
-      'HTTP-Referer': 'https://github.com/yourusername/order-bot',
-      'X-Title': 'Order Bot'
-    }
-  });
+  try {
+    groqClient = new OpenAI({
+      apiKey: apiKey,
+      baseURL: 'https://openrouter.ai/api/v1',
+      timeout: 30000,
+      maxRetries: 2,
+      defaultHeaders: {
+        'HTTP-Referer': 'https://github.com/yourusername/order-bot',
+        'X-Title': 'Order Bot'
+      }
+    });
 
-  Logger.success('✅ OpenRouter initialized');
-  Logger.info('   Model: meta-llama/llama-3.2-3b-instruct:free');
-  
-  return { openrouter: groqClient };
+    Logger.success('✅ OpenRouter initialized');
+    Logger.info('   Model: meta-llama/llama-3.2-3b-instruct:free');
+    
+    return { openrouter: groqClient };
+  } catch (error) {
+    Logger.error('Failed to initialize OpenRouter client', error);
+    throw error;
+  }
 }
 
 // ============================================================================
-// UNIFIED GENERATION FUNCTION
+// UNIFIED GENERATION FUNCTION WITH SAFETY CHECKS
 // ============================================================================
 
 async function generateWithGroq(prompt, jsonMode = false) {
+  // Safety check: ensure initialization
+  if (!isInitialized) {
+    Logger.error('AI service not initialized');
+    throw new Error('AI service not initialized. Call initializeAIServices() first.');
+  }
+
   try {
     switch (AI_PROVIDER) {
       case 'groq':
@@ -162,7 +198,12 @@ async function generateWithGroq(prompt, jsonMode = false) {
     // Fallback to Groq if Ollama fails and Groq is available
     if (AI_PROVIDER === 'ollama' && groqClient) {
       Logger.warn('⚠️  Falling back to Groq...');
-      return await generateGroq(prompt, jsonMode);
+      try {
+        return await generateGroq(prompt, jsonMode);
+      } catch (fallbackError) {
+        Logger.error('Fallback to Groq also failed', fallbackError);
+        throw fallbackError;
+      }
     }
     
     throw error;
@@ -170,7 +211,7 @@ async function generateWithGroq(prompt, jsonMode = false) {
 }
 
 // ============================================================================
-// GROQ IMPLEMENTATION
+// GROQ IMPLEMENTATION WITH ERROR HANDLING
 // ============================================================================
 
 async function generateGroq(prompt, jsonMode) {
@@ -178,16 +219,51 @@ async function generateGroq(prompt, jsonMode) {
     throw new Error('Groq client not initialized');
   }
 
-  const response = await groqClient.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0.1,
-    max_tokens: 2000,
-    response_format: jsonMode ? { type: 'json_object' } : undefined
-  });
+  try {
+    const requestOptions = {
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 2000
+    };
 
-  const content = response.choices[0].message.content.trim();
-  return jsonMode ? JSON.parse(content) : content;
+    // Only add response_format if jsonMode is true
+    if (jsonMode) {
+      requestOptions.response_format = { type: 'json_object' };
+    }
+
+    const response = await groqClient.chat.completions.create(requestOptions);
+
+    if (!response?.choices?.[0]?.message?.content) {
+      throw new Error('Invalid response from Groq API');
+    }
+
+    const content = response.choices[0].message.content.trim();
+    
+    if (jsonMode) {
+      try {
+        return JSON.parse(content);
+      } catch (parseError) {
+        Logger.error('JSON parse failed, raw content:', content);
+        throw new Error('Failed to parse JSON response from AI');
+      }
+    }
+    
+    return content;
+  } catch (error) {
+    // More detailed error logging
+    if (error.response) {
+      Logger.error('Groq API error:', {
+        status: error.response.status,
+        data: error.response.data
+      });
+    } else if (error.code === 'ECONNABORTED') {
+      Logger.error('Groq request timeout');
+    } else {
+      Logger.error('Groq request failed:', error.message);
+    }
+    throw error;
+  }
 }
 
 // ============================================================================
@@ -199,40 +275,57 @@ async function generateOllama(prompt, jsonMode) {
   
   const startTime = Date.now();
   
-  const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      prompt: prompt,
-      stream: false,
-      format: jsonMode ? 'json' : undefined,
-      options: {
-        temperature: 0.1,
-        num_predict: 2000,
-        top_k: 40,
-        top_p: 0.9,
-        repeat_penalty: 1.1
+  try {
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: prompt,
+        stream: false,
+        format: jsonMode ? 'json' : undefined,
+        options: {
+          temperature: 0.1,
+          num_predict: 2000,
+          top_k: 40,
+          top_p: 0.9,
+          repeat_penalty: 1.1
+        }
+      }),
+      signal: AbortSignal.timeout(60000) // 60 second timeout
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Ollama error: ${response.status} - ${error}`);
+    }
+
+    const data = await response.json();
+    const content = data.response?.trim();
+    
+    if (!content) {
+      throw new Error('Ollama returned empty response');
+    }
+    
+    const duration = Date.now() - startTime;
+    Logger.debug(`✅ Ollama completed in ${duration}ms`);
+    
+    if (jsonMode) {
+      try {
+        return JSON.parse(content);
+      } catch (parseError) {
+        Logger.error('Ollama JSON parse failed, raw:', content);
+        throw new Error('Failed to parse JSON from Ollama');
       }
-    })
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Ollama error: ${response.status} - ${error}`);
+    }
+    
+    return content;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Ollama request timeout (60s)');
+    }
+    throw error;
   }
-
-  const data = await response.json();
-  const content = data.response?.trim();
-  
-  if (!content) {
-    throw new Error('Ollama returned empty response');
-  }
-  
-  const duration = Date.now() - startTime;
-  Logger.debug(`✅ Ollama completed in ${duration}ms`);
-  
-  return jsonMode ? JSON.parse(content) : content;
 }
 
 // ============================================================================
@@ -240,16 +333,44 @@ async function generateOllama(prompt, jsonMode) {
 // ============================================================================
 
 async function generateOpenRouter(prompt, jsonMode) {
-  const response = await groqClient.chat.completions.create({
-    model: 'meta-llama/llama-3.2-3b-instruct:free',
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0.1,
-    max_tokens: 2000,
-    response_format: jsonMode ? { type: 'json_object' } : undefined
-  });
+  if (!groqClient) {
+    throw new Error('OpenRouter client not initialized');
+  }
 
-  const content = response.choices[0].message.content.trim();
-  return jsonMode ? JSON.parse(content) : content;
+  try {
+    const requestOptions = {
+      model: 'meta-llama/llama-3.2-3b-instruct:free',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 2000
+    };
+
+    if (jsonMode) {
+      requestOptions.response_format = { type: 'json_object' };
+    }
+
+    const response = await groqClient.chat.completions.create(requestOptions);
+
+    if (!response?.choices?.[0]?.message?.content) {
+      throw new Error('Invalid response from OpenRouter API');
+    }
+
+    const content = response.choices[0].message.content.trim();
+    
+    if (jsonMode) {
+      try {
+        return JSON.parse(content);
+      } catch (parseError) {
+        Logger.error('OpenRouter JSON parse failed');
+        throw new Error('Failed to parse JSON from OpenRouter');
+      }
+    }
+    
+    return content;
+  } catch (error) {
+    Logger.error('OpenRouter request failed:', error.message);
+    throw error;
+  }
 }
 
 // ============================================================================
@@ -298,24 +419,29 @@ async function transcribeWithGroqWhisper(audioBuffer) {
 
   Logger.info('🎤 Using Groq Whisper...');
   
-  const file = new File([audioBuffer], 'audio.m4a', { type: 'audio/m4a' });
-  
-  const transcription = await groqClient.audio.transcriptions.create({
-    file: file,
-    model: 'whisper-large-v3',
-    language: 'th',
-    temperature: 0.0,
-    response_format: 'text'
-  });
+  try {
+    const file = new File([audioBuffer], 'audio.m4a', { type: 'audio/m4a' });
+    
+    const transcription = await groqClient.audio.transcriptions.create({
+      file: file,
+      model: 'whisper-large-v3',
+      language: 'th',
+      temperature: 0.0,
+      response_format: 'text'
+    });
 
-  const text = transcription.text?.trim() || transcription.trim();
-  
-  if (!text) {
-    throw new Error('Empty transcription');
+    const text = transcription.text?.trim() || transcription.trim();
+    
+    if (!text) {
+      throw new Error('Empty transcription');
+    }
+    
+    Logger.success(`✅ Transcribed: "${text}"`);
+    return { success: true, text };
+  } catch (error) {
+    Logger.error('Groq Whisper failed:', error.message);
+    throw error;
   }
-  
-  Logger.success(`✅ Transcribed: "${text}"`);
-  return { success: true, text };
 }
 
 // ============================================================================
@@ -327,7 +453,9 @@ async function transcribeWithOllamaWhisper(audioBuffer) {
   
   try {
     // Check if whisper model exists
-    const tagsResponse = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    const tagsResponse = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
+      signal: AbortSignal.timeout(5000)
+    });
     const tagsData = await tagsResponse.json();
     const hasWhisper = tagsData.models?.some(m => m.name.includes('whisper'));
     
@@ -346,7 +474,8 @@ async function transcribeWithOllamaWhisper(audioBuffer) {
         model: 'whisper',
         prompt: `[Audio transcription task] Transcribe this Thai audio accurately: ${base64Audio.substring(0, 1000)}...`,
         stream: false
-      })
+      }),
+      signal: AbortSignal.timeout(60000)
     });
     
     if (!response.ok) {
@@ -383,6 +512,7 @@ function getGroq() {
 function getProviderInfo() {
   return {
     provider: AI_PROVIDER,
+    initialized: isInitialized,
     baseUrl: AI_PROVIDER === 'ollama' ? OLLAMA_BASE_URL : undefined,
     model: AI_PROVIDER === 'groq' ? 'llama-3.3-70b-versatile' : 
            AI_PROVIDER === 'ollama' ? OLLAMA_MODEL :
@@ -394,7 +524,7 @@ function getProviderInfo() {
 }
 
 function isAudioSupported() {
-  return groqClient !== null; // Audio only works if Groq is available
+  return groqClient !== null;
 }
 
 // ============================================================================
@@ -404,10 +534,16 @@ function isAudioSupported() {
 async function checkAIHealth() {
   const health = {
     provider: AI_PROVIDER,
+    initialized: isInitialized,
     textGeneration: false,
     audioTranscription: false,
     error: null
   };
+  
+  if (!isInitialized) {
+    health.error = 'AI service not initialized';
+    return health;
+  }
   
   try {
     // Test text generation
@@ -423,6 +559,7 @@ async function checkAIHealth() {
     
   } catch (error) {
     health.error = error.message;
+    health.textGeneration = false;
   }
   
   return health;
