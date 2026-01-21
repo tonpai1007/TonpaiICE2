@@ -59,47 +59,47 @@ function extractStockKeywords(itemName) {
 // SMART FUZZY MATCHING
 // ============================================================================
 
-function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
+function fuzzyMatchStock(searchTerm, stockCache, priceHint = null, unitHint = null) {
   const normalized = normalizeText(searchTerm);
   const keywords = extractStockKeywords(searchTerm);
   
-  Logger.info(`🔍 Searching: "${searchTerm}" (keywords: ${keywords.join(', ')})`);
-  if (priceHint) {
-    Logger.info(`💰 Price hint: ${priceHint}฿`);
-  }
+  Logger.info(`🔍 Searching: "${searchTerm}" (unit: ${unitHint || '-'}, price: ${priceHint || '-'})`);
   
   const matches = [];
   
   for (const item of stockCache) {
     const itemNorm = normalizeText(item.item);
+    const itemUnit = normalizeText(item.unit || '');
     const itemKeywords = extractStockKeywords(item.item);
     
     let score = 0;
     
     // Exact match
-    if (itemNorm === normalized) {
-      score += 100;
-    }
+    if (itemNorm === normalized) score += 100;
     
     // Contains match
-    if (itemNorm.includes(normalized) || normalized.includes(itemNorm)) {
-      score += 50;
-    }
+    if (itemNorm.includes(normalized) || normalized.includes(itemNorm)) score += 50;
     
     // Keyword overlap
     const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
     score += overlap * 20;
     
-    // Price hint match (HEAVY BOOST)
+    // Price hint match
     if (priceHint && item.price === priceHint) {
       score += 200;
-      Logger.success(`🎯 Exact price match: ${item.item} @ ${priceHint}฿`);
-    }
-    
-    // Fuzzy price match (within 10%)
-    if (priceHint && Math.abs(item.price - priceHint) <= (priceHint * 0.1)) {
+      Logger.success(`🎯 Exact price match: ${item.item}`);
+    } else if (priceHint && Math.abs(item.price - priceHint) <= (priceHint * 0.1)) {
       score += 100;
-      Logger.info(`💡 Close price match: ${item.item} @ ${item.price}฿ (hint: ${priceHint}฿)`);
+    }
+
+    // ✅ UNIT HINT BOOST (สำคัญ: ถ้าหน่วยตรงกัน ให้คะแนนพิเศษ)
+    if (unitHint) {
+      if (itemUnit.includes(unitHint)) {
+        score += 150; // คะแนนพิเศษถ้าหน่วยตรง (เช่น "ลัง" ตรงกับ "ลัง")
+        Logger.info(`📦 Unit match: ${item.item} (${item.unit}) matches ${unitHint}`);
+      } else if (itemNorm.includes(unitHint)) {
+        score += 100; // คะแนนพิเศษถ้าชื่อสินค้ามีคำบอกหน่วย (เช่น "โค้ก(ลัง)")
+      }
     }
     
     if (score > 0) {
@@ -110,7 +110,7 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
   matches.sort((a, b) => b.score - a.score);
   
   if (matches.length > 0) {
-    Logger.info(`📊 Found ${matches.length} matches (best: ${matches[0].item.item} - ${matches[0].score} points)`);
+    Logger.info(`📊 Best match: ${matches[0].item.item} (${matches[0].score})`);
   }
   
   return matches;
@@ -123,126 +123,89 @@ function fuzzyMatchStock(searchTerm, stockCache, priceHint = null) {
 async function parseAdjustmentCommand(text) {
   const stockCache = getStockCache();
   
-  // Extract all numbers
+  // Extract numbers
   const numbers = text.match(/\d+/g);
   if (!numbers || numbers.length === 0) {
     return { isAdjustment: false, reason: 'no_number' };
   }
   
-  // Detect operation keywords
+  // Operation keywords
   let operation = 'set';
-  let hasOperationKeyword = false;
   const lower = text.toLowerCase();
   
-  if (lower.includes('เติม') || lower.includes('เพิ่ม') || lower.includes('add')) {
-    operation = 'add';
-    hasOperationKeyword = true;
-  } else if (lower.includes('ลด') || lower.includes('ลบ') || lower.includes('subtract')) {
-    operation = 'subtract';
-    hasOperationKeyword = true;
-  } else if (lower.includes('มี') || lower.includes('เหลือ') || lower.includes('set')) {
-    operation = 'set';
-    hasOperationKeyword = true;
-  }
+  if (lower.match(/เติม|เพิ่ม|add/)) operation = 'add';
+  else if (lower.match(/ลด|ลบ|subtract/)) operation = 'subtract';
   
-  // If no operation keyword, check if it looks like an order
-  if (!hasOperationKeyword) {
-    if (lower.includes('สั่ง') || lower.includes('จำนวน') || 
-        lower.includes('ถุง') || lower.includes('ขวด') ||
-        lower.includes('ร้าน') || lower.includes('คุณ') || lower.includes('พี่')) {
+  // Check if it looks like an order (to prevent confusion)
+  if (operation === 'set' && !text.match(/มี|เหลือ|set/)) {
+    if (text.match(/สั่ง|ร้าน|พี่|คุณ|เอา/)) {
       return { isAdjustment: false, reason: 'looks_like_order' };
     }
   }
   
-  // ✅ FIX: Better price hint detection
-  let productName = text;
+  // ✅ FIX: Detect Unit Hint BEFORE cleaning (จับคำว่า "รัง" หรือ "ลัง")
+  let unitHint = null;
+  if (text.match(/รัง|ลัง|crate/)) unitHint = 'ลัง';
+  else if (text.match(/ขวด/)) unitHint = 'ขวด';
+  else if (text.match(/ถุง|กระสอบ/)) unitHint = 'ถุง';
+  else if (text.match(/แพ็ค|แพค/)) unitHint = 'แพ็ค';
+  else if (text.match(/โหล/)) unitHint = 'โหล';
+
+  // Extract Price & Quantity
   let value = null;
   let priceHint = null;
-  
   const parsedNumbers = numbers.map(n => parseInt(n));
   
-  // Pattern 1: "เติม [สินค้า] [ราคา] [จำนวน]"
-  // Pattern 2: "มี [สินค้า] [จำนวน]"
-  // Pattern 3: "เติม [สินค้า] [จำนวน]"
-  
   if (parsedNumbers.length >= 2) {
-    // Assume last number is quantity
-    value = parsedNumbers[parsedNumbers.length - 1];
-    
-    // If second-to-last number looks like a price (> 10 and quantity is reasonable)
+    value = parsedNumbers[parsedNumbers.length - 1]; // Assume last is qty
     const possiblePrice = parsedNumbers[parsedNumbers.length - 2];
     
     if (possiblePrice > 10 && value <= 1000) {
-      // Likely: [price] [quantity]
       priceHint = possiblePrice;
-      Logger.info(`💡 Detected pattern: price=${priceHint}฿, qty=${value}`);
     } else if (possiblePrice <= 1000 && value > 10) {
-      // Maybe reversed: [quantity] [price]
-      const temp = value;
+      // Swapped case
       value = possiblePrice;
-      priceHint = temp;
-      Logger.info(`💡 Detected reversed pattern: qty=${value}, price=${priceHint}฿`);
+      priceHint = parsedNumbers[parsedNumbers.length - 1];
     }
-  } else if (parsedNumbers.length === 1) {
-    // Only one number - assume it's quantity
+  } else {
     value = parsedNumbers[0];
   }
   
-  // ✅ FIX: Fallback if value is too large (likely a price)
-  if (value && value > 1000) {
-    Logger.warn(`⚠️ Value ${value} seems too large for quantity, treating as price`);
-    priceHint = value;
-    value = 1; // Default quantity
-  }
-  
-  // Clean product name
-  productName = text
+  // Clean product name (เอาคำว่า "รัง", "ลัง" ออกด้วย จะได้เหลือแค่ชื่อสินค้า)
+  let productName = text
     .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม|ลบ|set|add|subtract/gi, '')
     .replace(/\d+/g, '')
-    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|บาท|฿/gi, '')
+    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|รัง|บาท|฿|แพ็ค|แพค|โหล/gi, '') // ✅ เพิ่ม 'รัง', 'แพ็ค'
     .trim();
   
-  if (!productName) {
-    return { isAdjustment: false, reason: 'no_product_name' };
-  }
+  if (!productName) return { isAdjustment: false, reason: 'no_product_name' };
+  if (!value || value <= 0) return { isAdjustment: false, reason: 'invalid_value' };
   
-  if (!value || value <= 0) {
-    return { isAdjustment: false, reason: 'invalid_value' };
-  }
+  // Match with Hints
+  const matches = fuzzyMatchStock(productName, stockCache, priceHint, unitHint);
   
-  // Find matching product with price hint
-  const matches = fuzzyMatchStock(productName, stockCache, priceHint);
+  if (matches.length === 0) return { isAdjustment: false, reason: 'product_not_found' };
   
-  if (matches.length === 0) {
-    return { isAdjustment: false, reason: 'product_not_found' };
-  }
-  
-  // If multiple matches with same score, ask for clarification
-  if (matches.length > 1 && matches[0].score === matches[1].score) {
+  // Check ambiguity (only if scores are very close)
+  if (matches.length > 1 && (matches[0].score - matches[1].score < 10)) {
     return {
       isAdjustment: true,
       ambiguous: true,
       suggestions: matches.slice(0, 5).map(m => m.item),
       value: value,
-      operation: operation,
-      productName: productName,
-      priceHint: priceHint
+      productName: productName
     };
   }
   
-  // Best match found
-  const bestMatch = matches[0].item;
-  
   return {
     isAdjustment: true,
-    item: bestMatch.item,
-    stockItem: bestMatch,
+    item: matches[0].item.item,
+    stockItem: matches[0].item,
     value: value,
     operation: operation,
     priceHint: priceHint,
     originalText: text,
-    confidence: matches[0].score > 150 ? 'high' : 'medium',
-    matchScore: matches[0].score
+    confidence: matches[0].score > 150 ? 'high' : 'medium'
   };
 }
 
@@ -353,38 +316,14 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
 
 async function logVariance(item, oldStock, newStock, difference, reason, operation) {
   try {
-    const reasonText = getReasonText(reason, operation);
-    
-    const row = [
-      getThaiDateTimeString(),
-      item,
-      oldStock,
-      newStock,
-      difference,
-      reasonText
-    ];
-    
+    const reasonText = `${operation} (${reason})`;
+    const row = [getThaiDateTimeString(), item, oldStock, newStock, difference, reasonText];
     await appendSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F', [row]);
-    Logger.success(`📊 Logged variance: ${item} (${difference >= 0 ? '+' : ''}${difference})`);
-    
-    return true;
-  } catch (error) {
-    Logger.error('logVariance failed', error);
-    return false;
-  }
+  } catch (e) { Logger.error('Log failed', e); }
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-function getOperationText(operation, value) {
-  switch (operation) {
-    case 'add': return `เติม +${value}`;
-    case 'subtract': return `ลด -${value}`;
-    case 'set': return `ตั้งค่าเป็น ${value}`;
-    default: return `ปรับเป็น ${value}`;
-  }
+function getOperationText(op, val) {
+  return op === 'add' ? `เติม +${val}` : op === 'subtract' ? `ลด -${val}` : `ตั้งเป็น ${val}`;
 }
 
 function getReasonText(reason, operation) {
