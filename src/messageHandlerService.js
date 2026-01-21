@@ -1,4 +1,4 @@
-// messageHandlerService.js - FIXED: Missing variable definition
+// src/messageHandlerService.js - FIXED: Proper import usage
 const { Logger } = require('./logger');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction, updateOrderPaymentStatus, getLastOrderNumber } = require('./orderService');
@@ -9,6 +9,11 @@ const { shouldAutoProcess, applySmartCorrection, monitor } = require('./aggressi
 const { smartLearner } = require('./smartOrderLearning');
 const { autoAddCustomer } = require('./customerService');
 const { handleBusinessCommand } = require('./businessCommands');
+const { AccessControl } = require('./accessControl');
+const { saveToInbox, cancelOrder, generateInboxSummary } = require('./inboxService');
+const { generateEnhancedCreditReport, getCreditSummaryWithAlerts } = require('./creditService');
+const { getSheetData, updateSheetData } = require('./googleServices');
+const { CONFIG } = require('./config');
 
 // ============================================================================
 // FORMAT MESSAGES
@@ -99,7 +104,6 @@ function formatStockAdjustmentSuccess(result) {
 }
 
 function getHelpMessage(userId) {
-  const { AccessControl } = require('./accessControl');
   const isAdmin = AccessControl.isAdmin(userId);
   
   let msg = `💡 คู่มือการใช้งาน Order Bot\n${'='.repeat(40)}\n\n`;
@@ -148,9 +152,6 @@ function getHelpMessage(userId) {
 
 async function updateDeliveryPerson(orderNo, deliveryPerson) {
   try {
-    const { getSheetData, updateSheetData } = require('./googleServices');
-    const { CONFIG } = require('./config');
-    
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     const orderRows = [];
     let customer = '';
@@ -186,63 +187,43 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
 }
 
 // ============================================================================
-// MAIN MESSAGE HANDLER - FIXED: Added missing 'lower' variable
+// MAIN MESSAGE HANDLER
 // ============================================================================
 
 async function handleMessage(text, userId) {
   try {
     const lower = text.toLowerCase().trim();
 
-    // Save to inbox
-    const { saveToInbox } = require('./inboxService');
+    // Save to inbox - USE IMPORTED FUNCTION
     await saveToInbox(userId, text);
 
     // ========================================================================
-    // ✅ PRIORITY CHECK: Stock Adjustment Detection (BEFORE order parsing)
+    // STOCK ADJUSTMENT DETECTION
     // ========================================================================
     
-    const stockKeywords = [
-      'เหลือ', 'มี', 'เติม', 'ลด', 'เพิ่ม', 'ปรับ', 
-      'add', 'subtract', 'set', 'stock', 'inventory'
-    ];
+    const stockKeywords = ['เหลือ', 'มี', 'เติม', 'ลด', 'เพิ่ม', 'ปรับ'];
+    const orderKeywords = ['สั่ง', 'ซื้อ', 'เอา', 'ขอ', 'จอง'];
+    const customerPrefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ร้าน', 'ป้า'];
     
-    const orderKeywords = [
-      'สั่ง', 'ซื้อ', 'เอา', 'ขอ', 'จอง',
-      'order', 'buy', 'want'
-    ];
-    
-    // Count keywords
     const hasStockKeywords = stockKeywords.some(kw => lower.includes(kw));
     const hasOrderKeywords = orderKeywords.some(kw => lower.includes(kw));
-    
-    // Count customer indicators (ชื่อร้าน/คุณ/พี่)
-    const customerPrefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ร้าน', 'ป้า'];
     const hasCustomerPrefix = customerPrefixes.some(prefix => lower.includes(prefix));
-    
-    // Decision Logic:
-    // 1. If has "เหลือ/มี" WITHOUT customer name = Stock Adjustment
-    // 2. If has "สั่ง/ซื้อ" WITH customer name = Order
-    // 3. If ambiguous, check pattern
     
     let isLikelyStockAdjustment = false;
     
     if (hasStockKeywords && !hasOrderKeywords && !hasCustomerPrefix) {
-      // Clear stock adjustment: "น้ำแข็ง เหลือ 5"
       isLikelyStockAdjustment = true;
     } else if (lower.match(/^[ก-๙a-z\s]+\s+(เหลือ|มี)\s+\d+/i)) {
-      // Pattern: [สินค้า] [เหลือ/มี] [จำนวน]
-      // Example: "น้ำแข็งหลอด เหลือ 10"
       isLikelyStockAdjustment = true;
     }
     
     Logger.info(`🔍 Detection: Stock=${hasStockKeywords}, Order=${hasOrderKeywords}, Customer=${hasCustomerPrefix}, IsStockAdj=${isLikelyStockAdjustment}`);
 
     // ========================================================================
-    // WELCOME MESSAGE
+    // WELCOME
     // ========================================================================
     
     if (lower === 'start' || lower === 'เริ่ม' || lower === 'hello' || lower === 'สวัสดี') {
-      const { AccessControl } = require('./accessControl');
       const isAdmin = AccessControl.isAdmin(userId);
       
       let welcome = `👋 ยินดีต้อนรับสู่ Order Bot!\n${'='.repeat(40)}\n\n`;
@@ -272,11 +253,10 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // HELP COMMAND
+    // HELP
     // ========================================================================
     
     if (lower === 'help' || lower === 'ช่วย' || lower === 'สอน') {
-      const { getHelpMessage } = require('./messageHandlerService');
       return { success: true, message: getHelpMessage(userId) };
     }
 
@@ -284,19 +264,14 @@ async function handleMessage(text, userId) {
     // BUSINESS COMMANDS
     // ========================================================================
     
-    const { handleBusinessCommand } = require('./businessCommands');
     const businessResult = await handleBusinessCommand(text, userId);
     if (businessResult && businessResult.success) {
       return businessResult;
     }
 
     // ========================================================================
-    // ADMIN QUICK COMMANDS
+    // ADMIN COMMANDS
     // ========================================================================
-    
-    const { generateDailySummary } = require('./dashboardService');
-    const { loadStockCache, loadCustomerCache } = require('./cacheManager');
-    const { smartLearner } = require('./smartOrderLearning');
     
     if (lower === 'สรุป' || lower.includes('สรุปวันนี้')) {
       const summary = await generateDailySummary();
@@ -304,7 +279,6 @@ async function handleMessage(text, userId) {
     }
     
     if (lower === 'inbox' || lower.includes('ประวัติ')) {
-      const { generateInboxSummary } = require('./inboxService');
       const inbox = await generateInboxSummary(50);
       return { success: true, message: inbox };
     }
@@ -319,8 +293,6 @@ async function handleMessage(text, userId) {
     // ========================================================================
     // PAYMENT UPDATE
     // ========================================================================
-    
-    const { updateOrderPaymentStatus, getLastOrderNumber } = require('./orderService');
     
     if (lower === 'จ่าย' || lower === 'จ่ายแล้ว') {
       const lastOrderNo = await getLastOrderNumber();
@@ -360,7 +332,6 @@ async function handleMessage(text, userId) {
     // ========================================================================
     
     if (lower.startsWith('ส่ง ')) {
-      const { updateDeliveryPerson } = require('./messageHandlerService');
       const deliveryMatch = text.match(/ส่ง\s+(?:#(\d+)\s+)?(.+)/i);
       
       if (deliveryMatch) {
@@ -385,8 +356,6 @@ async function handleMessage(text, userId) {
     // ========================================================================
     
     if (lower === 'ยกเลิก' || lower.startsWith('ยกเลิก ')) {
-      const { cancelOrder } = require('./inboxService');
-      
       const orderNoMatch = text.match(/#(\d+)/);
       const orderNo = orderNoMatch ? parseInt(orderNoMatch[1]) : await getLastOrderNumber();
       
@@ -416,9 +385,6 @@ async function handleMessage(text, userId) {
     // ========================================================================
     
     if (lower.includes('เครดิต') || lower === 'credit') {
-      const { generateEnhancedCreditReport, getCreditSummaryWithAlerts } = require('./creditService');
-      
-      // Specific customer credit check
       if (lower.startsWith('เครดิต ')) {
         const customerName = text.replace(/เครดิต/i, '').trim();
         
@@ -451,18 +417,14 @@ async function handleMessage(text, userId) {
         return { success: true, message: msg };
       }
       
-      // General credit report
       const report = await generateEnhancedCreditReport();
       return { success: true, message: report };
     }
 
     // ========================================================================
-    // ✅ STOCK ADJUSTMENT - WITH IMPROVED DETECTION
+    // STOCK ADJUSTMENT
     // ========================================================================
     
-    const { parseAdjustmentCommand, adjustStock } = require('./stockAdjustment');
-    
-    // Force stock adjustment if detected
     if (isLikelyStockAdjustment) {
       Logger.info('🔧 Detected as stock adjustment');
       
@@ -492,7 +454,6 @@ async function handleMessage(text, userId) {
         );
         
         if (result.success) {
-          const { formatStockAdjustmentSuccess } = require('./messageHandlerService');
           return {
             success: true,
             message: formatStockAdjustmentSuccess(result)
@@ -504,10 +465,9 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // ORDER PARSING (Only if NOT stock adjustment)
+    // ORDER PARSING
     // ========================================================================
     
-    const { parseOrder } = require('./orderParser');
     const aiResults = await parseOrder(text);
     
     if (!aiResults || aiResults.length === 0) {
@@ -520,7 +480,6 @@ async function handleMessage(text, userId) {
       };
     }
 
-    const { Logger } = require('./logger');
     let finalResponses = [];
 
     for (const res of aiResults) {
@@ -528,18 +487,15 @@ async function handleMessage(text, userId) {
 
       switch (res.intent) {
         case 'disambiguation':
-          const { formatDisambiguationMessage } = require('./messageHandlerService');
           finalResponses.push(formatDisambiguationMessage(res));
           break;
 
         case 'order':
-          const { executeOrderLogic } = require('./messageHandlerService');
           const orderResult = await executeOrderLogic(res, userId);
           finalResponses.push(orderResult.message);
           break;
 
         case 'payment':
-          const { executePaymentLogic } = require('./messageHandlerService');
           const paymentResult = await executePaymentLogic(res, userId);
           finalResponses.push(paymentResult.message);
           break;
@@ -555,7 +511,6 @@ async function handleMessage(text, userId) {
     };
 
   } catch (error) {
-    const { Logger } = require('./logger');
     Logger.error('handleMessage error', error);
     return {
       success: false,
@@ -570,16 +525,15 @@ async function handleMessage(text, userId) {
 
 async function executeOrderLogic(parsed, userId) {
   try {
-    // Smart Correction & Learning
+    const { getCustomerCache } = require('./cacheManager');
+    
     parsed = applySmartCorrection(parsed);
     const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
     if (prediction.success && prediction.confidence === 'high') {
       parsed.items = prediction.items || parsed.items;
     }
 
-    // Auto-add customer
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
-      const { getCustomerCache } = require('./cacheManager');
       const customerCache = getCustomerCache();
       const customerExists = customerCache.some(c => 
         c.name.toLowerCase() === parsed.customer.toLowerCase()
@@ -589,7 +543,6 @@ async function executeOrderLogic(parsed, userId) {
       }
     }
 
-    // Prepare order data
     const orderData = {
       customer: parsed.customer || 'ไม่ระบุ',
       items: parsed.items,
@@ -604,7 +557,6 @@ async function executeOrderLogic(parsed, userId) {
     const autoDecision = shouldAutoProcess(parsed, totalValue);
     monitor.recordDecision(autoDecision, 'pending');
 
-    // Create order
     const result = await createOrderTransaction(orderData);
     
     if (result.success) {
@@ -613,7 +565,6 @@ async function executeOrderLogic(parsed, userId) {
       let extraMessages = [];
 
       if (parsed.isPaid) {
-        const { updateOrderPaymentStatus } = require('./orderService');
         await updateOrderPaymentStatus(result.orderNo, 'จ่ายแล้ว');
         extraMessages.push('💸 บันทึกรับเงินแล้ว');
       }
@@ -672,17 +623,15 @@ async function executePaymentLogic(res, userId) {
   } catch (error) {
     Logger.error('executePaymentLogic failed', error);
     return {
-      success: false,
-      message: '❌ เกิดข้อผิดพลาดในการอัปเดตการชำระเงิน'
+    success: false,
+    message: '❌ เกิดข้อผิดพลาดในการอัปเดตการชำระเงิน'
     };
   }
 }
-
 // ============================================================================
 // EXPORTS
 // ============================================================================
-
 module.exports = {
-  handleMessage,
-  updateDeliveryPerson
+handleMessage,
+updateDeliveryPerson
 };
