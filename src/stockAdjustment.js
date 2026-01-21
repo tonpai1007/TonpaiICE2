@@ -1,4 +1,4 @@
-// src/stockAdjustment.js - FIXED: Strict Filtering & Name Length Priority
+// src/stockAdjustment.js - FIXED: ลดความสับสน + แม่นยำขึ้น
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { getThaiDateTimeString, normalizeText } = require('./utils');
@@ -6,7 +6,7 @@ const { getSheetData, updateSheetData, appendSheetData } = require('./googleServ
 const { getStockCache, loadStockCache } = require('./cacheManager');
 
 // ============================================================================
-// ENHANCED KEYWORD EXTRACTION
+// ENHANCED: Extract Keywords แม่นยำขึ้น
 // ============================================================================
 
 function extractStockKeywords(itemName) {
@@ -15,6 +15,7 @@ function extractStockKeywords(itemName) {
   
   keywords.add(normalized);
   
+  // Tokenize
   const tokens = itemName.split(/\s+/);
   tokens.forEach(token => {
     const norm = normalizeText(token);
@@ -23,28 +24,21 @@ function extractStockKeywords(itemName) {
     }
   });
   
-  const thaiNumbers = {
-    'หนึ่ง': '1', 'สอง': '2', 'สาม': '3', 'สี่': '4', 'ห้า': '5',
-    'หก': '6', 'เจ็ด': '7', 'แปด': '8', 'เก้า': '9', 'สิบ': '10'
-  };
-  
-  for (const [thai, num] of Object.entries(thaiNumbers)) {
-    if (itemName.includes(thai)) {
-      keywords.add(num);
-    }
-  }
-  
+  // Common product variations
   const variations = {
-    'น้ำแข็ง': ['นำเข็ง', 'น้ำแข็ง', 'ice', 'แข็ง'],
+    'น้ำแข็ง': ['นําเเข็ง', 'น้ำเเข็ง', 'ice', 'แข็ง', 'นํา'],
     'หลอด': ['tube', 'ท่อ'],
     'แผ่น': ['sheet', 'เเผ่น'],
     'บด': ['crushed', 'บด'],
     'ถุง': ['bag', 'ถุง', 'กระสอบ'],
-    'โค้ก': ['coke', 'โคก', 'coca'],
-    'เปปซี่': ['pepsi', 'เป๊ปซี่'],
-    'น้ำดื่ม': ['water', 'น้ำ', 'drinking'],
+    'โค้ก': ['coke', 'โค', 'coca', 'โคก'],
+    'เป็ปซี่': ['pepsi', 'เป๊ปซี่', 'เปปซี่'],
+    'น้ำดื่ม': ['water', 'น้ำ', 'drinking', 'นํา'],
     'ลัง': ['box', 'case', 'รัง', 'ลัง', 'crate'],
-    'แพ็ค': ['pack', 'แพค', 'แพ็ค', 'โหล']
+    'แพ็ค': ['pack', 'แพค', 'แพ็ค', 'โหล'],
+    'สิงห์': ['singha', 'singh', 'singห์'],
+    'ช้าง': ['chang', 'elephant'],
+    'ลีโอ': ['leo']
   };
   
   for (const [key, vars] of Object.entries(variations)) {
@@ -57,92 +51,133 @@ function extractStockKeywords(itemName) {
 }
 
 // ============================================================================
-// STRICT FUZZY MATCHING (FILTER LOGIC)
+// IMPROVED: Fuzzy Match with Weighted Scoring
 // ============================================================================
 
 function fuzzyMatchStock(searchTerm, stockCache, priceHint = null, unitHint = null) {
   const normalized = normalizeText(searchTerm);
   const keywords = extractStockKeywords(searchTerm);
   
-  Logger.info(`🔍 Searching: "${searchTerm}" (unit: ${unitHint || '-'}, price: ${priceHint || '-'})`);
+  Logger.info(`🔍 Searching: "${searchTerm}" (price=${priceHint || '-'}, unit=${unitHint || '-'})`);
   
-  // 1. กรองเบื้องต้นด้วยชื่อ (ต้องมีคำค้นหาอยู่ในชื่อ หรือชื่ออยู่ในคำค้นหา)
+  // Phase 1: Initial filtering
   let candidates = stockCache.filter(item => {
     const itemNorm = normalizeText(item.item);
-    return itemNorm.includes(normalized) || normalized.includes(itemNorm);
+    
+    // Direct substring match
+    if (itemNorm.includes(normalized) || normalized.includes(itemNorm)) {
+      return true;
+    }
+    
+    // Keyword overlap
+    const itemKeywords = extractStockKeywords(item.item);
+    const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
+    
+    return overlap >= 1;
   });
 
-  if (candidates.length === 0) {
-    // ถ้าไม่เจอแบบตรงๆ ลองหาด้วย Keywords
-    candidates = stockCache.filter(item => {
-      const itemKeywords = extractStockKeywords(item.item);
-      return keywords.some(k => itemKeywords.includes(k));
-    });
-  }
+  Logger.info(`📊 Initial candidates: ${candidates.length}`);
 
-  // 2. ⚡ STRICT FILTER: ตัดทิ้งทันทีถ้าราคาหรือหน่วยไม่ตรง
+  // Phase 2: STRICT filtering by hints
   if (priceHint) {
-    const strictPrice = candidates.filter(item => Math.abs(item.price - priceHint) <= (priceHint * 0.05)); // ยอมให้ต่างแค่ 5%
-    if (strictPrice.length > 0) {
-      Logger.info(`💰 Price Filter: Reduced from ${candidates.length} to ${strictPrice.length} items`);
-      candidates = strictPrice;
+    const priceMatched = candidates.filter(item => 
+      Math.abs(item.price - priceHint) <= Math.max(5, priceHint * 0.15) // ±15% หรือ ±5฿
+    );
+    
+    if (priceMatched.length > 0) {
+      Logger.info(`💰 Price filter: ${candidates.length} → ${priceMatched.length}`);
+      candidates = priceMatched;
     }
   }
 
   if (unitHint) {
-    const strictUnit = candidates.filter(item => {
+    const unitMatched = candidates.filter(item => {
       const itemUnit = normalizeText(item.unit || '');
-      const itemNorm = normalizeText(item.item);
-      // เช็คทั้งในคอลัมน์หน่วย และในชื่อสินค้า
-      return itemUnit.includes(unitHint) || itemNorm.includes(unitHint);
+      const itemName = normalizeText(item.item);
+      
+      return itemUnit.includes(unitHint) || itemName.includes(unitHint);
     });
     
-    if (strictUnit.length > 0) {
-      Logger.info(`📦 Unit Filter: Reduced from ${candidates.length} to ${strictUnit.length} items`);
-      candidates = strictUnit;
+    if (unitMatched.length > 0) {
+      Logger.info(`📦 Unit filter: ${candidates.length} → ${unitMatched.length}`);
+      candidates = unitMatched;
     }
   }
 
-  // 3. ให้คะแนนผู้รอดชีวิต
+  // Phase 3: Weighted scoring
   const matches = candidates.map(item => {
     const itemNorm = normalizeText(item.item);
     const itemKeywords = extractStockKeywords(item.item);
     let score = 0;
     
-    // Name Match
-    if (itemNorm === normalized) score += 100;
-    else if (itemNorm.includes(normalized)) score += 60;
-    else if (normalized.includes(itemNorm)) score += 50;
+    // 1. Exact name match = HUGE bonus
+    if (itemNorm === normalized) {
+      score += 1000;
+    }
+    // 2. Full substring match
+    else if (itemNorm.includes(normalized)) {
+      score += 500;
+      
+      // Bonus: ถ้าเป็น prefix (เริ่มต้นด้วย)
+      if (itemNorm.startsWith(normalized)) {
+        score += 100;
+      }
+    }
+    // 3. Reverse substring
+    else if (normalized.includes(itemNorm)) {
+      score += 300;
+    }
     
-    // Keyword Overlap
+    // 4. Keyword overlap score
     const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
-    score += overlap * 20;
-
-    // Price Bonus (ถ้าตรงเป๊ะๆ ให้เพิ่มอีก)
-    if (priceHint && item.price === priceHint) score += 50;
-
-    // Unit Bonus
-    if (unitHint && (normalizeText(item.unit || '').includes(unitHint))) score += 50;
-
-    // ⚡ LENGTH PENALTY: ถ้าคะแนนเท่ากัน ตัวที่ชื่อสั้นกว่า (ใกล้เคียงคำค้นหามากกว่า) ชนะ
-    // ลบคะแนนตามความยาวส่วนเกิน
+    score += overlap * 50;
+    
+    // 5. Price match bonus
+    if (priceHint) {
+      if (item.price === priceHint) {
+        score += 200;
+      } else if (Math.abs(item.price - priceHint) <= priceHint * 0.05) {
+        score += 100;
+      }
+    }
+    
+    // 6. Unit match bonus
+    if (unitHint) {
+      const itemUnit = normalizeText(item.unit || '');
+      if (itemUnit.includes(unitHint)) {
+        score += 150;
+      }
+    }
+    
+    // 7. Length penalty (prefer shorter, more specific matches)
     const lengthDiff = Math.abs(itemNorm.length - normalized.length);
-    score -= (lengthDiff * 0.5); 
+    score -= (lengthDiff * 2);
+    
+    // 8. Stock availability bonus
+    if (item.stock > 0) {
+      score += 10;
+    }
 
     return { item, score };
   });
   
+  // Sort by score
   matches.sort((a, b) => b.score - a.score);
   
   if (matches.length > 0) {
-    Logger.info(`📊 Best match: ${matches[0].item.item} (${matches[0].score})`);
+    Logger.info(`🏆 Top match: ${matches[0].item.item} (score: ${matches[0].score})`);
+    
+    // Log top 3 for debugging
+    matches.slice(0, 3).forEach((m, i) => {
+      Logger.debug(`  ${i + 1}. ${m.item.item} - ${m.score} pts`);
+    });
   }
   
   return matches;
 }
 
 // ============================================================================
-// ENHANCED COMMAND PARSER
+// ENHANCED: Parse Adjustment Command
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
@@ -154,45 +189,56 @@ async function parseAdjustmentCommand(text) {
     return { isAdjustment: false, reason: 'no_number' };
   }
   
-  // Operation keywords
+  // Determine operation
   let operation = 'set';
   const lower = text.toLowerCase();
   
-  if (lower.match(/เติม|เพิ่ม|add/)) operation = 'add';
-  else if (lower.match(/ลด|ลบ|subtract/)) operation = 'subtract';
+  if (lower.match(/เติม|เพิ่ม|add/)) {
+    operation = 'add';
+  } else if (lower.match(/ลด|ลบ|subtract/)) {
+    operation = 'subtract';
+  }
   
+  // Check if looks like order (not stock adjustment)
   if (operation === 'set' && !text.match(/มี|เหลือ|set/)) {
     if (text.match(/สั่ง|ร้าน|พี่|คุณ|เอา/)) {
       return { isAdjustment: false, reason: 'looks_like_order' };
     }
   }
   
-  // Detect Unit Hint
+  // Detect unit hint
   let unitHint = null;
-  if (text.match(/รัง|ลัง|crate/)) unitHint = 'ลัง';
-  else if (text.match(/ขวด/)) unitHint = 'ขวด';
-  else if (text.match(/ถุง|กระสอบ/)) unitHint = 'ถุง';
-  else if (text.match(/แพ็ค|แพค/)) unitHint = 'แพ็ค';
-  else if (text.match(/โหล/)) unitHint = 'โหล';
-
-  // Extract Price & Quantity
+  const unitPatterns = {
+    'ลัง': /รัง|ลัง|crate|box/i,
+    'ขวด': /ขวด|bottle/i,
+    'ถุง': /ถุง|กระสอบ|bag/i,
+    'แพ็ค': /แพ็ค|แพค|โหล|pack/i,
+    'โหล': /โหล|dozen/i
+  };
+  
+  for (const [unit, pattern] of Object.entries(unitPatterns)) {
+    if (pattern.test(text)) {
+      unitHint = normalizeText(unit);
+      break;
+    }
+  }
+  
+  // Extract price & quantity
   let value = null;
   let priceHint = null;
   const parsedNumbers = numbers.map(n => parseInt(n));
   
   if (parsedNumbers.length >= 2) {
-    value = parsedNumbers[parsedNumbers.length - 1]; // Assume last is qty
-    const possiblePrice = parsedNumbers[parsedNumbers.length - 2];
+    // Logic: เลขใหญ่ = ราคา, เลขเล็ก = จำนวน
+    const sorted = [...parsedNumbers].sort((a, b) => b - a);
     
-    // Logic: ราคาปกติมักจะไม่ใช่ 1-10 (ยกเว้นน้ำแข็ง) และจำนวนมักจะไม่ใช่หลักพัน
-    if (possiblePrice > 10 && value <= 1000) {
-      priceHint = possiblePrice;
-    } else if (possiblePrice <= 1000 && value > 10) {
-      value = possiblePrice;
-      priceHint = parsedNumbers[parsedNumbers.length - 1];
-    } else if (unitHint && possiblePrice > 50) { 
-      // ถ้าระบุหน่วยชัดเจน และเลขหน้าดูเหมือนราคา (เกิน 50) ให้เดาว่าเป็นราคาเลย
-      priceHint = possiblePrice;
+    if (sorted[0] > 50 && sorted[1] <= 100) {
+      priceHint = sorted[0];
+      value = sorted[1];
+    } else {
+      // Fallback: last = qty
+      value = parsedNumbers[parsedNumbers.length - 1];
+      priceHint = parsedNumbers[parsedNumbers.length - 2];
     }
   } else {
     value = parsedNumbers[0];
@@ -202,23 +248,37 @@ async function parseAdjustmentCommand(text) {
   let productName = text
     .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม|ลบ|set|add|subtract/gi, '')
     .replace(/\d+/g, '')
-    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|รัง|บาท|฿|แพ็ค|แพค|โหล|ละ|ราคา/gi, '') // เพิ่มคำว่า "ละ", "ราคา"
+    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|รัง|บาท|฿|แพ็ค|แพค|โหล|ละ|ราคา/gi, '')
     .trim();
   
-  if (!productName) return { isAdjustment: false, reason: 'no_product_name' };
-  if (!value || value <= 0) return { isAdjustment: false, reason: 'invalid_value' };
+  if (!productName) {
+    return { isAdjustment: false, reason: 'no_product_name' };
+  }
   
-  // Match with Hints
+  if (!value || value <= 0) {
+    return { isAdjustment: false, reason: 'invalid_value' };
+  }
+  
+  // Match with hints
   const matches = fuzzyMatchStock(productName, stockCache, priceHint, unitHint);
   
-  if (matches.length === 0) return { isAdjustment: false, reason: 'product_not_found' };
+  if (matches.length === 0) {
+    return { 
+      isAdjustment: false, 
+      reason: 'product_not_found',
+      searchTerm: productName
+    };
+  }
   
-  // Ambiguity Check (Strict)
-  // แจ้งสับสนก็ต่อเมื่อ คะแนนใกล้กันมาก และ ไม่ใช่สินค้าตัวเดียวกัน (Duplicate)
+  // Ambiguity check with STRICTER threshold
   if (matches.length > 1) {
     const scoreDiff = matches[0].score - matches[1].score;
-    if (scoreDiff < 5 && matches[0].item.item !== matches[1].item.item) {
-       return {
+    
+    // ถ้าคะแนนต่างกันน้อยกว่า 100 = สับสน
+    if (scoreDiff < 100 && matches[0].item.item !== matches[1].item.item) {
+      Logger.warn(`⚠️ Ambiguous: Top 2 scores are close (${matches[0].score} vs ${matches[1].score})`);
+      
+      return {
         isAdjustment: true,
         ambiguous: true,
         suggestions: matches.slice(0, 5).map(m => m.item),
@@ -228,6 +288,7 @@ async function parseAdjustmentCommand(text) {
     }
   }
   
+  // Clear winner
   return {
     isAdjustment: true,
     item: matches[0].item.item,
@@ -236,37 +297,45 @@ async function parseAdjustmentCommand(text) {
     operation: operation,
     priceHint: priceHint,
     originalText: text,
-    confidence: matches[0].score > 100 ? 'high' : 'medium'
+    confidence: matches[0].score > 500 ? 'high' : 'medium'
   };
 }
 
 // ============================================================================
-// ADJUST STOCK
+// ADJUST STOCK (unchanged)
 // ============================================================================
 
 async function adjustStock(itemName, value, operation = 'set', reason = 'manual') {
   try {
     const stockCache = getStockCache();
-    // ค้นหาแบบตรงตัวจากผลลัพธ์ parser
     const item = stockCache.find(i => i.item === itemName);
     
-    if (!item) return { success: false, error: `❌ ไม่พบสินค้า: ${itemName}` };
+    if (!item) {
+      return { success: false, error: `❌ ไม่พบสินค้า: ${itemName}` };
+    }
     
     const oldStock = item.stock;
     let newStock;
     
     switch (operation) {
-      case 'add': newStock = oldStock + value; break;
+      case 'add': 
+        newStock = oldStock + value; 
+        break;
       case 'subtract': 
         newStock = oldStock - value; 
-        if (newStock < 0) return { success: false, error: `❌ สต็อกไม่พอ (มี ${oldStock})` };
+        if (newStock < 0) {
+          return { success: false, error: `❌ สต็อกไม่พอ (มี ${oldStock})` };
+        }
         break;
-      case 'set': newStock = value; break;
+      case 'set': 
+        newStock = value; 
+        break;
     }
     
     // Update Sheet
     const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
     let rowIndex = -1;
+    
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] === item.item) {
         rowIndex = i + 1;
@@ -277,7 +346,7 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
     if (rowIndex !== -1) {
       await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${rowIndex}`, [[newStock]]);
       await logVariance(item.item, oldStock, newStock, newStock - oldStock, reason, operation);
-      await loadStockCache(true); 
+      await loadStockCache(true);
       
       return {
         success: true,
@@ -290,6 +359,7 @@ async function adjustStock(itemName, value, operation = 'set', reason = 'manual'
         operationText: getOperationText(operation, value)
       };
     }
+    
     return { success: false, error: '❌ Database Error' };
     
   } catch (error) {
@@ -303,12 +373,20 @@ async function logVariance(item, oldStock, newStock, difference, reason, operati
     const reasonText = `${operation} (${reason})`;
     const row = [getThaiDateTimeString(), item, oldStock, newStock, difference, reasonText];
     await appendSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F', [row]);
-  } catch (e) { Logger.error('Log failed', e); }
+  } catch (e) { 
+    Logger.error('Log failed', e); 
+  }
 }
 
 function getOperationText(op, val) {
-  return op === 'add' ? `เติม +${val}` : op === 'subtract' ? `ลด -${val}` : `ตั้งเป็น ${val}`;
+  return op === 'add' ? `เติม +${val}` : 
+         op === 'subtract' ? `ลด -${val}` : 
+         `ตั้งเป็น ${val}`;
 }
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
 
 module.exports = {
   parseAdjustmentCommand,

@@ -527,36 +527,60 @@ async function executeOrderLogic(parsed, userId) {
   try {
     const { getCustomerCache } = require('./cacheManager');
     
+    // Apply smart correction
     parsed = applySmartCorrection(parsed);
+    
+    // Apply smart learning
     const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
     if (prediction.success && prediction.confidence === 'high') {
       parsed.items = prediction.items || parsed.items;
     }
 
+    // Auto-add customer if not exists
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
       const customerCache = getCustomerCache();
       const customerExists = customerCache.some(c => 
         c.name.toLowerCase() === parsed.customer.toLowerCase()
       );
+      
       if (!customerExists) {
         await autoAddCustomer(parsed.customer);
       }
     }
 
+    // ✅ FIX: ตรวจสอบ payment status อย่างชัดเจน
+    let paymentStatus = 'unpaid';
+    
+    if (parsed.isPaid === true) {
+      paymentStatus = 'paid';
+      Logger.info('💰 Detected: PAID order');
+    }
+
+    // ✅ FIX: ตรวจสอบ delivery person
+    let deliveryPerson = '';
+    
+    if (parsed.deliveryPerson && parsed.deliveryPerson.trim() !== '') {
+      deliveryPerson = parsed.deliveryPerson.trim();
+      Logger.info(`🚚 Detected: Delivery by ${deliveryPerson}`);
+    }
+
+    // Prepare order data
     const orderData = {
       customer: parsed.customer || 'ไม่ระบุ',
       items: parsed.items,
-      deliveryPerson: parsed.deliveryPerson || '',
-      paymentStatus: parsed.isPaid ? 'จ่ายแล้ว' : 'unpaid'
+      deliveryPerson: deliveryPerson,
+      paymentStatus: paymentStatus
     };
     
     const totalValue = parsed.items.reduce((sum, item) => 
       sum + (item.quantity * item.stockItem.price), 0
     );
 
+    // Auto-process decision
     const autoDecision = shouldAutoProcess(parsed, totalValue);
     monitor.recordDecision(autoDecision, 'pending');
 
+    // Create order
     const result = await createOrderTransaction(orderData);
     
     if (result.success) {
@@ -564,15 +588,19 @@ async function executeOrderLogic(parsed, userId) {
 
       let extraMessages = [];
 
-      if (parsed.isPaid) {
+      // ✅ FIX: Update payment ONLY if paid
+      if (paymentStatus === 'paid') {
         await updateOrderPaymentStatus(result.orderNo, 'จ่ายแล้ว');
         extraMessages.push('💸 บันทึกรับเงินแล้ว');
+        Logger.success(`✅ Payment marked as PAID for order #${result.orderNo}`);
       }
 
-      if (parsed.deliveryPerson) {
-        extraMessages.push(`🚚 ฝากส่งโดย: ${parsed.deliveryPerson}`);
+      // ✅ FIX: Show delivery info if provided
+      if (deliveryPerson) {
+        extraMessages.push(`🚚 กำลังส่งโดย: ${deliveryPerson}`);
       }
 
+      // Format response
       let responseMsg = formatOrderSuccess(
         result.orderNo,
         result.customer,
@@ -597,11 +625,16 @@ async function executeOrderLogic(parsed, userId) {
         message: `❌ สร้างออเดอร์ไม่สำเร็จ: ${result.error}`
       };
     }
+    
   } catch (error) {
     Logger.error('executeOrderLogic failed', error);
-    return { success: false, message: '❌ ระบบขัดข้อง' };
+    return { 
+      success: false, 
+      message: '❌ ระบบขัดข้อง' 
+    };
   }
 }
+
 
 async function executePaymentLogic(res, userId) {
   try {
@@ -633,5 +666,6 @@ async function executePaymentLogic(res, userId) {
 // ============================================================================
 module.exports = {
 handleMessage,
-updateDeliveryPerson
+updateDeliveryPerson,
+executeOrderLogic 
 };
