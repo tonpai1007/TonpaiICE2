@@ -1,4 +1,4 @@
-// messageHandlerService.js - FIXED: Complete integration
+// messageHandlerService.js - FIXED: Missing variable definition
 const { Logger } = require('./logger');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction, updateOrderPaymentStatus, getLastOrderNumber } = require('./orderService');
@@ -143,7 +143,7 @@ function getHelpMessage(userId) {
 }
 
 // ============================================================================
-// UPDATE DELIVERY PERSON (NEW FUNCTION)
+// UPDATE DELIVERY PERSON
 // ============================================================================
 
 async function updateDeliveryPerson(orderNo, deliveryPerson) {
@@ -186,7 +186,7 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
 }
 
 // ============================================================================
-// MAIN MESSAGE HANDLER (FIXED)
+// MAIN MESSAGE HANDLER - FIXED: Added missing 'lower' variable
 // ============================================================================
 
 async function handleMessage(text, userId) {
@@ -196,6 +196,46 @@ async function handleMessage(text, userId) {
     // Save to inbox
     const { saveToInbox } = require('./inboxService');
     await saveToInbox(userId, text);
+
+    // ========================================================================
+    // ✅ PRIORITY CHECK: Stock Adjustment Detection (BEFORE order parsing)
+    // ========================================================================
+    
+    const stockKeywords = [
+      'เหลือ', 'มี', 'เติม', 'ลด', 'เพิ่ม', 'ปรับ', 
+      'add', 'subtract', 'set', 'stock', 'inventory'
+    ];
+    
+    const orderKeywords = [
+      'สั่ง', 'ซื้อ', 'เอา', 'ขอ', 'จอง',
+      'order', 'buy', 'want'
+    ];
+    
+    // Count keywords
+    const hasStockKeywords = stockKeywords.some(kw => lower.includes(kw));
+    const hasOrderKeywords = orderKeywords.some(kw => lower.includes(kw));
+    
+    // Count customer indicators (ชื่อร้าน/คุณ/พี่)
+    const customerPrefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ร้าน', 'ป้า'];
+    const hasCustomerPrefix = customerPrefixes.some(prefix => lower.includes(prefix));
+    
+    // Decision Logic:
+    // 1. If has "เหลือ/มี" WITHOUT customer name = Stock Adjustment
+    // 2. If has "สั่ง/ซื้อ" WITH customer name = Order
+    // 3. If ambiguous, check pattern
+    
+    let isLikelyStockAdjustment = false;
+    
+    if (hasStockKeywords && !hasOrderKeywords && !hasCustomerPrefix) {
+      // Clear stock adjustment: "น้ำแข็ง เหลือ 5"
+      isLikelyStockAdjustment = true;
+    } else if (lower.match(/^[ก-๙a-z\s]+\s+(เหลือ|มี)\s+\d+/i)) {
+      // Pattern: [สินค้า] [เหลือ/มี] [จำนวน]
+      // Example: "น้ำแข็งหลอด เหลือ 10"
+      isLikelyStockAdjustment = true;
+    }
+    
+    Logger.info(`🔍 Detection: Stock=${hasStockKeywords}, Order=${hasOrderKeywords}, Customer=${hasCustomerPrefix}, IsStockAdj=${isLikelyStockAdjustment}`);
 
     // ========================================================================
     // WELCOME MESSAGE
@@ -223,7 +263,8 @@ async function handleMessage(text, userId) {
       welcome += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
       welcome += `💡 พิมพ์ "help" เพื่อดูคู่มือการใช้งาน\n\n`;
       welcome += `ตัวอย่างคำสั่งง่ายๆ:\n`;
-      welcome += `• "เจ้แอน สั่ง โค้ก 30 จำนวน 5"\n`;
+      welcome += `• "เจ้แอน สั่ง โค้ก 30 จำนวน 5" (สั่งสินค้า)\n`;
+      welcome += `• "น้ำแข็ง เหลือ 10" (ปรับสต็อก)\n`;
       welcome += `• "จ่าย" (จ่ายออเดอร์ล่าสุด)\n`;
       welcome += `• "ส่ง พี่แดง" (อัปเดตผู้ส่งของ)`;
       
@@ -235,13 +276,15 @@ async function handleMessage(text, userId) {
     // ========================================================================
     
     if (lower === 'help' || lower === 'ช่วย' || lower === 'สอน') {
+      const { getHelpMessage } = require('./messageHandlerService');
       return { success: true, message: getHelpMessage(userId) };
     }
 
     // ========================================================================
-    // BUSINESS COMMANDS (Must check before other processing)
+    // BUSINESS COMMANDS
     // ========================================================================
     
+    const { handleBusinessCommand } = require('./businessCommands');
     const businessResult = await handleBusinessCommand(text, userId);
     if (businessResult && businessResult.success) {
       return businessResult;
@@ -250,6 +293,10 @@ async function handleMessage(text, userId) {
     // ========================================================================
     // ADMIN QUICK COMMANDS
     // ========================================================================
+    
+    const { generateDailySummary } = require('./dashboardService');
+    const { loadStockCache, loadCustomerCache } = require('./cacheManager');
+    const { smartLearner } = require('./smartOrderLearning');
     
     if (lower === 'สรุป' || lower.includes('สรุปวันนี้')) {
       const summary = await generateDailySummary();
@@ -262,7 +309,7 @@ async function handleMessage(text, userId) {
       return { success: true, message: inbox };
     }
     
-    if (lower === 'รีเฟรช') {
+    if (lower === 'รีเฟรช' || lower === 'refresh') {
       await loadStockCache(true);
       await loadCustomerCache(true);
       await smartLearner.loadOrderHistory();
@@ -270,8 +317,10 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // PAYMENT UPDATE (Simple shortcut)
+    // PAYMENT UPDATE
     // ========================================================================
+    
+    const { updateOrderPaymentStatus, getLastOrderNumber } = require('./orderService');
     
     if (lower === 'จ่าย' || lower === 'จ่ายแล้ว') {
       const lastOrderNo = await getLastOrderNumber();
@@ -289,7 +338,6 @@ async function handleMessage(text, userId) {
       return { success: false, message: '❌ ไม่พบออเดอร์ล่าสุด' };
     }
 
-    // Payment with order number
     if (lower.startsWith('จ่าย #') || lower.startsWith('จ่าย#')) {
       const orderNoMatch = text.match(/#(\d+)/);
       if (orderNoMatch) {
@@ -308,10 +356,11 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // DELIVERY UPDATE (NEW FEATURE)
+    // DELIVERY UPDATE
     // ========================================================================
     
     if (lower.startsWith('ส่ง ')) {
+      const { updateDeliveryPerson } = require('./messageHandlerService');
       const deliveryMatch = text.match(/ส่ง\s+(?:#(\d+)\s+)?(.+)/i);
       
       if (deliveryMatch) {
@@ -332,7 +381,7 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // CANCEL ORDER (NEW FEATURE)
+    // CANCEL ORDER
     // ========================================================================
     
     if (lower === 'ยกเลิก' || lower.startsWith('ยกเลิก ')) {
@@ -363,97 +412,115 @@ async function handleMessage(text, userId) {
     }
 
     // ========================================================================
-    // STOCK ADJUSTMENT (Auto-detect)
+    // CREDIT COMMANDS
     // ========================================================================
     
-    const stockAdjustment = await parseAdjustmentCommand(text);
-    
-    if (stockAdjustment.isAdjustment) {
-      if (stockAdjustment.ambiguous) {
-        let msg = `🤔 พบสินค้าหลายรายการ: "${stockAdjustment.productName}"\n\n`;
+    if (lower.includes('เครดิต') || lower === 'credit') {
+      const { generateEnhancedCreditReport, getCreditSummaryWithAlerts } = require('./creditService');
+      
+      // Specific customer credit check
+      if (lower.startsWith('เครดิต ')) {
+        const customerName = text.replace(/เครดิต/i, '').trim();
         
-        stockAdjustment.suggestions.forEach((item, idx) => {
-          msg += `${idx + 1}. ${item.item}\n`;
-          msg += `   💰 ${item.price}฿ │ 📦 ${item.stock} ${item.unit}\n\n`;
+        const summary = await getCreditSummaryWithAlerts();
+        const customer = summary.customers.find(c => 
+          c.name.toLowerCase().includes(customerName.toLowerCase())
+        );
+        
+        if (!customer) {
+          return {
+            success: false,
+            message: `❌ ไม่พบเครดิตของ ${customerName}\n\nลูกค้ารายนี้อาจจ่ายเงินหมดแล้ว หรือยังไม่เคยมีเครดิตค้าง`
+          };
+        }
+        
+        let msg = `💳 เครดิตของ ${customer.name}\n${'='.repeat(40)}\n\n`;
+        msg += `ยอดรวม: ${customer.totalAmount.toLocaleString()}฿\n\n`;
+        
+        customer.orders.forEach(order => {
+          let status = '';
+          if (order.isOverdue) {
+            status = `🔴 เกิน ${Math.abs(order.daysUntilDue)} วัน`;
+          } else if (order.daysUntilDue <= 7) {
+            status = `⏰ เหลือ ${order.daysUntilDue} วัน`;
+          }
+          
+          msg += `#${order.orderNo}: ${order.amount.toLocaleString()}฿ ${status}\n`;
         });
-        
-        msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-        msg += `💡 ระบุให้ชัดเจน:\n`;
-        msg += `ตัวอย่าง: "เติม ${stockAdjustment.suggestions[0].item} ${stockAdjustment.suggestions[0].price} ${stockAdjustment.value}"\n\n`;
         
         return { success: true, message: msg };
       }
       
-      const result = await adjustStock(
-        stockAdjustment.item,
-        stockAdjustment.value,
-        stockAdjustment.operation,
-        'manual_adjustment'
-      );
-      
-      if (result.success) {
-        return {
-          success: true,
-          message: formatStockAdjustmentSuccess(result)
-        };
-      } else {
-        return { success: false, message: result.error };
-      }
-    }
-    if (lower.includes('เครดิต') || lower === 'credit') {
-      const { generateEnhancedCreditReport } = require('./creditService');
+      // General credit report
       const report = await generateEnhancedCreditReport();
       return { success: true, message: report };
     }
 
-    // Quick credit check for specific customer
-    if (lower.startsWith('เครดิต ')) {
-      const { getCreditSummaryWithAlerts } = require('./creditService');
-      const customerName = text.replace(/เครดิต/i, '').trim();
-      
-      const summary = await getCreditSummaryWithAlerts();
-      const customer = summary.customers.find(c => 
-        c.name.toLowerCase().includes(customerName.toLowerCase())
-      );
-      
-      if (!customer) {
-        return {
-          success: false,
-          message: `❌ ไม่พบเครดิตของ ${customerName}\n\nลูกค้ารายนี้อาจจ่ายเงินหมดแล้ว หรือยังไม่เคยมีเครดิตค้าง`
-        };
-      }
-      
-      let msg = `💳 เครดิตของ ${customer.name}\n${'='.repeat(40)}\n\n`;
-      msg += `ยอดรวม: ${customer.totalAmount.toLocaleString()}฿\n\n`;
-      
-      customer.orders.forEach(order => {
-        let status = '';
-        if (order.isOverdue) {
-          status = `🔴 เกิน ${Math.abs(order.daysUntilDue)} วัน`;
-        } else if (order.daysUntilDue <= 7) {
-          status = `⏰ เหลือ ${order.daysUntilDue} วัน`;
-        }
-        
-        msg += `#${order.orderNo}: ${order.amount.toLocaleString()}฿ ${status}\n`;
-      });
-      
-      return { success: true, message: msg };
-    }
-
-
     // ========================================================================
-    // ORDER PARSING (With Smart Learning & Auto-Process)
+    // ✅ STOCK ADJUSTMENT - WITH IMPROVED DETECTION
     // ========================================================================
     
+    const { parseAdjustmentCommand, adjustStock } = require('./stockAdjustment');
+    
+    // Force stock adjustment if detected
+    if (isLikelyStockAdjustment) {
+      Logger.info('🔧 Detected as stock adjustment');
+      
+      const stockAdjustment = await parseAdjustmentCommand(text);
+      
+      if (stockAdjustment.isAdjustment) {
+        if (stockAdjustment.ambiguous) {
+          let msg = `🤔 พบสินค้าหลายรายการ: "${stockAdjustment.productName}"\n\n`;
+          
+          stockAdjustment.suggestions.forEach((item, idx) => {
+            msg += `${idx + 1}. ${item.item}\n`;
+            msg += `   💰 ${item.price}฿ │ 📦 ${item.stock} ${item.unit}\n\n`;
+          });
+          
+          msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+          msg += `💡 ระบุให้ชัดเจน:\n`;
+          msg += `ตัวอย่าง: "เติม ${stockAdjustment.suggestions[0].item} ${stockAdjustment.value}"\n\n`;
+          
+          return { success: true, message: msg };
+        }
+        
+        const result = await adjustStock(
+          stockAdjustment.item,
+          stockAdjustment.value,
+          stockAdjustment.operation,
+          'manual_adjustment'
+        );
+        
+        if (result.success) {
+          const { formatStockAdjustmentSuccess } = require('./messageHandlerService');
+          return {
+            success: true,
+            message: formatStockAdjustmentSuccess(result)
+          };
+        } else {
+          return { success: false, message: result.error };
+        }
+      }
+    }
+
+    // ========================================================================
+    // ORDER PARSING (Only if NOT stock adjustment)
+    // ========================================================================
+    
+    const { parseOrder } = require('./orderParser');
     const aiResults = await parseOrder(text);
     
     if (!aiResults || aiResults.length === 0) {
       return {
         success: false,
-        message: "❌ ไม่เข้าใจคำสั่ง\n\n💡 พิมพ์ \"help\" เพื่อดูคู่มือการใช้งาน"
+        message: "❌ ไม่เข้าใจคำสั่ง\n\n💡 พิมพ์ \"help\" เพื่อดูคู่มือการใช้งาน\n\n" +
+                 "หรือตรวจสอบรูปแบบ:\n" +
+                 "• สั่งสินค้า: \"[ร้าน] สั่ง [สินค้า] [ราคา] [จำนวน]\"\n" +
+                 "• ปรับสต็อก: \"[สินค้า] เหลือ/มี [จำนวน]\""
       };
     }
 
+    const { Logger } = require('./logger');
     let finalResponses = [];
 
     for (const res of aiResults) {
@@ -461,15 +528,18 @@ async function handleMessage(text, userId) {
 
       switch (res.intent) {
         case 'disambiguation':
+          const { formatDisambiguationMessage } = require('./messageHandlerService');
           finalResponses.push(formatDisambiguationMessage(res));
           break;
 
         case 'order':
+          const { executeOrderLogic } = require('./messageHandlerService');
           const orderResult = await executeOrderLogic(res, userId);
           finalResponses.push(orderResult.message);
           break;
 
         case 'payment':
+          const { executePaymentLogic } = require('./messageHandlerService');
           const paymentResult = await executePaymentLogic(res, userId);
           finalResponses.push(paymentResult.message);
           break;
@@ -485,6 +555,7 @@ async function handleMessage(text, userId) {
     };
 
   } catch (error) {
+    const { Logger } = require('./logger');
     Logger.error('handleMessage error', error);
     return {
       success: false,
@@ -494,19 +565,19 @@ async function handleMessage(text, userId) {
 }
 
 // ============================================================================
-// EXECUTION HELPERS (ENHANCED)
+// EXECUTION HELPERS
 // ============================================================================
 
 async function executeOrderLogic(parsed, userId) {
   try {
-    // 1. Smart Correction & Learning (เหมือนเดิม)
+    // Smart Correction & Learning
     parsed = applySmartCorrection(parsed);
     const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
     if (prediction.success && prediction.confidence === 'high') {
       parsed.items = prediction.items || parsed.items;
     }
 
-    // 2. Auto-add customer (เหมือนเดิม)
+    // Auto-add customer
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
       const { getCustomerCache } = require('./cacheManager');
       const customerCache = getCustomerCache();
@@ -518,52 +589,39 @@ async function executeOrderLogic(parsed, userId) {
       }
     }
 
-    // 3. เตรียมข้อมูลสร้างออเดอร์
+    // Prepare order data
     const orderData = {
       customer: parsed.customer || 'ไม่ระบุ',
       items: parsed.items,
-      deliveryPerson: parsed.deliveryPerson || '', // ✅ รับค่าคนส่งทันทีถ้ามี
-      paymentStatus: parsed.isPaid ? 'จ่ายแล้ว' : 'unpaid' // ✅ รับสถานะจ่ายเงินทันทีถ้ามี
+      deliveryPerson: parsed.deliveryPerson || '',
+      paymentStatus: parsed.isPaid ? 'จ่ายแล้ว' : 'unpaid'
     };
     
-    // คำนวณยอดรวม
     const totalValue = parsed.items.reduce((sum, item) => 
       sum + (item.quantity * item.stockItem.price), 0
     );
 
-    // เช็ค Auto Process
     const autoDecision = shouldAutoProcess(parsed, totalValue);
     monitor.recordDecision(autoDecision, 'pending');
 
-    // 4. 🔥 สร้างออเดอร์ (Create Order)
+    // Create order
     const result = await createOrderTransaction(orderData);
     
     if (result.success) {
       monitor.recordDecision(autoDecision, result.orderNo);
 
-      // ==========================================================
-      // ✅ EXTRA ACTIONS: จัดการสถานะเพิ่มเติมทันที (ถ้ามี)
-      // ==========================================================
-      
       let extraMessages = [];
 
-      // A. ถ้าสั่งว่า "จ่ายแล้ว" ให้ไปอัปเดตสถานะใน Sheet ทันที (เพื่อความชัวร์)
       if (parsed.isPaid) {
         const { updateOrderPaymentStatus } = require('./orderService');
         await updateOrderPaymentStatus(result.orderNo, 'จ่ายแล้ว');
         extraMessages.push('💸 บันทึกรับเงินแล้ว');
       }
 
-      // B. ถ้าระบุคนส่ง "ส่งพี่แดง"
       if (parsed.deliveryPerson) {
-        // (Function updateDeliveryPerson จะไปแก้ใน Google Sheet)
-        // บันทึก Log หรือแจ้งเตือนเพิ่มได้ตรงนี้
         extraMessages.push(`🚚 ฝากส่งโดย: ${parsed.deliveryPerson}`);
       }
 
-      // ==========================================================
-
-      // สร้างข้อความตอบกลับ
       let responseMsg = formatOrderSuccess(
         result.orderNo,
         result.customer,
@@ -573,7 +631,6 @@ async function executeOrderLogic(parsed, userId) {
         autoDecision.shouldAuto
       );
 
-      // เติมข้อความสถานะพิเศษต่อท้าย
       if (extraMessages.length > 0) {
         responseMsg += `\n\n✨ อัปเดตเพิ่มเติม:\n• ${extraMessages.join('\n• ')}`;
       }
