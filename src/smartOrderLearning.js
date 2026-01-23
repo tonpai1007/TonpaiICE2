@@ -51,22 +51,17 @@ class SmartOrderLearner {
         Logger.debug(`   - รายการ (Col H): "${sample[7]}"`); // ต้องเป็น JSON เท่านั้น
       }
 
-      for (const [index, order] of recentOrders.entries()) {
-        // Col C = ชื่อลูกค้า (Index 2)
-        const customer = (order[2] || '').trim();
-        // Col H = รายการสินค้าแบบ JSON (Index 7)
-        const lineItemsJson = order[7] || '[]';
+     for (const [index, order] of recentOrders.entries()) {
+        const customer = (order[2] || '').trim(); // Column C: ชื่อลูกค้า
+        const itemName = (order[3] || '').trim(); // Column D: ชื่อสินค้า
+        const quantity = parseInt(order[4]) || 1; // Column E: จำนวน
         
-        if (!customer || customer === 'ไม่ระบุ') continue;
+        if (!customer || customer === 'ไม่ระบุ' || !itemName) continue;
 
         try {
-          // พยายามแปลงข้อความเป็นโค้ด (JSON)
-          const lineItems = JSON.parse(lineItemsJson);
+          // แทนที่จะใช้ JSON.parse เราสร้าง Array ขึ้นมาเองเลยจากข้อมูลในแถวนั้น
+          const lineItems = [{ item: itemName, quantity: quantity }];
           
-          if (!Array.isArray(lineItems) || lineItems.length === 0) {
-             throw new Error('Not an array or empty');
-          }
-
           if (!this.customerPatterns.has(customer)) {
             this.customerPatterns.set(customer, {
               customer: customer,
@@ -81,40 +76,29 @@ class SmartOrderLearner {
           const pattern = this.customerPatterns.get(customer);
           pattern.totalOrders++;
 
-          // Track each item
-          lineItems.forEach(item => {
-            if (!item.item) return; // ข้ามถ้าไม่มีชื่อสินค้า
-            const itemName = item.item;
-            const key = normalizeText(itemName);
-            
-            if (!pattern.commonItems.has(key)) {
-              pattern.commonItems.set(key, {
-                name: itemName,
-                count: 0,
-                quantities: []
-              });
-            }
-            
-            const itemData = pattern.commonItems.get(key);
-            itemData.count++;
-            itemData.quantities.push(item.quantity || 1);
-          });
+          // บันทึกรายการสินค้าลงความจำ
+          const key = normalizeText(itemName);
+          if (!pattern.commonItems.has(key)) {
+            pattern.commonItems.set(key, {
+              name: itemName,
+              count: 0,
+              quantities: []
+            });
+          }
+          
+          const itemData = pattern.commonItems.get(key);
+          itemData.count++;
+          itemData.quantities.push(quantity);
 
-          // Store full order pattern
+          // บันทึกประวัติออเดอร์
           pattern.orders.push({
-            items: lineItems.map(i => ({
-              item: i.item,
-              quantity: i.quantity,
-              unit: i.unit
-            })),
-            timestamp: order[1]
+            items: lineItems,
+            timestamp: order[1] // Column B: วันที่
           });
           
-          if (pattern.orders.length > 20) {
-            pattern.orders.shift();
-          }
+          if (pattern.orders.length > 20) pattern.orders.shift();
 
-        } catch (parseError) {
+        }catch (parseError) {
           // ถ้าอ่านไม่ได้ จะแจ้งเตือนแค่ 3 ครั้งแรก เพื่อไม่ให้รกหน้าจอ
           errorCount++;
           if (errorCount <= 3) {
