@@ -1,4 +1,4 @@
-// src/middleware/webhook-security.js - FIXED: Complete security implementation
+// src/middleware/webhook-security.js - FIXED: Memory leak prevention
 const crypto = require('crypto');
 const { CONFIG } = require('../config');
 const { Logger } = require('../logger');
@@ -25,8 +25,6 @@ function verifyLineSignature(req, res, next) {
 
     if (signature !== expectedSignature) {
       Logger.error('❌ Invalid signature');
-      Logger.warn(`Expected: ${expectedSignature.substring(0, 10)}...`);
-      Logger.warn(`Received: ${signature.substring(0, 10)}...`);
       return res.status(401).json({ error: 'Unauthorized: Invalid signature' });
     }
 
@@ -39,13 +37,14 @@ function verifyLineSignature(req, res, next) {
 }
 
 // ============================================================================
-// RATE LIMITING - IN-MEMORY IMPLEMENTATION
+// RATE LIMITING - FIXED: Memory leak prevention
 // ============================================================================
 
 class RateLimiter {
   constructor(options = {}) {
     this.windowMs = options.windowMs || 60000; // 1 minute
     this.maxRequests = options.maxRequests || 100;
+    this.maxKeys = options.maxKeys || 10000; // ✅ NEW: Prevent unbounded growth
     this.requests = new Map();
     
     // Cleanup old entries every minute
@@ -55,6 +54,12 @@ class RateLimiter {
   check(identifier) {
     const now = Date.now();
     const key = identifier;
+    
+    // ✅ FIX: Enforce max keys limit
+    if (!this.requests.has(key) && this.requests.size >= this.maxKeys) {
+      Logger.warn(`⚠️ Rate limiter at max capacity (${this.maxKeys} keys), cleaning old entries`);
+      this.forceCleanup();
+    }
     
     if (!this.requests.has(key)) {
       this.requests.set(key, []);
@@ -87,27 +92,75 @@ class RateLimiter {
 
   cleanup() {
     const now = Date.now();
+    let cleanedCount = 0;
+    
     for (const [key, timestamps] of this.requests.entries()) {
       const validTimestamps = timestamps.filter(t => now - t < this.windowMs);
+      
       if (validTimestamps.length === 0) {
         this.requests.delete(key);
+        cleanedCount++;
       } else {
         this.requests.set(key, validTimestamps);
       }
     }
-    Logger.debug(`Rate limiter cleanup: ${this.requests.size} active keys`);
+    
+    if (cleanedCount > 0) {
+      Logger.debug(`Rate limiter cleanup: Removed ${cleanedCount} inactive keys, ${this.requests.size} active`);
+    }
+  }
+
+  // ✅ NEW: Force cleanup when at max capacity
+  forceCleanup() {
+    const now = Date.now();
+    
+    // Sort by oldest activity
+    const entries = Array.from(this.requests.entries())
+      .map(([key, timestamps]) => ({
+        key,
+        lastActivity: timestamps.length > 0 ? Math.max(...timestamps) : 0
+      }))
+      .sort((a, b) => a.lastActivity - b.lastActivity);
+    
+    // Remove oldest 20% of entries
+    const removeCount = Math.floor(entries.length * 0.2);
+    
+    for (let i = 0; i < removeCount; i++) {
+      this.requests.delete(entries[i].key);
+    }
+    
+    Logger.info(`⚡ Force cleanup: Removed ${removeCount} oldest entries`);
+  }
+
+  // ✅ NEW: Get stats for monitoring
+  getStats() {
+    const now = Date.now();
+    let totalRequests = 0;
+    
+    for (const timestamps of this.requests.values()) {
+      totalRequests += timestamps.filter(t => now - t < this.windowMs).length;
+    }
+    
+    return {
+      activeKeys: this.requests.size,
+      totalRequests: totalRequests,
+      maxKeys: this.maxKeys,
+      utilizationPercent: (this.requests.size / this.maxKeys * 100).toFixed(1)
+    };
   }
 }
 
-// Global rate limiter instance
+// Global rate limiter instances
 const webhookLimiter = new RateLimiter({
   windowMs: 60000,      // 1 minute
-  maxRequests: 300      // 300 requests per minute (LINE's webhook rate)
+  maxRequests: 300,     // 300 requests per minute
+  maxKeys: 5000         // ✅ Limit total keys
 });
 
 const userLimiter = new RateLimiter({
   windowMs: 60000,      // 1 minute  
-  maxRequests: 20       // 20 requests per user per minute (prevent spam)
+  maxRequests: 20,      // 20 requests per user per minute
+  maxKeys: 10000        // ✅ Limit total users tracked
 });
 
 function rateLimitMiddleware(req, res, next) {
@@ -123,7 +176,7 @@ function rateLimitMiddleware(req, res, next) {
       });
     }
     
-    // Check per-user rate limit (if userId available)
+    // Check per-user rate limit
     const userId = req.body?.events?.[0]?.source?.userId;
     
     if (userId) {
@@ -146,8 +199,7 @@ function rateLimitMiddleware(req, res, next) {
     next();
   } catch (error) {
     Logger.error('Rate limit middleware error', error);
-    // Don't block on rate limiter errors
-    next();
+    next(); // Don't block on errors
   }
 }
 
@@ -157,22 +209,14 @@ function rateLimitMiddleware(req, res, next) {
 
 function validateWebhookRequest(req, res, next) {
   try {
-    // Validate request body structure
     if (!req.body || typeof req.body !== 'object') {
       Logger.error('Invalid request body: not an object');
       return res.status(400).json({ error: 'Bad Request: Invalid body' });
     }
     
-    // Validate events array
     if (!Array.isArray(req.body.events)) {
       Logger.error('Invalid request body: events is not an array');
       return res.status(400).json({ error: 'Bad Request: Invalid events' });
-    }
-    
-    // Validate destination (bot userId)
-    if (!req.body.destination || typeof req.body.destination !== 'string') {
-      Logger.warn('Missing or invalid destination field');
-      // Don't block - some webhooks might not have this
     }
     
     next();
@@ -183,23 +227,20 @@ function validateWebhookRequest(req, res, next) {
 }
 
 // ============================================================================
-// IP WHITELIST (OPTIONAL - LINE webhook IPs)
+// IP WHITELIST (OPTIONAL)
 // ============================================================================
 
 const LINE_WEBHOOK_IPS = [
-  '147.92.128.0/17',  // LINE webhook IP range
-  '127.0.0.1',        // Localhost for testing
-  '::1'               // IPv6 localhost
+  '147.92.128.0/17',
+  '127.0.0.1',
+  '::1'
 ];
 
 function isIPInRange(ip, cidr) {
-  if (cidr === ip) return true; // Exact match
-  
+  if (cidr === ip) return true;
   if (!cidr.includes('/')) return false;
   
-  // Simple CIDR check (for production, use 'ip-range-check' or 'ipaddr.js')
   const [range, bits] = cidr.split('/');
-  // Simplified - in production use proper CIDR library
   return ip.startsWith(range.split('.').slice(0, 2).join('.'));
 }
 
@@ -211,26 +252,21 @@ function ipWhitelistMiddleware(req, res, next) {
     
     Logger.debug(`Request from IP: ${clientIP}`);
     
-    // Skip in development
     if (process.env.NODE_ENV !== 'production') {
       return next();
     }
     
-    // Check if IP is whitelisted
     const isWhitelisted = LINE_WEBHOOK_IPS.some(range => 
       isIPInRange(clientIP, range)
     );
     
     if (!isWhitelisted) {
       Logger.warn(`⚠️ Request from non-whitelisted IP: ${clientIP}`);
-      // Log but don't block - LINE IPs might change
-      // In strict mode, you could return 403 here
     }
     
     next();
   } catch (error) {
     Logger.error('IP whitelist middleware error', error);
-    // Don't block on errors
     next();
   }
 }
@@ -240,7 +276,6 @@ function ipWhitelistMiddleware(req, res, next) {
 // ============================================================================
 
 function fullSecurityMiddleware(req, res, next) {
-  // Chain all security checks
   validateWebhookRequest(req, res, (err) => {
     if (err) return next(err);
     
@@ -266,5 +301,7 @@ module.exports = {
   validateWebhookRequest,
   ipWhitelistMiddleware,
   fullSecurityMiddleware,
-  RateLimiter
+  RateLimiter,
+  webhookLimiter, // ✅ Export for monitoring
+  userLimiter     // ✅ Export for monitoring
 };

@@ -1,10 +1,13 @@
-// orderService.js - UPDATED: Match new column structure (9 columns, no status column)
+// orderService.js - UPDATED: Auto-create credit entries for unpaid orders
 
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-const { getThaiDateTimeString } = require('./utils');
+const { getThaiDateTimeString, extractGregorianDate } = require('./utils');
 const { getSheetData, appendSheetData, updateSheetData } = require('./googleServices');
 const { loadStockCache } = require('./cacheManager');
+
+// Import credit service
+const { createCreditEntry, markCreditAsPaid } = require('./creditService');
 
 // ============================================================================
 // COLUMN MAPPING (9 columns total)
@@ -17,13 +20,13 @@ const COL = {
   PRODUCT: 3,       // D - สินค้า
   QUANTITY: 4,      // E - จำนวน
   NOTES: 5,         // F - หมายเหตุ
-  DELIVERY: 6,      // G - ผู้ส่ง (empty = not delivered, name = delivered)
+  DELIVERY: 6,      // G - ผู้ส่ง
   PAYMENT: 7,       // H - จ่ายแล้วหรือยัง
   AMOUNT: 8         // I - ยอดเงิน
 };
 
 // ============================================================================
-// CREATE ORDER - Multiple rows (one per item)
+// CREATE ORDER - WITH AUTO CREDIT ENTRY
 // ============================================================================
 
 async function createOrderTransaction(orderData) {
@@ -108,13 +111,12 @@ async function createOrderTransaction(orderData) {
 
     const totalAmount = rowsToAdd.reduce((sum, row) => sum + row[8], 0);
     
-    Logger.success(`✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿`);
-
-    return {
+    const result = {
       success: true,
       orderNo,
       customer,
       totalAmount,
+      paymentStatus,
       items: items.map((item, idx) => ({
         productName: item.stockItem.item,
         quantity: item.quantity,
@@ -125,6 +127,16 @@ async function createOrderTransaction(orderData) {
         stockItem: item.stockItem
       }))
     };
+    
+    // ✅ AUTO-CREATE CREDIT ENTRY IF UNPAID
+   if (paymentStatus !== 'paid' && paymentStatus !== 'จ่ายแล้ว') {
+      await createCreditEntry(result);
+      Logger.info(`💳 Credit entry auto-created for unpaid order #${orderNo}`);
+    }
+    
+    Logger.success(`✅ Order #${orderNo} created: ${customer} - ${totalAmount}฿ (${paymentStatus})`);
+
+    return result;
 
   } catch (error) {
     Logger.error('createOrderTransaction failed', error);
@@ -136,7 +148,7 @@ async function createOrderTransaction(orderData) {
 }
 
 // ============================================================================
-// UPDATE PAYMENT STATUS
+// UPDATE PAYMENT STATUS - WITH AUTO CREDIT UPDATE
 // ============================================================================
 
 async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
@@ -162,6 +174,12 @@ async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล
     // Update all rows (Column H - Payment)
     for (const orderRow of orderRows) {
       await updateSheetData(CONFIG.SHEET_ID, `คำสั่งซื้อ!H${orderRow.index}`, [[newStatus]]);
+    }
+    
+    // ✅ AUTO-UPDATE CREDIT ENTRY IF PAID
+    if (newStatus === 'จ่ายแล้ว') {
+      await markCreditAsPaid(orderNo);
+      Logger.success(`💳 Credit entry marked as paid for #${orderNo}`);
     }
     
     Logger.success(`💰 Payment updated: #${orderNo} → ${newStatus}`);
@@ -206,5 +224,5 @@ module.exports = {
   createOrder: createOrderTransaction,
   updateOrderPaymentStatus,
   getLastOrderNumber,
-  COL // Export column mapping
+  COL
 };

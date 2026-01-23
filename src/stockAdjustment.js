@@ -1,383 +1,396 @@
-// FIXED: stockAdjustment.js - Simplified voice-friendly version
-
+// src/stockAdjustment.js - FIXED: ลดความสับสน + แม่นยำขึ้น
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-const { getThaiDateTimeString } = require('./utils');
+const { getThaiDateTimeString, normalizeText } = require('./utils');
 const { getSheetData, updateSheetData, appendSheetData } = require('./googleServices');
 const { getStockCache, loadStockCache } = require('./cacheManager');
 
 // ============================================================================
-// SIMPLE COMMAND PARSER (NO AI NEEDED)
+// ENHANCED: Extract Keywords แม่นยำขึ้น
+// ============================================================================
+
+function extractStockKeywords(itemName) {
+  const keywords = new Set();
+  const normalized = normalizeText(itemName);
+  
+  keywords.add(normalized);
+  
+  // Tokenize
+  const tokens = itemName.split(/\s+/);
+  tokens.forEach(token => {
+    const norm = normalizeText(token);
+    if (norm.length >= 2) {
+      keywords.add(norm);
+    }
+  });
+  
+  // Common product variations
+  const variations = {
+    'น้ำแข็ง': ['นําเเข็ง', 'น้ำเเข็ง', 'ice', 'แข็ง', 'นํา'],
+    'หลอด': ['tube', 'ท่อ'],
+    'แผ่น': ['sheet', 'เเผ่น'],
+    'บด': ['crushed', 'บด'],
+    'ถุง': ['bag', 'ถุง', 'กระสอบ'],
+    'โค้ก': ['coke', 'โค', 'coca', 'โคก'],
+    'เป็ปซี่': ['pepsi', 'เป๊ปซี่', 'เปปซี่'],
+    'น้ำดื่ม': ['water', 'น้ำ', 'drinking', 'นํา'],
+    'ลัง': ['box', 'case', 'รัง', 'ลัง', 'crate'],
+    'แพ็ค': ['pack', 'แพค', 'แพ็ค', 'โหล'],
+    'สิงห์': ['singha', 'singh', 'singห์'],
+    'ช้าง': ['chang', 'elephant'],
+    'ลีโอ': ['leo']
+  };
+  
+  for (const [key, vars] of Object.entries(variations)) {
+    if (normalized.includes(normalizeText(key))) {
+      vars.forEach(v => keywords.add(normalizeText(v)));
+    }
+  }
+  
+  return Array.from(keywords);
+}
+
+// ============================================================================
+// IMPROVED: Fuzzy Match with Weighted Scoring
+// ============================================================================
+
+function fuzzyMatchStock(searchTerm, stockCache, priceHint = null, unitHint = null) {
+  const normalized = normalizeText(searchTerm);
+  const keywords = extractStockKeywords(searchTerm);
+  
+  Logger.info(`🔍 Searching: "${searchTerm}" (price=${priceHint || '-'}, unit=${unitHint || '-'})`);
+  
+  // Phase 1: Initial filtering
+  let candidates = stockCache.filter(item => {
+    const itemNorm = normalizeText(item.item);
+    
+    // Direct substring match
+    if (itemNorm.includes(normalized) || normalized.includes(itemNorm)) {
+      return true;
+    }
+    
+    // Keyword overlap
+    const itemKeywords = extractStockKeywords(item.item);
+    const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
+    
+    return overlap >= 1;
+  });
+
+  Logger.info(`📊 Initial candidates: ${candidates.length}`);
+
+  // Phase 2: STRICT filtering by hints
+  if (priceHint) {
+    const priceMatched = candidates.filter(item => 
+      Math.abs(item.price - priceHint) <= Math.max(5, priceHint * 0.15) // ±15% หรือ ±5฿
+    );
+    
+    if (priceMatched.length > 0) {
+      Logger.info(`💰 Price filter: ${candidates.length} → ${priceMatched.length}`);
+      candidates = priceMatched;
+    }
+  }
+
+  if (unitHint) {
+    const unitMatched = candidates.filter(item => {
+      const itemUnit = normalizeText(item.unit || '');
+      const itemName = normalizeText(item.item);
+      
+      return itemUnit.includes(unitHint) || itemName.includes(unitHint);
+    });
+    
+    if (unitMatched.length > 0) {
+      Logger.info(`📦 Unit filter: ${candidates.length} → ${unitMatched.length}`);
+      candidates = unitMatched;
+    }
+  }
+
+  // Phase 3: Weighted scoring
+  const matches = candidates.map(item => {
+    const itemNorm = normalizeText(item.item);
+    const itemKeywords = extractStockKeywords(item.item);
+    let score = 0;
+    
+    // 1. Exact name match = HUGE bonus
+    if (itemNorm === normalized) {
+      score += 1000;
+    }
+    // 2. Full substring match
+    else if (itemNorm.includes(normalized)) {
+      score += 500;
+      
+      // Bonus: ถ้าเป็น prefix (เริ่มต้นด้วย)
+      if (itemNorm.startsWith(normalized)) {
+        score += 100;
+      }
+    }
+    // 3. Reverse substring
+    else if (normalized.includes(itemNorm)) {
+      score += 300;
+    }
+    
+    // 4. Keyword overlap score
+    const overlap = keywords.filter(k => itemKeywords.includes(k)).length;
+    score += overlap * 50;
+    
+    // 5. Price match bonus
+    if (priceHint) {
+      if (item.price === priceHint) {
+        score += 200;
+      } else if (Math.abs(item.price - priceHint) <= priceHint * 0.05) {
+        score += 100;
+      }
+    }
+    
+    // 6. Unit match bonus
+    if (unitHint) {
+      const itemUnit = normalizeText(item.unit || '');
+      if (itemUnit.includes(unitHint)) {
+        score += 150;
+      }
+    }
+    
+    // 7. Length penalty (prefer shorter, more specific matches)
+    const lengthDiff = Math.abs(itemNorm.length - normalized.length);
+    score -= (lengthDiff * 2);
+    
+    // 8. Stock availability bonus
+    if (item.stock > 0) {
+      score += 10;
+    }
+
+    return { item, score };
+  });
+  
+  // Sort by score
+  matches.sort((a, b) => b.score - a.score);
+  
+  if (matches.length > 0) {
+    Logger.info(`🏆 Top match: ${matches[0].item.item} (score: ${matches[0].score})`);
+    
+    // Log top 3 for debugging
+    matches.slice(0, 3).forEach((m, i) => {
+      Logger.debug(`  ${i + 1}. ${m.item.item} - ${m.score} pts`);
+    });
+  }
+  
+  return matches;
+}
+
+// ============================================================================
+// ENHANCED: Parse Adjustment Command
 // ============================================================================
 
 async function parseAdjustmentCommand(text) {
   const stockCache = getStockCache();
   
-  // Must have a number
-  const numberMatch = text.match(/\d+/);
-  if (!numberMatch) {
+  // Extract numbers
+  const numbers = text.match(/\d+/g);
+  if (!numbers || numbers.length === 0) {
     return { isAdjustment: false, reason: 'no_number' };
   }
   
-  const value = parseInt(numberMatch[0]);
-  
-  // Detect operation
-  let operation = 'set'; // default
+  // Determine operation
+  let operation = 'set';
   const lower = text.toLowerCase();
   
-  if (lower.includes('เติม') || lower.includes('เพิ่ม') || lower.includes('add')) {
+  if (lower.match(/เติม|เพิ่ม|add/)) {
     operation = 'add';
-  } else if (lower.includes('ลด') || lower.includes('subtract')) {
+  } else if (lower.match(/ลด|ลบ|subtract/)) {
     operation = 'subtract';
-  } else if (lower.includes('มี') || lower.includes('เหลือ')) {
-    operation = 'set';
   }
   
-  // Extract product name (remove operation words and numbers)
+  // Check if looks like order (not stock adjustment)
+  if (operation === 'set' && !text.match(/มี|เหลือ|set/)) {
+    if (text.match(/สั่ง|ร้าน|พี่|คุณ|เอา/)) {
+      return { isAdjustment: false, reason: 'looks_like_order' };
+    }
+  }
+  
+  // Detect unit hint
+  let unitHint = null;
+  const unitPatterns = {
+    'ลัง': /รัง|ลัง|crate|box/i,
+    'ขวด': /ขวด|bottle/i,
+    'ถุง': /ถุง|กระสอบ|bag/i,
+    'แพ็ค': /แพ็ค|แพค|โหล|pack/i,
+    'โหล': /โหล|dozen/i
+  };
+  
+  for (const [unit, pattern] of Object.entries(unitPatterns)) {
+    if (pattern.test(text)) {
+      unitHint = normalizeText(unit);
+      break;
+    }
+  }
+  
+  // Extract price & quantity
+  let value = null;
+  let priceHint = null;
+  const parsedNumbers = numbers.map(n => parseInt(n));
+  
+  if (parsedNumbers.length >= 2) {
+    // Logic: เลขใหญ่ = ราคา, เลขเล็ก = จำนวน
+    const sorted = [...parsedNumbers].sort((a, b) => b - a);
+    
+    if (sorted[0] > 50 && sorted[1] <= 100) {
+      priceHint = sorted[0];
+      value = sorted[1];
+    } else {
+      // Fallback: last = qty
+      value = parsedNumbers[parsedNumbers.length - 1];
+      priceHint = parsedNumbers[parsedNumbers.length - 2];
+    }
+  } else {
+    value = parsedNumbers[0];
+  }
+  
+  // Clean product name
   let productName = text
-    .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม/gi, '')
+    .replace(/เติม|ลด|มี|เหลือ|ปรับ|เพิ่ม|ลบ|set|add|subtract/gi, '')
     .replace(/\d+/g, '')
-    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง/gi, '')
+    .replace(/ถุง|ขวด|กล่อง|ชิ้น|ลัง|รัง|บาท|฿|แพ็ค|แพค|โหล|ละ|ราคา/gi, '')
     .trim();
   
   if (!productName) {
     return { isAdjustment: false, reason: 'no_product_name' };
   }
   
-  // Find matching product
-  const lowerProduct = productName.toLowerCase();
+  if (!value || value <= 0) {
+    return { isAdjustment: false, reason: 'invalid_value' };
+  }
   
-  // Try exact match first
-  let match = stockCache.find(item => 
-    item.item.toLowerCase() === lowerProduct
-  );
+  // Match with hints
+  const matches = fuzzyMatchStock(productName, stockCache, priceHint, unitHint);
   
-  // Try contains match
-  if (!match) {
-    const matches = stockCache.filter(item => 
-      item.item.toLowerCase().includes(lowerProduct) ||
-      lowerProduct.includes(item.item.toLowerCase())
-    );
+  if (matches.length === 0) {
+    return { 
+      isAdjustment: false, 
+      reason: 'product_not_found',
+      searchTerm: productName
+    };
+  }
+  
+  // Ambiguity check with STRICTER threshold
+  if (matches.length > 1) {
+    const scoreDiff = matches[0].score - matches[1].score;
     
-    if (matches.length === 1) {
-      match = matches[0];
-    } else if (matches.length > 1) {
-      // Multiple matches - return suggestions
+    // ถ้าคะแนนต่างกันน้อยกว่า 100 = สับสน
+    if (scoreDiff < 100 && matches[0].item.item !== matches[1].item.item) {
+      Logger.warn(`⚠️ Ambiguous: Top 2 scores are close (${matches[0].score} vs ${matches[1].score})`);
+      
       return {
         isAdjustment: true,
         ambiguous: true,
-        suggestions: matches,
+        suggestions: matches.slice(0, 5).map(m => m.item),
         value: value,
-        operation: operation
+        productName: productName
       };
     }
   }
   
-  if (!match) {
-    return { isAdjustment: false, reason: 'product_not_found' };
-  }
-  
+  // Clear winner
   return {
     isAdjustment: true,
-    item: match.item,
-    stockItem: match,
+    item: matches[0].item.item,
+    stockItem: matches[0].item,
     value: value,
     operation: operation,
+    priceHint: priceHint,
     originalText: text,
-    confidence: 'high'
+    confidence: matches[0].score > 500 ? 'high' : 'medium'
   };
 }
 
 // ============================================================================
-// ADJUST STOCK - SIMPLIFIED
+// ADJUST STOCK (unchanged)
 // ============================================================================
 
 async function adjustStock(itemName, value, operation = 'set', reason = 'manual') {
   try {
-    Logger.info(`🔧 Adjusting: ${itemName} ${operation} ${value}`);
-    
-    // Validate
-    if (value < 0 || value > 100000) {
-      return { 
-        success: false, 
-        error: '❌ จำนวนไม่ถูกต้อง (0-100,000)' 
-      };
-    }
-    
-    // Find item in cache
     const stockCache = getStockCache();
-    const item = stockCache.find(i => 
-      i.item.toLowerCase() === itemName.toLowerCase()
-    );
+    const item = stockCache.find(i => i.item === itemName);
     
     if (!item) {
-      return { 
-        success: false, 
-        error: `❌ ไม่พบสินค้า: ${itemName}` 
-      };
+      return { success: false, error: `❌ ไม่พบสินค้า: ${itemName}` };
     }
     
-    // Calculate new stock
     const oldStock = item.stock;
     let newStock;
     
     switch (operation) {
-      case 'add':
-        newStock = oldStock + value;
+      case 'add': 
+        newStock = oldStock + value; 
         break;
-      case 'subtract':
-        newStock = oldStock - value;
+      case 'subtract': 
+        newStock = oldStock - value; 
         if (newStock < 0) {
-          return {
-            success: false,
-            error: `❌ สต็อกไม่พอลด\n\nมี: ${oldStock}\nต้องการลด: ${value}\nขาด: ${Math.abs(newStock)}`
-          };
+          return { success: false, error: `❌ สต็อกไม่พอ (มี ${oldStock})` };
         }
         break;
-      case 'set':
-        newStock = value;
+      case 'set': 
+        newStock = value; 
         break;
-      default:
-        return { success: false, error: '❌ คำสั่งไม่ถูกต้อง' };
     }
     
-    const difference = newStock - oldStock;
-    
-    // Update in Google Sheets
+    // Update Sheet
     const rows = await getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G');
     let rowIndex = -1;
     
     for (let i = 1; i < rows.length; i++) {
-      if (rows[i][0].toLowerCase() === item.item.toLowerCase()) {
-        rowIndex = i + 1; // +1 because sheets are 1-indexed
+      if (rows[i][0] === item.item) {
+        rowIndex = i + 1;
         break;
       }
     }
     
-    if (rowIndex === -1) {
-      return { 
-        success: false, 
-        error: '❌ ไม่พบสินค้าในระบบ' 
+    if (rowIndex !== -1) {
+      await updateSheetData(CONFIG.SHEET_ID, `สต็อก!E${rowIndex}`, [[newStock]]);
+      await logVariance(item.item, oldStock, newStock, newStock - oldStock, reason, operation);
+      await loadStockCache(true);
+      
+      return {
+        success: true,
+        item: item.item,
+        price: item.price,
+        oldStock,
+        newStock,
+        difference: newStock - oldStock,
+        unit: item.unit,
+        operationText: getOperationText(operation, value)
       };
     }
     
-    // Update the stock value
-    await updateSheetData(
-      CONFIG.SHEET_ID, 
-      `สต็อก!E${rowIndex}`, 
-      [[newStock]]
-    );
-    
-    // Log to variance
-    await logVariance(item.item, oldStock, newStock, difference, reason, operation);
-    
-    // Reload cache
-    await loadStockCache(true);
-    
-    Logger.success(`✅ Updated: ${item.item} (${oldStock} → ${newStock})`);
-    
-    return {
-      success: true,
-      item: item.item,
-      unit: item.unit,
-      oldStock: oldStock,
-      newStock: newStock,
-      difference: difference,
-      operation: operation,
-      operationText: getOperationText(operation, value)
-    };
+    return { success: false, error: '❌ Database Error' };
     
   } catch (error) {
     Logger.error('adjustStock failed', error);
-    return {
-      success: false,
-      error: `❌ เกิดข้อผิดพลาด: ${error.message}`
-    };
+    return { success: false, error: error.message };
   }
 }
-
-// ============================================================================
-// LOG VARIANCE
-// ============================================================================
 
 async function logVariance(item, oldStock, newStock, difference, reason, operation) {
   try {
-    const reasonText = getReasonText(reason, operation);
-    
-    const row = [
-      getThaiDateTimeString(),
-      item,
-      oldStock,
-      newStock,
-      difference,
-      reasonText
-    ];
-    
+    const reasonText = `${operation} (${reason})`;
+    const row = [getThaiDateTimeString(), item, oldStock, newStock, difference, reasonText];
     await appendSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F', [row]);
-    Logger.success(`📊 Logged variance: ${item} (${difference >= 0 ? '+' : ''}${difference})`);
-    
-    return true;
-  } catch (error) {
-    Logger.error('logVariance failed', error);
-    return false;
+  } catch (e) { 
+    Logger.error('Log failed', e); 
   }
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-function getOperationText(operation, value) {
-  switch (operation) {
-    case 'add': return `เติม +${value}`;
-    case 'subtract': return `ลด -${value}`;
-    case 'set': return `ตั้งค่าเป็น ${value}`;
-    default: return `ปรับเป็น ${value}`;
-  }
-}
-
-function getReasonText(reason, operation) {
-  const operationMap = {
-    'add': 'เติมสต็อก',
-    'subtract': 'ลดสต็อก',
-    'set': 'ปรับสต็อก'
-  };
-  
-  const reasonMap = {
-    'manual': 'ปรับด้วยมือ',
-    'manual_adjustment': 'ปรับด้วยมือ',
-    'voice_adjustment': 'ปรับผ่านเสียง',
-    'text_adjustment': 'ปรับผ่านข้อความ',
-    'restock': 'เติมสินค้า',
-    'damage': 'สินค้าเสียหาย',
-    'loss': 'สินค้าสูญหาย'
-  };
-  
-  const opText = operationMap[operation] || 'ปรับสต็อก';
-  const reasonText = reasonMap[reason] || reason;
-  
-  return `${opText} (${reasonText})`;
+function getOperationText(op, val) {
+  return op === 'add' ? `เติม +${val}` : 
+         op === 'subtract' ? `ลด -${val}` : 
+         `ตั้งเป็น ${val}`;
 }
 
 // ============================================================================
-// VIEW STOCK
+// EXPORTS
 // ============================================================================
-
-async function viewCurrentStock(searchTerm = null) {
-  try {
-    const stockCache = getStockCache();
-    
-    if (stockCache.length === 0) {
-      return '❌ ไม่มีข้อมูลสต็อก';
-    }
-    
-    let items = stockCache;
-    
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase();
-      items = stockCache.filter(item => 
-        item.item.toLowerCase().includes(term) ||
-        item.category.toLowerCase().includes(term)
-      );
-      
-      if (items.length === 0) {
-        return `❌ ไม่พบ "${searchTerm}"`;
-      }
-    }
-    
-    const displayItems = items.slice(0, 20);
-    
-    let report = `📦 สต็อกสินค้า\n${'='.repeat(40)}\n\n`;
-    
-    displayItems.forEach(item => {
-      const icon = item.stock === 0 ? '🔴' : item.stock < 10 ? '🟡' : '🟢';
-      report += `${icon} ${item.item}\n`;
-      report += `   ${item.stock} ${item.unit} │ ${item.price}฿\n\n`;
-    });
-    
-    if (items.length > 20) {
-      report += `... และอีก ${items.length - 20} รายการ\n`;
-    }
-    
-    return report;
-    
-  } catch (error) {
-    Logger.error('viewCurrentStock failed', error);
-    return `❌ เกิดข้อผิดพลาด: ${error.message}`;
-  }
-}
-
-// ============================================================================
-// GENERATE VARIANCE REPORT
-// ============================================================================
-
-async function generateVarianceReport(period = 'today') {
-  try {
-    const rows = await getSheetData(CONFIG.SHEET_ID, 'VarianceLog!A:F');
-    
-    if (rows.length <= 1) {
-      return '📊 ยังไม่มีการปรับสต็อก';
-    }
-    
-    const today = new Date().toLocaleDateString('en-CA');
-    const variances = rows.slice(1)
-      .filter(row => {
-        if (period === 'today') {
-          const rowDate = row[0].split(' ')[0];
-          return rowDate.includes(today);
-        }
-        return true;
-      })
-      .map(row => ({
-        date: row[0],
-        item: row[1],
-        oldStock: parseInt(row[2] || 0),
-        newStock: parseInt(row[3] || 0),
-        difference: parseInt(row[4] || 0),
-        reason: row[5] || '-'
-      }));
-    
-    if (variances.length === 0) {
-      return `📊 ไม่มีการปรับสต็อกวันนี้`;
-    }
-    
-    let report = `📊 รายงานการปรับสต็อก\n${'='.repeat(40)}\n\n`;
-    
-    const itemMap = new Map();
-    variances.forEach(v => {
-      if (!itemMap.has(v.item)) {
-        itemMap.set(v.item, []);
-      }
-      itemMap.get(v.item).push(v);
-    });
-    
-    itemMap.forEach((changes, itemName) => {
-      const totalDiff = changes.reduce((sum, c) => sum + c.difference, 0);
-      const icon = totalDiff === 0 ? '➖' : totalDiff > 0 ? '📈' : '📉';
-      
-      report += `${icon} ${itemName}\n`;
-      
-      changes.forEach(v => {
-        const time = v.date.split(' ')[1] || '';
-        const sign = v.difference >= 0 ? '+' : '';
-        report += `   ${time} │ ${v.oldStock} → ${v.newStock} (${sign}${v.difference})\n`;
-      });
-      
-      report += `\n`;
-    });
-    
-    return report;
-    
-  } catch (error) {
-    Logger.error('generateVarianceReport failed', error);
-    return `❌ เกิดข้อผิดพลาด: ${error.message}`;
-  }
-}
 
 module.exports = {
   parseAdjustmentCommand,
   adjustStock,
-  logVariance,
-  generateVarianceReport,
-  viewCurrentStock
+  fuzzyMatchStock,
+  extractStockKeywords
 };

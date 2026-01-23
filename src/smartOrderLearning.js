@@ -13,6 +13,8 @@ class SmartOrderLearner {
     this.customerPatterns = new Map();
     this.lastLoaded = 0;
     this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes - refresh from Sheets
+    this.predictionCache = new Map();
+    this.cacheMaxAge = 5 * 60 * 1000; 
   }
 
   async loadOrderHistory() {
@@ -154,12 +156,30 @@ class SmartOrderLearner {
 
     return longest / Math.max(len1, len2);
   }
+  predictOrder(customerName, parsedItems = []) {
+    const cacheKey = `${customerName}_${JSON.stringify(parsedItems.map(i => i.stockItem?.item))}`;
+    const cached = this.predictionCache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < this.cacheMaxAge) {
+      return cached.result;
+    }
+    
+    const result = this._predictOrderInternal(customerName, parsedItems);
+    
+    this.predictionCache.set(cacheKey, {
+      result,
+      timestamp: Date.now()
+    });
+    
+    return result;
+  }
+
 
   // ============================================================================
   // PREDICT ORDER
   // ============================================================================
 
-  predictOrder(customerName, parsedItems = []) {
+  _predictOrderInternal(customerName, parsedItems) {
     const customerPattern = this.findCustomerByName(customerName);
     
     if (!customerPattern) {
