@@ -1,7 +1,7 @@
 // aiServices.js - FIXED: Defensive OpenAI client initialization
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-
+const { Readable } = require('stream');
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -514,8 +514,10 @@ async function transcribeWithGroqWhisper(audioBuffer) {
 
   Logger.info('🎤 Using Groq Whisper...');
   
-  try {
-    const file = new File([audioBuffer], 'audio.m4a', { type: 'audio/m4a' });
+  try
+   {const { Readable } = require('stream'); // เรียกใช้ Stream
+    const file = Readable.from(audioBuffer); // แปลง Buffer เป็น Stream
+    file.path = 'audio.m4a'; // หลอก Library ว่าชื่อไฟล์นี้ (จำเป็นต้องมีนามสกุล)
     
     const transcription = await groqClient.audio.transcriptions.create({
       file: file,
@@ -525,7 +527,7 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       response_format: 'text'
     });
 
-    const text = transcription.text?.trim() || transcription.trim();
+    const text = transcription.text?.trim() || transcription.trim(); // ป้องกัน error
     
     if (!text) {
       throw new Error('Empty transcription');
