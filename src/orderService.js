@@ -129,7 +129,7 @@ async function createOrderTransaction(orderData) {
     };
     
     // ✅ AUTO-CREATE CREDIT ENTRY IF UNPAID
-    if (paymentStatus !== 'paid') {
+   if (paymentStatus !== 'paid' && paymentStatus !== 'จ่ายแล้ว') {
       await createCreditEntry(result);
       Logger.info(`💳 Credit entry auto-created for unpaid order #${orderNo}`);
     }
