@@ -7,56 +7,237 @@ const { getStockCache, getCustomerCache } = require('./cacheManager');
 // PRE-PROCESS: แยกคำสั่งหลายแบบออกจากกัน
 // ============================================================================
 
+// Enhanced Multi-Intent Detection
+// Supports: Order + Payment + Delivery in ONE voice input
+
 function splitMultipleIntents(text) {
   const lower = text.toLowerCase();
   
-  // Pattern 1: "[ชื่อ] ส่ง [สินค้า] แล้วก็ จ่าย"
+  // ============================================================================
+  // INTENT DETECTION FLAGS
+  // ============================================================================
+  
+  const intents = {
+    hasOrder: false,
+    hasPayment: false,
+    hasDelivery: false,
+    hasCredit: false
+  };
+  
+  // Order keywords
+  if (/สั่ง|ซื้อ|เอา|ขอ|จอง/.test(lower)) {
+    intents.hasOrder = true;
+  }
+  
+  // Payment keywords
+  const paidKeywords = /จ่าย(?:แล้ว|เงิน)?|ชำระ(?:แล้ว|เงิน)?|เงินสด|โอน(?:แล้ว|เงิน)?/i;
+  const unpaidKeywords = /เครดิต|ค้าง|ยัง(?:ไม่|ไม่ได้)จ่าย|เอาไว้ก่อน/i;
+  
+  if (paidKeywords.test(text)) {
+    intents.hasPayment = true;
+    intents.paymentStatus = 'paid';
+  } else if (unpaidKeywords.test(text)) {
+    intents.hasPayment = true;
+    intents.paymentStatus = 'unpaid';
+  }
+  
+  // Delivery keywords
+  if (/ส่ง|จัดส่ง|delivery|ผู้ส่ง/.test(lower)) {
+    intents.hasDelivery = true;
+  }
+  
+  // ============================================================================
+  // COMPLEX PATTERNS (Voice-Optimized)
+  // ============================================================================
+  
   const patterns = [
+    // Pattern 1: "พี่แดง ส่ง โค้ก 30 5ขวด แล้วจ่ายเงินแล้ว"
     {
-      regex: /(.+?)\s*ส่ง\s*(.+?)(?:\s+(?:แล้ว|เเล้ว))?(?:\s+(?:จ่าย|ชำระ|จ่ายเงิน))?(?:\s+(?:แล้ว|เเล้ว))?/i,
+      regex: /(.+?)\s*ส่ง\s+(.+?)(?:\s+(?:แล้ว|เเล้ว|ด้วย|แล้วก็))?\s*(?:จ่าย|ชำระ|โอน)?(?:\s*(?:แล้ว|เงิน))?/i,
       extract: (match, fullText) => {
-        const customer = match[1].trim();
+        const deliveryPerson = match[1].trim();
         const itemsPart = match[2].trim();
-        const hasPaid = /(?:จ่าย|ชำระ)/.test(fullText);
+        
+        // Check if customer name is in items part
+        const customerMatch = itemsPart.match(/^(คุณ|พี่|น้อง|เจ๊|ร้าน)\s*(\S+)/);
         
         return {
-          customer,
-          itemsPart,
-          hasPaid,
+          customer: customerMatch ? `${customerMatch[1]}${customerMatch[2]}` : deliveryPerson,
+          itemsPart: customerMatch ? itemsPart.replace(customerMatch[0], '').trim() : itemsPart,
+          deliveryPerson: deliveryPerson,
+          hasPaid: paidKeywords.test(fullText),
           hasDelivery: true,
-          type: 'order'
+          confidence: 'high',
+          pattern: 'delivery_first'
         };
       }
     },
     
-    // Pattern 2: "[ชื่อ] สั่ง [สินค้า] จ่ายแล้ว"
+    // Pattern 2: "คุณแอน สั่ง น้ำแข็ง 60 2ถุง จ่ายแล้ว ส่งพี่แดง"
     {
-      regex: /(.+?)\s*(?:สั่ง|เอา|ขอ)\s*(.+?)(?:\s+(?:จ่าย|ชำระ))?(?:\s+(?:แล้ว|เเล้ว))?/i,
+      regex: /((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+?)(?:\s+(?:จ่าย|ชำระ))?(?:\s*(?:แล้ว|เงิน))?\s*(?:ส่ง)?\s*(.+)?/i,
       extract: (match, fullText) => {
         const customer = match[1].trim();
         const itemsPart = match[2].trim();
-        const hasPaid = /(?:จ่าย|ชำระ)/.test(fullText);
+        const deliveryMatch = match[3] ? match[3].trim() : null;
+        
+        // Extract delivery person
+        let deliveryPerson = '';
+        if (deliveryMatch && /ส่ง/.test(fullText)) {
+          const deliveryPersonMatch = fullText.match(/ส่ง\s*(พี่|คุณ)?\s*(\S+)/i);
+          if (deliveryPersonMatch) {
+            deliveryPerson = deliveryPersonMatch[0].replace('ส่ง', '').trim();
+          }
+        }
         
         return {
           customer,
           itemsPart,
-          hasPaid,
+          deliveryPerson,
+          hasPaid: paidKeywords.test(fullText),
+          hasDelivery: deliveryPerson !== '',
+          confidence: 'high',
+          pattern: 'customer_first'
+        };
+      }
+    },
+    
+    // Pattern 3: "โค้ก 30 5ขวด สำหรับพี่แดง จ่ายแล้ว"
+    {
+      regex: /(.+?)\s+สำหรับ\s+([\S\s]+?)(?:\s+(?:จ่าย|ชำระ))?/i,
+      extract: (match, fullText) => {
+        const itemsPart = match[1].trim();
+        const customer = match[2].trim();
+        
+        return {
+          customer,
+          itemsPart,
+          deliveryPerson: '',
+          hasPaid: paidKeywords.test(fullText),
           hasDelivery: false,
-          type: 'order'
+          confidence: 'medium',
+          pattern: 'items_for_customer'
+        };
+      }
+    },
+    
+    // Pattern 4: Simple order with payment flag
+    {
+      regex: /(.+?)\s*(?:สั่ง|เอา|ขอ)\s*(.+)/i,
+      extract: (match, fullText) => {
+        const customer = match[1].trim();
+        const itemsPart = match[2].trim();
+        
+        // Check if items part contains delivery info
+        let deliveryPerson = '';
+        const deliveryMatch = itemsPart.match(/ส่ง\s*(พี่|คุณ)?\s*(\S+)/i);
+        if (deliveryMatch) {
+          deliveryPerson = deliveryMatch[0].replace('ส่ง', '').trim();
+        }
+        
+        return {
+          customer,
+          itemsPart: itemsPart.replace(/ส่ง\s*\S+/i, '').trim(),
+          deliveryPerson,
+          hasPaid: paidKeywords.test(fullText),
+          hasDelivery: deliveryPerson !== '',
+          confidence: 'medium',
+          pattern: 'simple_order'
         };
       }
     }
   ];
   
+  // ============================================================================
+  // TRY PATTERNS IN ORDER
+  // ============================================================================
+  
   for (const pattern of patterns) {
     const match = text.match(pattern.regex);
     if (match) {
-      return pattern.extract(match, text);
+      const extracted = pattern.extract(match, text);
+      
+      // Validate extraction
+      if (extracted.customer && extracted.itemsPart) {
+        Logger.info(`🎯 Pattern matched: ${extracted.pattern}`);
+        Logger.info(`   Customer: ${extracted.customer}`);
+        Logger.info(`   Items: ${extracted.itemsPart}`);
+        Logger.info(`   Payment: ${extracted.hasPaid ? 'PAID' : 'UNPAID'}`);
+        Logger.info(`   Delivery: ${extracted.deliveryPerson || 'None'}`);
+        
+        return {
+          ...extracted,
+          type: 'order',
+          intents: {
+            ...intents,
+            hasOrder: true,
+            hasPayment: extracted.hasPaid !== undefined,
+            hasDelivery: extracted.hasDelivery
+          }
+        };
+      }
     }
   }
   
   return null;
 }
+
+// ============================================================================
+// PAYMENT STATUS DETECTOR (More Robust)
+// ============================================================================
+
+function detectPaymentStatus(text) {
+  const lower = text.toLowerCase();
+  
+  // Explicit unpaid
+  if (/เครดิต|ค้าง(?:ชำระ)?|ยังไม่จ่าย|เอาไว้ก่อน/.test(lower)) {
+    return { status: 'unpaid', confidence: 'high' };
+  }
+  
+  // Explicit paid
+  if (/จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว|เงิน)|เงินสด|โอน(?:แล้ว|เงิน)/.test(lower)) {
+    return { status: 'paid', confidence: 'high' };
+  }
+  
+  // Ambiguous - check position
+  if (/จ่าย|ชำระ/.test(lower)) {
+    // If "จ่าย" is near end of sentence → likely paid
+    const paymentIndex = text.search(/จ่าย|ชำระ/);
+    const nearEnd = paymentIndex > text.length * 0.6;
+    
+    return { 
+      status: nearEnd ? 'paid' : 'unpaid', 
+      confidence: 'medium' 
+    };
+  }
+  
+  return { status: null, confidence: 'none' };
+}
+
+// ============================================================================
+// DELIVERY PERSON EXTRACTOR
+// ============================================================================
+
+function extractDeliveryPerson(text) {
+  const patterns = [
+    /ส่ง\s*(พี่|คุณ|น้อง)?\s*(\S+)/i,
+    /จัดส่ง\s*(พี่|คุณ|น้อง)?\s*(\S+)/i,
+    /(?:ให้|ใช้)\s*(พี่|คุณ|น้อง)?\s*(\S+)\s*ส่ง/i
+  ];
+  
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return {
+        name: match[0].replace(/ส่ง|จัดส่ง/g, '').trim(),
+        confidence: 'high'
+      };
+    }
+  }
+  
+  return { name: null, confidence: 'none' };
+}
+
 
 // ============================================================================
 // ENHANCED: ดึง Price Hints ที่แม่นยำขึ้น
@@ -227,6 +408,11 @@ async function parseOrder(userInput) {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
+  const paymentDetection = detectPaymentStatus(userInput);
+
+  Logger.info(`🎯 Pre-processed intent: ${JSON.stringify(preProcessed)}`);
+  Logger.info(`💰 Payment detection: ${paymentDetection.status} (${paymentDetection.confidence})`);
+  
   // 1. Pre-process: แยกคำสั่งหลายแบบ
   const preProcessed = splitMultipleIntents(userInput);
   
@@ -353,5 +539,7 @@ module.exports = {
   buildSmartStockList,
   boostConfidence,
   calculateMatchConfidence,
-  splitMultipleIntents
+  splitMultipleIntents,
+  detectPaymentStatus,
+  extractDeliveryPerson
 };

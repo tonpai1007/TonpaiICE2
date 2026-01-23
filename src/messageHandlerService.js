@@ -468,6 +468,172 @@ async function handleMessage(text, userId) {
     // ORDER PARSING
     // ========================================================================
     
+    if (lower === 'วิเคราะห์สต็อก' || lower === 'analyze stock') {
+      const { stockPredictor } = require('./stockPrediction');
+      await stockPredictor.analyzeSalesVelocity();
+      const report = await stockPredictor.generateStockReport();
+      return { success: true, message: report };
+    }
+
+    if (lower === 'abc' || lower === 'abc analysis') {
+      const { stockPredictor } = require('./stockPrediction');
+      const report = await stockPredictor.performABCAnalysis();
+      return { success: true, message: report };
+    }
+
+    if (lower === 'สุขภาพสต็อก' || lower === 'stock health') {
+      const { stockPredictor } = require('./stockPrediction');
+      const health = await stockPredictor.getStockHealth();
+      return { success: true, message: health };
+    }
+
+    if (lower === 'ต้องสั่งอะไร' || lower === 'ควรสั่งอะไร' || lower === 'reorder') {
+      const { stockPredictor } = require('./stockPrediction');
+      const recommendations = await stockPredictor.generateReorderRecommendations();
+      
+      if (recommendations.length === 0) {
+        return { 
+          success: true, 
+          message: '✅ สต็อกทุกรายการเพียงพอ\n\nไม่มีสินค้าที่ต้องสั่งซื้อด่วน' 
+        };
+      }
+      
+      let msg = `📋 รายการที่ควรสั่งซื้อ (${recommendations.length} รายการ)\n${'='.repeat(40)}\n\n`;
+      
+      recommendations.slice(0, 10).forEach((r, i) => {
+        const urgencyIcon = r.urgency === 'critical' ? '🔴' : 
+                            r.urgency === 'high' ? '🟡' : '🟢';
+        msg += `${urgencyIcon} ${i + 1}. ${r.product}\n`;
+        msg += `   📦 เหลือ ${r.currentStock} (พอ ${r.daysUntilStockout} วัน)\n`;
+        msg += `   ✅ แนะนำสั่ง ${r.recommendedQuantity}\n\n`;
+      });
+      
+      if (recommendations.length > 10) {
+        msg += `... และอีก ${recommendations.length - 10} รายการ\n\n`;
+      }
+      
+      const totalCost = recommendations.reduce((sum, r) => sum + r.estimatedCost, 0);
+      msg += `💰 ต้นทุนรวม: ${totalCost.toLocaleString()}฿`;
+      
+      return { success: true, message: msg };
+    }
+
+    // ============================================================================
+    // VOICE-FRIENDLY STOCK QUERY
+    // ============================================================================
+
+    if (lower.match(/^(มี|เหลือ|สต็อก)\s+(.+?)(?:\s+เท่าไหร่|อยู่|ไหม)?$/)) {
+      const match = lower.match(/^(มี|เหลือ|สต็อก)\s+(.+?)(?:\s+เท่าไหร่|อยู่|ไหม)?$/);
+      const productName = match[2].trim();
+      
+      const stockCache = getStockCache();
+      const { fuzzyMatchStock } = require('./stockAdjustment');
+      
+      const matches = fuzzyMatchStock(productName, stockCache);
+      
+      if (matches.length === 0) {
+        return { 
+          success: false, 
+          message: `❌ ไม่พบสินค้า "${productName}"\n\nลองเช็คชื่อใหม่อีกครั้ง` 
+        };
+      }
+      
+      if (matches.length === 1) {
+        const item = matches[0].item;
+        let msg = `📦 ${item.item}\n${'='.repeat(30)}\n\n`;
+        msg += `💰 ราคา: ${item.price}฿\n`;
+        msg += `📊 สต็อก: ${item.stock} ${item.unit}\n`;
+        
+        if (item.stock <= 3) {
+          msg += `\n🔴 สต็อกเหลือน้อย!`;
+        } else if (item.stock <= 10) {
+          msg += `\n🟡 ควรสั่งเพิ่ม`;
+        }
+        
+        return { success: true, message: msg };
+      }
+      
+      // Multiple matches
+      let msg = `🔍 พบ ${matches.length} รายการ:\n\n`;
+      matches.slice(0, 5).forEach((m, i) => {
+        msg += `${i + 1}. ${m.item.item}\n`;
+        msg += `   💰 ${m.item.price}฿ │ 📦 ${m.item.stock} ${m.item.unit}\n\n`;
+      });
+      
+      return { success: true, message: msg };
+    }
+
+    // ============================================================================
+    // FAST MOVERS REPORT
+    // ============================================================================
+
+    if (lower === 'ขายดี' || lower === 'fast movers' || lower === 'top sellers') {
+      const { stockPredictor } = require('./stockPrediction');
+      
+      if (stockPredictor.salesHistory.size === 0) {
+        await stockPredictor.analyzeSalesVelocity();
+      }
+      
+      const fastMovers = Array.from(stockPredictor.salesHistory.values())
+        .filter(v => v.velocity === 'fast')
+        .sort((a, b) => b.avgDailySales - a.avgDailySales)
+        .slice(0, 15);
+      
+      if (fastMovers.length === 0) {
+        return { 
+          success: true, 
+          message: '📊 ยังไม่มีข้อมูลเพียงพอ\n\nให้ระบบทำงานไปสักพัก' 
+        };
+      }
+      
+      let msg = `⚡ สินค้าขายดี (Fast Movers)\n${'='.repeat(40)}\n\n`;
+      
+      fastMovers.forEach((item, i) => {
+        msg += `${i + 1}. ${item.name}\n`;
+        msg += `   📈 ขาย ${item.avgDailySales.toFixed(1)}/วัน\n`;
+        msg += `   📦 เหลือ ${item.currentStock} (พอ ${item.daysUntilStockout} วัน)\n\n`;
+      });
+      
+      msg += `\n💡 แนะนำ: เติมสินค้าเหล่านี้บ่อยๆ`;
+      
+      return { success: true, message: msg };
+    }
+
+    // ============================================================================
+    // SLOW MOVERS / DEADSTOCK
+    // ============================================================================
+
+    if (lower === 'ขายไม่ดี' || lower === 'slow movers' || lower === 'deadstock') {
+      const { stockPredictor } = require('./stockPrediction');
+      
+      if (stockPredictor.salesHistory.size === 0) {
+        await stockPredictor.analyzeSalesVelocity();
+      }
+      
+      const slowMovers = Array.from(stockPredictor.salesHistory.values())
+        .filter(v => v.velocity === 'very_slow' || v.velocity === 'dormant')
+        .sort((a, b) => a.avgDailySales - b.avgDailySales)
+        .slice(0, 15);
+      
+      if (slowMovers.length === 0) {
+        return { 
+          success: true, 
+          message: '✅ ทุกสินค้าขายดีหมด!' 
+        };
+      }
+      
+      let msg = `🐌 สินค้าขายช้า (Slow Movers)\n${'='.repeat(40)}\n\n`;
+      
+      slowMovers.forEach((item, i) => {
+        msg += `${i + 1}. ${item.name}\n`;
+        msg += `   📉 ขาย ${item.avgDailySales.toFixed(1)}/วัน\n`;
+        msg += `   📦 สต็อก ${item.currentStock}\n\n`;
+      });
+      
+      msg += `\n💡 พิจารณา: ลดราคา หรือหยุดสั่ง`;
+      
+      return { success: true, message: msg };
+    }
     const aiResults = await parseOrder(text);
     
     if (!aiResults || aiResults.length === 0) {
