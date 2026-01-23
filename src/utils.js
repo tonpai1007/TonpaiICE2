@@ -10,7 +10,19 @@ function normalizeText(text) {
     .replace(/[^\u0E00-\u0E7F0-9a-z]/g, '')
     .trim();
 }
-
+function normalizeToGregorian(dateStr) {
+  if (!dateStr) return null;
+  
+  // Handle "DD/MM/YYYY HH:MM:SS"
+  if (dateStr.includes('/')) {
+    const [datePart] = dateStr.split(' ');
+    const [day, month, year] = datePart.split('/');
+    return `${year}-${month}-${day}`;
+  }
+  
+  // Handle "YYYY-MM-DD"
+  return dateStr.split(' ')[0];
+}
 function extractDigits(str) {
   const match = String(str).match(/\d+/g);
   return match ? match.join('') : '';

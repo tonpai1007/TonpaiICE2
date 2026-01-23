@@ -185,7 +185,26 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
     return { success: false, error: error.message };
   }
 }
+class RequestCache {
+  constructor() {
+    this.cache = new Map();
+    this.timestamp = Date.now();
+  }
+  
+  async getOrFetch(key, fetchFn) {
+    if (this.cache.has(key)) return this.cache.get(key);
+    
+    const data = await fetchFn();
+    this.cache.set(key, data);
+    return data;
+  }
+}
 
+// Use in message handler
+const requestCache = new RequestCache();
+const stockData = await requestCache.getOrFetch('stock', 
+  () => getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G')
+);
 // ============================================================================
 // MAIN MESSAGE HANDLER
 // ============================================================================

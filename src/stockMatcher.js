@@ -7,11 +7,11 @@ const { Logger } = require('./logger');
 // PERFORMANCE-OPTIMIZED STOCK MATCHER
 // ============================================================================
 
-class StockMatcher {
+
+ class StockMatcher {
   constructor() {
-    this.searchCache = new Map();
-    this.keywordIndex = new Map();
-    this.maxCacheSize = 1000;
+    this.index = null;
+    this.lastStockHash = null;
   }
 
   // ========================================================================

@@ -30,15 +30,15 @@ function splitMultipleIntents(text) {
   }
   
   // Payment keywords
-  const paidKeywords = /จ่าย(?:แล้ว|เงิน)?|ชำระ(?:แล้ว|เงิน)?|เงินสด|โอน(?:แล้ว|เงิน)?/i;
-  const unpaidKeywords = /เครดิต|ค้าง|ยัง(?:ไม่|ไม่ได้)จ่าย|เอาไว้ก่อน/i;
-  
-  if (paidKeywords.test(text)) {
-    intents.hasPayment = true;
+ const hasExplicitPaid = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว)|โอนแล้ว/i.test(text);
+  const hasExplicitUnpaid = /เครดิต|ค้าง|ยังไม่จ่าย/i.test(text);
+
+  if (hasExplicitPaid) {
     intents.paymentStatus = 'paid';
-  } else if (unpaidKeywords.test(text)) {
-    intents.hasPayment = true;
+  } else if (hasExplicitUnpaid) {
     intents.paymentStatus = 'unpaid';
+  } else {
+    intents.paymentStatus = null; // ✅ Ambiguous - let system decide
   }
   
   // Delivery keywords
