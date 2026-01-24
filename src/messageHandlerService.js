@@ -1,4 +1,5 @@
-// src/messageHandlerService.js - FIXED: Proper import usage
+
+// src/messageHandlerService.js - FIXED: Remove top-level await
 const { Logger } = require('./logger');
 const { parseOrder } = require('./orderParser');
 const { createOrderTransaction, updateOrderPaymentStatus, getLastOrderNumber } = require('./orderService');
@@ -185,26 +186,7 @@ async function updateDeliveryPerson(orderNo, deliveryPerson) {
     return { success: false, error: error.message };
   }
 }
-class RequestCache {
-  constructor() {
-    this.cache = new Map();
-    this.timestamp = Date.now();
-  }
-  
-  async getOrFetch(key, fetchFn) {
-    if (this.cache.has(key)) return this.cache.get(key);
-    
-    const data = await fetchFn();
-    this.cache.set(key, data);
-    return data;
-  }
-}
 
-// Use in message handler
-const requestCache = new RequestCache();
-const stockData = await requestCache.getOrFetch('stock', 
-  () => getSheetData(CONFIG.SHEET_ID, 'สต็อก!A:G')
-);
 // ============================================================================
 // MAIN MESSAGE HANDLER
 // ============================================================================
@@ -213,13 +195,10 @@ async function handleMessage(text, userId) {
   try {
     const lower = text.toLowerCase().trim();
 
-    // Save to inbox - USE IMPORTED FUNCTION
+    // Save to inbox
     await saveToInbox(userId, text);
 
-    // ========================================================================
-    // STOCK ADJUSTMENT DETECTION
-    // ========================================================================
-    
+    // Stock adjustment detection
     const stockKeywords = ['เหลือ', 'มี', 'เติม', 'ลด', 'เพิ่ม', 'ปรับ'];
     const orderKeywords = ['สั่ง', 'ซื้อ', 'เอา', 'ขอ', 'จอง'];
     const customerPrefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ร้าน', 'ป้า'];
@@ -238,10 +217,7 @@ async function handleMessage(text, userId) {
     
     Logger.info(`🔍 Detection: Stock=${hasStockKeywords}, Order=${hasOrderKeywords}, Customer=${hasCustomerPrefix}, IsStockAdj=${isLikelyStockAdjustment}`);
 
-    // ========================================================================
     // WELCOME
-    // ========================================================================
-    
     if (lower === 'start' || lower === 'เริ่ม' || lower === 'hello' || lower === 'สวัสดี') {
       const isAdmin = AccessControl.isAdmin(userId);
       
@@ -271,27 +247,18 @@ async function handleMessage(text, userId) {
       return { success: true, message: welcome };
     }
 
-    // ========================================================================
     // HELP
-    // ========================================================================
-    
     if (lower === 'help' || lower === 'ช่วย' || lower === 'สอน') {
       return { success: true, message: getHelpMessage(userId) };
     }
 
-    // ========================================================================
     // BUSINESS COMMANDS
-    // ========================================================================
-    
     const businessResult = await handleBusinessCommand(text, userId);
     if (businessResult && businessResult.success) {
       return businessResult;
     }
 
-    // ========================================================================
     // ADMIN COMMANDS
-    // ========================================================================
-    
     if (lower === 'สรุป' || lower.includes('สรุปวันนี้')) {
       const summary = await generateDailySummary();
       return { success: true, message: summary };
@@ -309,10 +276,7 @@ async function handleMessage(text, userId) {
       return { success: true, message: '✅ รีเฟรชข้อมูลสำเร็จ' };
     }
 
-    // ========================================================================
     // PAYMENT UPDATE
-    // ========================================================================
-    
     if (lower === 'จ่าย' || lower === 'จ่ายแล้ว') {
       const lastOrderNo = await getLastOrderNumber();
       
@@ -346,10 +310,7 @@ async function handleMessage(text, userId) {
       }
     }
 
-    // ========================================================================
     // DELIVERY UPDATE
-    // ========================================================================
-    
     if (lower.startsWith('ส่ง ')) {
       const deliveryMatch = text.match(/ส่ง\s+(?:#(\d+)\s+)?(.+)/i);
       
@@ -370,10 +331,7 @@ async function handleMessage(text, userId) {
       }
     }
 
-    // ========================================================================
     // CANCEL ORDER
-    // ========================================================================
-    
     if (lower === 'ยกเลิก' || lower.startsWith('ยกเลิก ')) {
       const orderNoMatch = text.match(/#(\d+)/);
       const orderNo = orderNoMatch ? parseInt(orderNoMatch[1]) : await getLastOrderNumber();
@@ -399,10 +357,7 @@ async function handleMessage(text, userId) {
       }
     }
 
-    // ========================================================================
     // CREDIT COMMANDS
-    // ========================================================================
-    
     if (lower.includes('เครดิต') || lower === 'credit') {
       if (lower.startsWith('เครดิต ')) {
         const customerName = text.replace(/เครดิต/i, '').trim();
@@ -440,10 +395,7 @@ async function handleMessage(text, userId) {
       return { success: true, message: report };
     }
 
-    // ========================================================================
     // STOCK ADJUSTMENT
-    // ========================================================================
-    
     if (isLikelyStockAdjustment) {
       Logger.info('🔧 Detected as stock adjustment');
       
@@ -483,176 +435,7 @@ async function handleMessage(text, userId) {
       }
     }
 
-    // ========================================================================
     // ORDER PARSING
-    // ========================================================================
-    
-    if (lower === 'วิเคราะห์สต็อก' || lower === 'analyze stock') {
-      const { stockPredictor } = require('./stockPrediction');
-      await stockPredictor.analyzeSalesVelocity();
-      const report = await stockPredictor.generateStockReport();
-      return { success: true, message: report };
-    }
-
-    if (lower === 'abc' || lower === 'abc analysis') {
-      const { stockPredictor } = require('./stockPrediction');
-      const report = await stockPredictor.performABCAnalysis();
-      return { success: true, message: report };
-    }
-
-    if (lower === 'สุขภาพสต็อก' || lower === 'stock health') {
-      const { stockPredictor } = require('./stockPrediction');
-      const health = await stockPredictor.getStockHealth();
-      return { success: true, message: health };
-    }
-
-    if (lower === 'ต้องสั่งอะไร' || lower === 'ควรสั่งอะไร' || lower === 'reorder') {
-      const { stockPredictor } = require('./stockPrediction');
-      const recommendations = await stockPredictor.generateReorderRecommendations();
-      
-      if (recommendations.length === 0) {
-        return { 
-          success: true, 
-          message: '✅ สต็อกทุกรายการเพียงพอ\n\nไม่มีสินค้าที่ต้องสั่งซื้อด่วน' 
-        };
-      }
-      
-      let msg = `📋 รายการที่ควรสั่งซื้อ (${recommendations.length} รายการ)\n${'='.repeat(40)}\n\n`;
-      
-      recommendations.slice(0, 10).forEach((r, i) => {
-        const urgencyIcon = r.urgency === 'critical' ? '🔴' : 
-                            r.urgency === 'high' ? '🟡' : '🟢';
-        msg += `${urgencyIcon} ${i + 1}. ${r.product}\n`;
-        msg += `   📦 เหลือ ${r.currentStock} (พอ ${r.daysUntilStockout} วัน)\n`;
-        msg += `   ✅ แนะนำสั่ง ${r.recommendedQuantity}\n\n`;
-      });
-      
-      if (recommendations.length > 10) {
-        msg += `... และอีก ${recommendations.length - 10} รายการ\n\n`;
-      }
-      
-      const totalCost = recommendations.reduce((sum, r) => sum + r.estimatedCost, 0);
-      msg += `💰 ต้นทุนรวม: ${totalCost.toLocaleString()}฿`;
-      
-      return { success: true, message: msg };
-    }
-
-    // ============================================================================
-    // VOICE-FRIENDLY STOCK QUERY
-    // ============================================================================
-
-    if (lower.match(/^(มี|เหลือ|สต็อก)\s+(.+?)(?:\s+เท่าไหร่|อยู่|ไหม)?$/)) {
-      const match = lower.match(/^(มี|เหลือ|สต็อก)\s+(.+?)(?:\s+เท่าไหร่|อยู่|ไหม)?$/);
-      const productName = match[2].trim();
-      
-      const stockCache = getStockCache();
-      const { fuzzyMatchStock } = require('./stockAdjustment');
-      
-      const matches = fuzzyMatchStock(productName, stockCache);
-      
-      if (matches.length === 0) {
-        return { 
-          success: false, 
-          message: `❌ ไม่พบสินค้า "${productName}"\n\nลองเช็คชื่อใหม่อีกครั้ง` 
-        };
-      }
-      
-      if (matches.length === 1) {
-        const item = matches[0].item;
-        let msg = `📦 ${item.item}\n${'='.repeat(30)}\n\n`;
-        msg += `💰 ราคา: ${item.price}฿\n`;
-        msg += `📊 สต็อก: ${item.stock} ${item.unit}\n`;
-        
-        if (item.stock <= 3) {
-          msg += `\n🔴 สต็อกเหลือน้อย!`;
-        } else if (item.stock <= 10) {
-          msg += `\n🟡 ควรสั่งเพิ่ม`;
-        }
-        
-        return { success: true, message: msg };
-      }
-      
-      // Multiple matches
-      let msg = `🔍 พบ ${matches.length} รายการ:\n\n`;
-      matches.slice(0, 5).forEach((m, i) => {
-        msg += `${i + 1}. ${m.item.item}\n`;
-        msg += `   💰 ${m.item.price}฿ │ 📦 ${m.item.stock} ${m.item.unit}\n\n`;
-      });
-      
-      return { success: true, message: msg };
-    }
-
-    // ============================================================================
-    // FAST MOVERS REPORT
-    // ============================================================================
-
-    if (lower === 'ขายดี' || lower === 'fast movers' || lower === 'top sellers') {
-      const { stockPredictor } = require('./stockPrediction');
-      
-      if (stockPredictor.salesHistory.size === 0) {
-        await stockPredictor.analyzeSalesVelocity();
-      }
-      
-      const fastMovers = Array.from(stockPredictor.salesHistory.values())
-        .filter(v => v.velocity === 'fast')
-        .sort((a, b) => b.avgDailySales - a.avgDailySales)
-        .slice(0, 15);
-      
-      if (fastMovers.length === 0) {
-        return { 
-          success: true, 
-          message: '📊 ยังไม่มีข้อมูลเพียงพอ\n\nให้ระบบทำงานไปสักพัก' 
-        };
-      }
-      
-      let msg = `⚡ สินค้าขายดี (Fast Movers)\n${'='.repeat(40)}\n\n`;
-      
-      fastMovers.forEach((item, i) => {
-        msg += `${i + 1}. ${item.name}\n`;
-        msg += `   📈 ขาย ${item.avgDailySales.toFixed(1)}/วัน\n`;
-        msg += `   📦 เหลือ ${item.currentStock} (พอ ${item.daysUntilStockout} วัน)\n\n`;
-      });
-      
-      msg += `\n💡 แนะนำ: เติมสินค้าเหล่านี้บ่อยๆ`;
-      
-      return { success: true, message: msg };
-    }
-
-    // ============================================================================
-    // SLOW MOVERS / DEADSTOCK
-    // ============================================================================
-
-    if (lower === 'ขายไม่ดี' || lower === 'slow movers' || lower === 'deadstock') {
-      const { stockPredictor } = require('./stockPrediction');
-      
-      if (stockPredictor.salesHistory.size === 0) {
-        await stockPredictor.analyzeSalesVelocity();
-      }
-      
-      const slowMovers = Array.from(stockPredictor.salesHistory.values())
-        .filter(v => v.velocity === 'very_slow' || v.velocity === 'dormant')
-        .sort((a, b) => a.avgDailySales - b.avgDailySales)
-        .slice(0, 15);
-      
-      if (slowMovers.length === 0) {
-        return { 
-          success: true, 
-          message: '✅ ทุกสินค้าขายดีหมด!' 
-        };
-      }
-      
-      let msg = `🐌 สินค้าขายช้า (Slow Movers)\n${'='.repeat(40)}\n\n`;
-      
-      slowMovers.forEach((item, i) => {
-        msg += `${i + 1}. ${item.name}\n`;
-        msg += `   📉 ขาย ${item.avgDailySales.toFixed(1)}/วัน\n`;
-        msg += `   📦 สต็อก ${item.currentStock}\n\n`;
-      });
-      
-      msg += `\n💡 พิจารณา: ลดราคา หรือหยุดสั่ง`;
-      
-      return { success: true, message: msg };
-    }
     const aiResults = await parseOrder(text);
     
     if (!aiResults || aiResults.length === 0) {
@@ -712,16 +495,13 @@ async function executeOrderLogic(parsed, userId) {
   try {
     const { getCustomerCache } = require('./cacheManager');
     
-    // Apply smart correction
     parsed = applySmartCorrection(parsed);
     
-    // Apply smart learning
     const prediction = smartLearner.predictOrder(parsed.customer, parsed.items);
     if (prediction.success && prediction.confidence === 'high') {
       parsed.items = prediction.items || parsed.items;
     }
 
-    // Auto-add customer if not exists
     if (parsed.customer && parsed.customer !== 'ไม่ระบุ') {
       const customerCache = getCustomerCache();
       const customerExists = customerCache.some(c => 
@@ -733,23 +513,18 @@ async function executeOrderLogic(parsed, userId) {
       }
     }
 
-    // ✅ FIX: ตรวจสอบ payment status อย่างชัดเจน
     let paymentStatus = 'unpaid';
-    
     if (parsed.isPaid === true) {
       paymentStatus = 'paid';
       Logger.info('💰 Detected: PAID order');
     }
 
-    // ✅ FIX: ตรวจสอบ delivery person
     let deliveryPerson = '';
-    
     if (parsed.deliveryPerson && parsed.deliveryPerson.trim() !== '') {
       deliveryPerson = parsed.deliveryPerson.trim();
       Logger.info(`🚚 Detected: Delivery by ${deliveryPerson}`);
     }
 
-    // Prepare order data
     const orderData = {
       customer: parsed.customer || 'ไม่ระบุ',
       items: parsed.items,
@@ -761,11 +536,9 @@ async function executeOrderLogic(parsed, userId) {
       sum + (item.quantity * item.stockItem.price), 0
     );
 
-    // Auto-process decision
     const autoDecision = shouldAutoProcess(parsed, totalValue);
     monitor.recordDecision(autoDecision, 'pending');
 
-    // Create order
     const result = await createOrderTransaction(orderData);
     
     if (result.success) {
@@ -773,19 +546,16 @@ async function executeOrderLogic(parsed, userId) {
 
       let extraMessages = [];
 
-      // ✅ FIX: Update payment ONLY if paid
       if (paymentStatus === 'paid') {
         await updateOrderPaymentStatus(result.orderNo, 'จ่ายแล้ว');
         extraMessages.push('💸 บันทึกรับเงินแล้ว');
         Logger.success(`✅ Payment marked as PAID for order #${result.orderNo}`);
       }
 
-      // ✅ FIX: Show delivery info if provided
       if (deliveryPerson) {
         extraMessages.push(`🚚 กำลังส่งโดย: ${deliveryPerson}`);
       }
 
-      // Format response
       let responseMsg = formatOrderSuccess(
         result.orderNo,
         result.customer,
@@ -819,6 +589,9 @@ async function executeOrderLogic(parsed, userId) {
     };
   }
 }
+// ============================================================================
+// EXECUTION HELPERS
+// ============================================================================
 
 
 async function executePaymentLogic(res, userId) {
