@@ -13,7 +13,7 @@ const { getStockCache, getCustomerCache } = require('./cacheManager');
 function splitMultipleIntents(text) {
   const lower = text.toLowerCase();
   
-  // ✅ FIX: Define paidKeywords at the top of the function
+  // ✅ FIX: Define paidKeywords at the top
   const paidKeywords = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว|เงิน)|โอน(?:แล้ว|เงิน)|เงินสด/i;
   
   // ============================================================================
@@ -41,7 +41,7 @@ function splitMultipleIntents(text) {
   } else if (hasExplicitUnpaid) {
     intents.paymentStatus = 'unpaid';
   } else {
-    intents.paymentStatus = null; // ✅ Ambiguous - let system decide
+    intents.paymentStatus = null;
   }
   
   // Delivery keywords
@@ -50,47 +50,73 @@ function splitMultipleIntents(text) {
   }
   
   // ============================================================================
-  // COMPLEX PATTERNS (Voice-Optimized)
+  // ✅ FIX: BETTER PATTERNS - Voice-Optimized
   // ============================================================================
   
   const patterns = [
-    // Pattern 1: "พี่แดง ส่ง โค้ก 30 5ขวด แล้วจ่ายเงินแล้ว"
+    // Pattern 1: "ส่งโดย X" or "โดย X ส่ง" - Extract delivery person FIRST
     {
-      regex: /(.+?)\s*ส่ง\s+(.+?)(?:\s+(?:แล้ว|เเล้ว|ด้วย|แล้วก็))?\s*(?:จ่าย|ชำระ|โอน)?(?:\s*(?:แล้ว|เงิน))?/i,
+      regex: /ส่ง(?:โดย|ให้)\s+(\S+)|(?:โดย|ให้)\s+(\S+)\s*ส่ง/i,
       extract: (match, fullText) => {
-        const deliveryPerson = match[1].trim();
-        const itemsPart = match[2].trim();
+        const deliveryPerson = (match[1] || match[2] || '').trim();
         
-        // Check if customer name is in items part
-        const customerMatch = itemsPart.match(/^(คุณ|พี่|น้อง|เจ๊|ร้าน)\s*(\S+)/);
+        // Remove delivery part to get clean items
+        const cleanText = fullText
+          .replace(/ส่ง(?:โดย|ให้)\s+\S+/gi, '')
+          .replace(/(?:โดย|ให้)\s+\S+\s*ส่ง/gi, '')
+          .trim();
         
-        return {
-          customer: customerMatch ? `${customerMatch[1]}${customerMatch[2]}` : deliveryPerson,
-          itemsPart: customerMatch ? itemsPart.replace(customerMatch[0], '').trim() : itemsPart,
-          deliveryPerson: deliveryPerson,
-          hasPaid: paidKeywords.test(fullText),
-          hasDelivery: true,
-          confidence: 'high',
-          pattern: 'delivery_first'
-        };
+        // Now extract customer and items
+        const orderMatch = cleanText.match(/((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+)/i);
+        
+        if (orderMatch) {
+          return {
+            customer: orderMatch[1].trim(),
+            itemsPart: orderMatch[2].trim(),
+            deliveryPerson: deliveryPerson,
+            hasPaid: paidKeywords.test(fullText),
+            hasDelivery: true,
+            confidence: 'high',
+            pattern: 'delivery_extracted'
+          };
+        }
+        
+        // No clear customer - use first word before "สั่ง"
+        const fallbackMatch = cleanText.match(/(\S+)\s*(?:สั่ง|เอา)\s+(.+)/i);
+        if (fallbackMatch) {
+          return {
+            customer: fallbackMatch[1].trim(),
+            itemsPart: fallbackMatch[2].trim(),
+            deliveryPerson: deliveryPerson,
+            hasPaid: paidKeywords.test(fullText),
+            hasDelivery: true,
+            confidence: 'medium',
+            pattern: 'delivery_extracted_fallback'
+          };
+        }
+        
+        return null;
       }
     },
     
-    // Pattern 2: "คุณแอน สั่ง น้ำแข็ง 60 2ถุง จ่ายแล้ว ส่งพี่แดง"
+    // Pattern 2: "[Customer] สั่ง [items] จ่ายแล้ว ส่ง[person]"
     {
-      regex: /((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+?)(?:\s+(?:จ่าย|ชำระ))?(?:\s*(?:แล้ว|เงิน))?\s*(?:ส่ง)?\s*(.+)?/i,
+      regex: /((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+)/i,
       extract: (match, fullText) => {
         const customer = match[1].trim();
-        const itemsPart = match[2].trim();
-        const deliveryMatch = match[3] ? match[3].trim() : null;
+        let itemsPart = match[2].trim();
         
-        // Extract delivery person
+        // Extract delivery person from items part
         let deliveryPerson = '';
-        if (deliveryMatch && /ส่ง/.test(fullText)) {
-          const deliveryPersonMatch = fullText.match(/ส่ง\s*(พี่|คุณ)?\s*(\S+)/i);
-          if (deliveryPersonMatch) {
-            deliveryPerson = deliveryPersonMatch[0].replace('ส่ง', '').trim();
-          }
+        const deliveryMatch = itemsPart.match(/ส่ง(?:โดย|ให้)?\s*(\S+)|(?:โดย|ให้)\s*(\S+)\s*ส่ง/i);
+        
+        if (deliveryMatch) {
+          deliveryPerson = (deliveryMatch[1] || deliveryMatch[2] || '').trim();
+          // Remove delivery info from items
+          itemsPart = itemsPart
+            .replace(/ส่ง(?:โดย|ให้)?\s*\S+/gi, '')
+            .replace(/(?:โดย|ให้)\s*\S+\s*ส่ง/gi, '')
+            .trim();
         }
         
         return {
@@ -105,42 +131,46 @@ function splitMultipleIntents(text) {
       }
     },
     
-    // Pattern 3: "โค้ก 30 5ขวด สำหรับพี่แดง จ่ายแล้ว"
+    // Pattern 3: Simple "[word] สั่ง [items]" - Could be customer OR product
     {
-      regex: /(.+?)\s+สำหรับ\s+([\S\s]+?)(?:\s+(?:จ่าย|ชำระ))?/i,
+      regex: /(\S+)\s*(?:สั่ง|เอา)\s+(.+)/i,
       extract: (match, fullText) => {
-        const itemsPart = match[1].trim();
-        const customer = match[2].trim();
+        const firstWord = match[1].trim();
+        let itemsPart = match[2].trim();
         
-        return {
-          customer,
-          itemsPart,
-          deliveryPerson: '',
-          hasPaid: paidKeywords.test(fullText),
-          hasDelivery: false,
-          confidence: 'medium',
-          pattern: 'items_for_customer'
-        };
-      }
-    },
-    
-    // Pattern 4: Simple order with payment flag
-    {
-      regex: /(.+?)\s*(?:สั่ง|เอา|ขอ)\s*(.+)/i,
-      extract: (match, fullText) => {
-        const customer = match[1].trim();
-        const itemsPart = match[2].trim();
-        
-        // Check if items part contains delivery info
+        // Extract delivery
         let deliveryPerson = '';
-        const deliveryMatch = itemsPart.match(/ส่ง\s*(พี่|คุณ)?\s*(\S+)/i);
+        const deliveryMatch = itemsPart.match(/ส่ง(?:โดย|ให้)?\s*(\S+)|(?:โดย|ให้)\s*(\S+)\s*ส่ง/i);
+        
         if (deliveryMatch) {
-          deliveryPerson = deliveryMatch[0].replace('ส่ง', '').trim();
+          deliveryPerson = (deliveryMatch[1] || deliveryMatch[2] || '').trim();
+          itemsPart = itemsPart
+            .replace(/ส่ง(?:โดย|ให้)?\s*\S+/gi, '')
+            .replace(/(?:โดย|ให้)\s*\S+\s*ส่ง/gi, '')
+            .trim();
+        }
+        
+        // ✅ FIX: Check if firstWord is likely a product name
+        const productKeywords = ['น้ำแข็ง', 'โค้ก', 'เป๊ปซี่', 'สิงห์', 'ช้าง', 'น้ำ', 'เบียร์'];
+        const isLikelyProduct = productKeywords.some(kw => firstWord.includes(kw));
+        
+        if (isLikelyProduct) {
+          // "กาแฟ สั่ง น้ำแข็ง" → กาแฟ is PRODUCT, not customer
+          // Put it back into items
+          return {
+            customer: 'ไม่ระบุ',
+            itemsPart: `${firstWord} ${itemsPart}`.trim(),
+            deliveryPerson,
+            hasPaid: paidKeywords.test(fullText),
+            hasDelivery: deliveryPerson !== '',
+            confidence: 'low',
+            pattern: 'product_first_detected'
+          };
         }
         
         return {
-          customer,
-          itemsPart: itemsPart.replace(/ส่ง\s*\S+/i, '').trim(),
+          customer: firstWord,
+          itemsPart,
           deliveryPerson,
           hasPaid: paidKeywords.test(fullText),
           hasDelivery: deliveryPerson !== '',
@@ -161,7 +191,7 @@ function splitMultipleIntents(text) {
       const extracted = pattern.extract(match, text);
       
       // Validate extraction
-      if (extracted.customer && extracted.itemsPart) {
+      if (extracted && extracted.itemsPart) {
         Logger.info(`🎯 Pattern matched: ${extracted.pattern}`);
         Logger.info(`   Customer: ${extracted.customer}`);
         Logger.info(`   Items: ${extracted.itemsPart}`);
