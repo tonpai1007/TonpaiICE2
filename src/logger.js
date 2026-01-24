@@ -102,10 +102,10 @@ class PerformanceMonitor {
 }
 
 // ============================================================================
-// SINGLETON INSTANCES
+// SINGLETON INSTANCES - FIX: Export Logger instance
 // ============================================================================
 
-
+const Logger = new SimpleLogger();  // ✅ CREATE INSTANCE
 const performanceMonitor = new PerformanceMonitor();
 
 // ============================================================================
@@ -113,6 +113,7 @@ const performanceMonitor = new PerformanceMonitor();
 // ============================================================================
 
 module.exports = {
+  Logger,  // ✅ EXPORT THE INSTANCE
   SimpleLogger,
   PerformanceMonitor: performanceMonitor
 };
