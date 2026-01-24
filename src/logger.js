@@ -105,7 +105,7 @@ class PerformanceMonitor {
 // SINGLETON INSTANCES
 // ============================================================================
 
-const Logger = new SimpleLogger();
+
 const performanceMonitor = new PerformanceMonitor();
 
 // ============================================================================
@@ -113,6 +113,6 @@ const performanceMonitor = new PerformanceMonitor();
 // ============================================================================
 
 module.exports = {
-  Logger,
+  SimpleLogger,
   PerformanceMonitor: performanceMonitor
 };

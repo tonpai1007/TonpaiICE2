@@ -5,11 +5,24 @@ const { handleMessage } = require('./messageHandlerService');
 async function processVoiceMessage(audioBuffer, userId) {
   try {
     const { success, text } = await transcribeAudio(audioBuffer);
-    if (!success || !text) return { success: false, message: '❌ ฟังไม่ออกค่ะ... พยายามพูดให้เหมือนมนุษย์กว่านี้หน่อยนะ' };
+    if (!success || !text) {
+      return { 
+        success: false, 
+        message: '❌ ไม่สามารถฟังเสียงได้ชัดเจน\n\n💡 ลองพูดใหม่อีกครั้ง หรือพิมพ์ข้อความแทน' 
+      };
+    }
 
     Logger.info(`🎤 Voice Raw Text: "${text}"`);
-    // ส่งข้อความดิบไปให้ระบบจัดการข้อความหลักจัดการต่อ
-    const result = await handleMessage(text, userId); 
+    
+    // ✅ FIX: Add error handling for handleMessage
+    const result = await handleMessage(text, userId);
+    
+    if (!result || !result.message) {
+      return {
+        success: false,
+        message: `🎤 ฉันได้ยินว่า: "${text}"\n\n❌ แต่ไม่เข้าใจคำสั่ง กรุณาลองใหม่`
+      };
+    }
     
     return {
       success: true,
@@ -17,7 +30,10 @@ async function processVoiceMessage(audioBuffer, userId) {
     };
   } catch (error) {
     Logger.error('Voice system failure', error);
-    return { success: false, message: '❌ ระบบเอ๋อไปแล้วค่ะ คงเพราะโค้ดเก่านายทำพิษล่ะมั้ง' };
+    return { 
+      success: false, 
+      message: '❌ ระบบประมวลผลเสียงขัดข้อง\n\nกรุณาลองใหม่อีกครั้ง หรือพิมพ์ข้อความแทน' 
+    };
   }
 }
 
