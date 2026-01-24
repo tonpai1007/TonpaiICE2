@@ -72,31 +72,67 @@ async function initializeApp() {
     initializeGoogleServices();
     initializeAIServices();
     
-    // Initialize sheets
-    await initializeSheets();
+    // ✅ ADD: Retry logic for sheets initialization
+    let sheetsInitialized = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await initializeSheets();
+        sheetsInitialized = true;
+        break;
+      } catch (error) {
+        Logger.error(`❌ Sheets init attempt ${attempt}/3 failed`, error);
+        if (attempt === 3) {
+          Logger.error('CRITICAL: Cannot initialize sheets after 3 attempts');
+          Logger.error('Server will start but orders will FAIL until sheets are fixed');
+          // Don't exit - let server run for health checks
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        }
+      }
+    }
     
-    // Initialize inbox sheet structure
-    const { initializeInboxSheet } = require('./inboxService');
-    await initializeInboxSheet();
+    // ✅ ADD: Initialize inbox sheet separately (non-critical)
+    try {
+      const { initializeInboxSheet } = require('./inboxService');
+      await initializeInboxSheet();
+    } catch (error) {
+      Logger.warn('⚠️  Inbox sheet init failed (non-critical)', error);
+    }
     
-    // Load caches
-    await loadStockCache(true);
-    await loadCustomerCache(true);
+    // ✅ ADD: Graceful cache loading
+    try {
+      await loadStockCache(true);
+      await loadCustomerCache(true);
+    } catch (error) {
+      Logger.error('❌ Cache loading failed - orders may fail', error);
+      // Continue anyway - cache will retry on first request
+    }
     
-    // Initialize smart learning
-    await smartLearner.loadOrderHistory();
-    const stats = smartLearner.getStats();
-    Logger.success(`🧠 Smart Learning: ${stats.customersLearned} customers, ${stats.totalPatterns} patterns`);
+    // Initialize smart learning (non-critical)
+    try {
+      await smartLearner.loadOrderHistory();
+      const stats = smartLearner.getStats();
+      Logger.success(`🧠 Smart Learning: ${stats.customersLearned} customers, ${stats.totalPatterns} patterns`);
+    } catch (error) {
+      Logger.warn('⚠️  Smart learning init failed (non-critical)', error);
+    }
     
     // Start cleanup scheduler
-    const { scheduleCleanup } = require('./cleanupService');
-    scheduleCleanup();
-    Logger.success('✅ Cleanup scheduler initialized (runs at 3 AM daily)');
+    try {
+      const { scheduleCleanup } = require('./cleanupService');
+      scheduleCleanup();
+      Logger.success('✅ Cleanup scheduler initialized');
+    } catch (error) {
+      Logger.warn('⚠️  Cleanup scheduler failed (non-critical)', error);
+    }
     
-    Logger.success('✅ System Ready');
+    Logger.success('✅ System Ready' + (sheetsInitialized ? '' : ' (WITH ERRORS - CHECK LOGS)'));
   } catch (error) {
     Logger.error('❌ Init failed - CRITICAL', error);
-    process.exit(1);
+    
+    // ✅ CHANGED: Don't exit - allow server to start for debugging
+    Logger.error('⚠️  Server starting in degraded mode');
+    Logger.error('⚠️  Fix the errors above and restart, or use /health endpoint');
   }
 }
 
@@ -327,7 +363,9 @@ app.get('/health', async (req, res) => {
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
       memory: process.memoryUsage(),
-      checks: {}
+      checks: {},
+      warnings: [],
+      errors: []
     };
     
     // Check Google Sheets
@@ -337,19 +375,58 @@ app.get('/health', async (req, res) => {
       health.checks.googleSheets = 'ok';
     } catch (error) {
       health.checks.googleSheets = 'error';
+      health.errors.push('Google Sheets connection failed');
       health.status = 'degraded';
     }
     
     // Check cache
     const { getStockCache, getCustomerCache } = require('./cacheManager');
-    health.checks.stockCache = getStockCache().length > 0 ? 'ok' : 'empty';
-    health.checks.customerCache = getCustomerCache().length > 0 ? 'ok' : 'empty';
+    const stockCount = getStockCache().length;
+    const customerCount = getCustomerCache().length;
+    
+    health.checks.stockCache = stockCount > 0 ? 'ok' : 'empty';
+    health.checks.customerCache = customerCount > 0 ? 'ok' : 'empty';
+    
+    if (stockCount === 0) {
+      health.warnings.push('Stock cache is empty - orders will fail');
+      health.status = 'degraded';
+    }
     
     // Check AI service
     const { getGroq } = require('./aiServices');
     health.checks.aiService = getGroq() ? 'ok' : 'not_initialized';
     
-    const statusCode = health.status === 'ok' ? 200 : 503;
+    if (!getGroq()) {
+      health.errors.push('AI service not initialized');
+      health.status = 'error';
+    }
+    
+    // ✅ ADD: Check order service locks
+    const { stockLock } = require('./orderService');
+    const lockStats = stockLock.getStats();
+    health.checks.orderLocks = {
+      active: lockStats.currentLocks,
+      timeouts: lockStats.totalTimeouts
+    };
+    
+    if (lockStats.currentLocks > 10) {
+      health.warnings.push(`High lock contention: ${lockStats.currentLocks} active locks`);
+    }
+    
+    if (lockStats.totalTimeouts > 5) {
+      health.warnings.push(`${lockStats.totalTimeouts} lock timeouts detected`);
+      health.status = 'degraded';
+    }
+    
+    // ✅ ADD: Check rate limiter
+    const { webhookLimiter, userLimiter } = require('./middleware/webhook-security');
+    health.checks.rateLimiter = {
+      webhook: webhookLimiter.getStats(),
+      user: userLimiter.getStats()
+    };
+    
+    const statusCode = health.status === 'ok' ? 200 : 
+                       health.status === 'degraded' ? 200 : 503;
     res.status(statusCode).json(health);
     
   } catch (error) {
@@ -410,8 +487,20 @@ const PORT = process.env.PORT || 3000;
 
 // แก้บรรทัดนี้: เติม '0.0.0.0' เพื่อบังคับใช้ IPv4
 const server = app.listen(PORT, '0.0.0.0', async () => {
-  Logger.info(`🚀 Server running on port ${PORT} (IPv4)`);
+  console.log('\n' + '='.repeat(60));
+  console.log('🚀 ORDER BOT - STARTING UP');
+  console.log('='.repeat(60));
+  console.log(`📡 Server: http://0.0.0.0:${PORT}`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🤖 AI Provider: ${process.env.AI_PROVIDER || 'groq'}`);
+  console.log(`📊 Health Check: http://0.0.0.0:${PORT}/health`);
+  console.log('='.repeat(60) + '\n');
+  
   await initializeApp();
+  
+  console.log('\n' + '='.repeat(60));
+  console.log('✅ ORDER BOT - READY TO ACCEPT REQUESTS');
+  console.log('='.repeat(60) + '\n');
 });
 // ============================================================================
 // EXPORTS

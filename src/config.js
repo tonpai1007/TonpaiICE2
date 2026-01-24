@@ -60,6 +60,16 @@ class ConfigManager {
     if (missing.length > 0) {
       throw new Error(`❌ Missing required: ${missing.join(', ')}`);
     }
+     if (!this._config.LINE_TOKEN.startsWith('Bearer ')) {
+      console.warn('⚠️  LINE_TOKEN should start with "Bearer " - auto-fixing...');
+      this._config.LINE_TOKEN = `Bearer ${this._config.LINE_TOKEN}`;
+    }
+
+    // ✅ ADD: Validate Sheet ID format
+    if (!/^[a-zA-Z0-9_-]{20,}$/.test(this._config.SHEET_ID)) {
+      console.warn('⚠️  SHEET_ID format looks invalid (should be 20+ alphanumeric chars)');
+    }
+
 
     // Validate AI provider config
     const provider = this._config.AI_PROVIDER;
@@ -89,6 +99,17 @@ class ConfigManager {
     this._validated = true;
     console.log(`✅ Config validated (AI Provider: ${provider})`);
     return true;
+  }
+  isProduction() {
+    return this._config.NODE_ENV === 'production';
+  }
+
+  getSecurityConfig() {
+    return {
+      rateLimitEnabled: this.isProduction(),
+      ipWhitelistEnabled: this.isProduction(),
+      verboseLogging: !this.isProduction()
+    };
   }
 
   loadGoogleCredentials() {

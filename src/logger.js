@@ -5,15 +5,9 @@
 // ============================================================================
 
 class SimpleLogger {
-  constructor() {
-    this.level = process.env.LOG_LEVEL || 'info';
-    this.levels = {
-      debug: 0,
-      info: 1,
-      success: 1,
-      warn: 2,
-      error: 3
-    };
+   constructor() {
+    const { configManager } = require('./config');
+    this.level = configManager?.get('NODE_ENV') === 'production' ? 'info' : 'debug';
   }
 
   _shouldLog(level) {

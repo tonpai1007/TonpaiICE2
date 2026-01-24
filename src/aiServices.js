@@ -114,70 +114,6 @@ function initializeGroq() {
   }
 }
 
-// ============================================================================
-// OLLAMA SETUP
-// ============================================================================
-
-async function initializeOllama() {
-  try {
-    // Test connection with timeout
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeout);
-    
-    if (!response.ok) {
-      throw new Error(`Ollama returned ${response.status}`);
-    }
-    
-    const data = await response.json();
-    const models = data.models || [];
-    
-    Logger.success('✅ Ollama connected (Local AI)');
-    Logger.info(`   URL: ${OLLAMA_BASE_URL}`);
-    Logger.info(`   Model: ${OLLAMA_MODEL}`);
-    Logger.info(`   Available models: ${models.length}`);
-    
-    // Check if our model exists
-    const hasModel = models.some(m => m.name === OLLAMA_MODEL);
-    if (!hasModel) {
-      Logger.warn(`⚠️  Model ${OLLAMA_MODEL} not found`);
-      Logger.info(`   Run: ollama pull ${OLLAMA_MODEL}`);
-    }
-    
-    // Setup Groq for audio fallback if available
-    if (CONFIG.GROQ_API_KEY) {
-      try {
-        const OpenAIClass = loadOpenAI();
-        groqClient = new OpenAIClass({
-          apiKey: CONFIG.GROQ_API_KEY.trim(),
-          baseURL: 'https://api.groq.com/openai/v1',
-          timeout: 30000,
-          maxRetries: 2
-        });
-        Logger.success('   ✅ Groq Whisper available for audio');
-      } catch (error) {
-        Logger.warn('   ⚠️  Groq client init failed:', error.message);
-      }
-    } else {
-      Logger.warn('   ⚠️  No GROQ_API_KEY - voice messages will fail');
-    }
-    
-    return { ollama: true };
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      Logger.error('❌ Ollama connection timeout');
-    } else {
-      Logger.error('❌ Ollama connection failed', error);
-    }
-    Logger.error('   Make sure Ollama is running: ollama serve');
-    throw error;
-  }
-}
 
 // ============================================================================
 // OPENROUTER SETUP
@@ -235,8 +171,7 @@ async function generateWithGroq(prompt, jsonMode = false) {
       case 'groq':
         return await generateGroq(prompt, jsonMode);
       
-      case 'ollama':
-        return await generateOllama(prompt, jsonMode);
+     
       
       case 'openrouter':
         return await generateOpenRouter(prompt, jsonMode);
@@ -369,69 +304,7 @@ async function generateGroq(prompt, jsonMode) {
 // OLLAMA IMPLEMENTATION
 // ============================================================================
 
-async function generateOllama(prompt, jsonMode) {
-  Logger.debug(`🦙 Ollama generating (${jsonMode ? 'JSON' : 'text'})...`);
-  
-  const startTime = Date.now();
-  
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
-    
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt: prompt,
-        stream: false,
-        format: jsonMode ? 'json' : undefined,
-        options: {
-          temperature: 0.1,
-          num_predict: 2000,
-          top_k: 40,
-          top_p: 0.9,
-          repeat_penalty: 1.1
-        }
-      }),
-      signal: controller.signal
-    });
 
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Ollama error ${response.status}: ${error}`);
-    }
-
-    const data = await response.json();
-    const content = data.response?.trim();
-    
-    if (!content) {
-      throw new Error('Ollama returned empty response');
-    }
-    
-    const duration = Date.now() - startTime;
-    Logger.debug(`✅ Ollama completed in ${duration}ms`);
-    
-    if (jsonMode) {
-      try {
-        return JSON.parse(content);
-      } catch (parseError) {
-        Logger.error('Ollama JSON parse failed, raw:', content.substring(0, 500));
-        throw new Error('Failed to parse JSON from Ollama');
-      }
-    }
-    
-    return content;
-    
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error('Ollama request timeout (60s)');
-    }
-    throw error;
-  }
-}
 
 // ============================================================================
 // OPENROUTER IMPLEMENTATION
@@ -514,10 +387,11 @@ async function transcribeWithGroqWhisper(audioBuffer) {
 
   Logger.info('🎤 Using Groq Whisper...');
   
-  try
-   {const { Readable } = require('stream'); // เรียกใช้ Stream
-    const file = Readable.from(audioBuffer); // แปลง Buffer เป็น Stream
-    file.path = 'audio.m4a'; // หลอก Library ว่าชื่อไฟล์นี้ (จำเป็นต้องมีนามสกุล)
+  try {
+    // ✅ FIX: Create a File-like object that OpenAI SDK expects
+    const file = new File([audioBuffer], 'audio.m4a', {
+      type: 'audio/m4a'
+    });
     
     const transcription = await groqClient.audio.transcriptions.create({
       file: file,
@@ -527,7 +401,7 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       response_format: 'text'
     });
 
-    const text = transcription.text?.trim() || transcription.trim(); // ป้องกัน error
+    const text = transcription.text?.trim() || transcription.trim();
     
     if (!text) {
       throw new Error('Empty transcription');
@@ -541,6 +415,7 @@ async function transcribeWithGroqWhisper(audioBuffer) {
     throw error;
   }
 }
+
 
 async function transcribeWithOllamaWhisper(audioBuffer) {
   Logger.info('🎤 Ollama Whisper not implemented');
