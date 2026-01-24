@@ -13,6 +13,9 @@ const { getStockCache, getCustomerCache } = require('./cacheManager');
 function splitMultipleIntents(text) {
   const lower = text.toLowerCase();
   
+  // ✅ FIX: Define paidKeywords at the top of the function
+  const paidKeywords = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว|เงิน)|โอน(?:แล้ว|เงิน)|เงินสด/i;
+  
   // ============================================================================
   // INTENT DETECTION FLAGS
   // ============================================================================
@@ -30,7 +33,7 @@ function splitMultipleIntents(text) {
   }
   
   // Payment keywords
- const hasExplicitPaid = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว)|โอนแล้ว/i.test(text);
+  const hasExplicitPaid = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว)|โอนแล้ว/i.test(text);
   const hasExplicitUnpaid = /เครดิต|ค้าง|ยังไม่จ่าย/i.test(text);
 
   if (hasExplicitPaid) {
@@ -181,7 +184,6 @@ function splitMultipleIntents(text) {
   
   return null;
 }
-
 // ============================================================================
 // PAYMENT STATUS DETECTOR (More Robust)
 // ============================================================================
