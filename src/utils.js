@@ -1,6 +1,258 @@
-// utils.js - FIXED: Consistent date handling across system
+// src/utils.js - FIXED: Consistent date handling
+
 // ============================================================================
-// TEXT PROCESSING
+// DATE & TIME - STANDARDIZED GREGORIAN FORMAT
+// ============================================================================
+
+/**
+ * Get current date in YYYY-MM-DD format (Gregorian)
+ * Used for: Date comparisons, Dashboard, filtering
+ * @returns {string} "2026-01-24"
+ */
+function getThaiDateString() {
+  const now = new Date();
+  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  return bangkokTime.toISOString().split('T')[0]; // Returns: "2026-01-24"
+}
+
+/**
+ * Get current datetime in display format
+ * Used for: Order timestamps, user-facing displays
+ * @returns {string} "24/01/2026 14:30:00" (Thai format for readability)
+ */
+function getThaiDateTimeString() {
+  const now = new Date();
+  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  
+  const day = String(bangkokTime.getDate()).padStart(2, '0');
+  const month = String(bangkokTime.getMonth() + 1).padStart(2, '0');
+  const year = bangkokTime.getFullYear();
+  const hours = String(bangkokTime.getHours()).padStart(2, '0');
+  const minutes = String(bangkokTime.getMinutes()).padStart(2, '0');
+  const seconds = String(bangkokTime.getSeconds()).padStart(2, '0');
+  
+  return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
+}
+
+/**
+ * ✅ FIX #3: Extract Gregorian date from ANY format
+ * Handles both Thai display format and Gregorian format
+ * 
+ * Input examples:
+ *   "24/01/2026 14:30:00" → "2026-01-24"
+ *   "2026-01-24 14:30:00" → "2026-01-24"
+ *   "24/01/2569"          → "2026-01-24" (Buddhist year conversion)
+ * 
+ * @param {string} dateStr - Date string in any format
+ * @returns {string|null} "YYYY-MM-DD" or null if invalid
+ */
+function extractGregorianDate(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  
+  const trimmed = dateStr.trim();
+  
+  // Handle format: "24/01/2026 14:30:00" or "24/01/2026"
+  if (trimmed.includes('/')) {
+    const datePart = trimmed.split(' ')[0]; // "24/01/2026"
+    const parts = datePart.split('/');
+    
+    if (parts.length !== 3) return null;
+    
+    const [day, month, year] = parts;
+    const yearNum = parseInt(year);
+    
+    // Check if Buddhist year (> 2500)
+    if (yearNum > 2500) {
+      const gregorianYear = yearNum - 543;
+      return `${gregorianYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    }
+    
+    // Already Gregorian
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+  }
+  
+  // Handle format: "2026-01-24 14:30:00" or "2026-01-24"
+  if (trimmed.includes('-')) {
+    return trimmed.split(' ')[0]; // "2026-01-24"
+  }
+  
+  // Invalid format
+  return null;
+}
+
+/**
+ * Convert Thai Buddhist year date to Gregorian
+ * @param {string} thaiDateStr - "24/01/2569"
+ * @returns {string|null} "2026-01-24"
+ */
+function convertThaiDateToGregorian(thaiDateStr) {
+  const match = thaiDateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (!match) return null;
+  
+  const day = match[1];
+  const month = match[2];
+  const buddhistYear = parseInt(match[3]);
+  
+  // Check if it's already Gregorian (year < 2500)
+  if (buddhistYear < 2500) {
+    return `${buddhistYear}-${month}-${day}`;
+  }
+  
+  // Convert from Buddhist to Gregorian
+  const gregorianYear = buddhistYear - 543;
+  return `${gregorianYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
+/**
+ * ✅ FIX #3: Format Gregorian date for display
+ * @param {string} gregorianDate - "2026-01-24"
+ * @returns {string} "24/01/2026"
+ */
+function formatDateForDisplay(gregorianDate) {
+  if (!gregorianDate) return '';
+  
+  const parts = gregorianDate.split('-');
+  if (parts.length !== 3) return gregorianDate;
+  
+  const [year, month, day] = parts;
+  return `${day}/${month}/${year}`;
+}
+
+/**
+ * Check if two dates are the same day
+ * @param {string} dateStr1 - Any date format
+ * @param {string} dateStr2 - Any date format
+ * @returns {boolean}
+ */
+function isSameDay(dateStr1, dateStr2) {
+  const date1 = extractGregorianDate(dateStr1);
+  const date2 = extractGregorianDate(dateStr2);
+  
+  if (!date1 || !date2) return false;
+  
+  return date1 === date2;
+}
+
+/**
+ * ✅ FIX #3: Get date range for filtering
+ * @param {'today'|'yesterday'|'week'|'month'} period
+ * @returns {{startDate: string, endDate: string}} Gregorian dates "YYYY-MM-DD"
+ */
+function getDateRange(period) {
+  const now = new Date();
+  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
+  
+  const startDate = new Date(bangkokTime);
+  const endDate = new Date(bangkokTime);
+  
+  switch (period) {
+    case 'today':
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    
+    case 'yesterday':
+      startDate.setDate(startDate.getDate() - 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setDate(endDate.getDate() - 1);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    
+    case 'week':
+      startDate.setDate(startDate.getDate() - 7);
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    
+    case 'month':
+      startDate.setMonth(startDate.getMonth() - 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+    
+    default:
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+  }
+  
+  return {
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0]
+  };
+}
+
+/**
+ * ✅ FIX #3: Check if date is within range
+ * @param {string} dateStr - Any format
+ * @param {string} startDate - "YYYY-MM-DD"
+ * @param {string} endDate - "YYYY-MM-DD"
+ * @returns {boolean}
+ */
+function isDateInRange(dateStr, startDate, endDate) {
+  const date = extractGregorianDate(dateStr);
+  if (!date) return false;
+  
+  return date >= startDate && date <= endDate;
+}
+
+/**
+ * ✅ FIX #3: Parse any date to Date object
+ * @param {string} dateStr - Any format
+ * @returns {Date|null}
+ */
+function parseToDate(dateStr) {
+  const gregorian = extractGregorianDate(dateStr);
+  if (!gregorian) return null;
+  
+  const date = new Date(gregorian);
+  return isNaN(date.getTime()) ? null : date;
+}
+
+// ============================================================================
+// VALIDATION
+// ============================================================================
+
+const Validator = {
+  isValidOrderNumber: (orderNo) => {
+    return Number.isInteger(orderNo) && orderNo > 0 && orderNo < 1000000;
+  },
+  
+  isValidQuantity: (quantity) => {
+    return Number.isInteger(quantity) && quantity > 0 && quantity <= 10000;
+  },
+  
+  /**
+   * ✅ FIX #3: Validate date in any format
+   */
+  isValidDate: (dateStr) => {
+    const parsed = parseToDate(dateStr);
+    return parsed !== null;
+  },
+  
+  sanitizeText: (text) => {
+    if (!text) return '';
+    return String(text)
+      .trim()
+      .replace(/[<>]/g, '')
+      .substring(0, 500);
+  },
+  
+  sanitizeCustomerName: (name) => {
+    if (!name) return 'ไม่ระบุ';
+    return String(name)
+      .trim()
+      .replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, '')
+      .substring(0, 100);
+  },
+  
+  sanitizeNumber: (num, defaultValue = 0) => {
+    const parsed = parseFloat(num);
+    return isNaN(parsed) ? defaultValue : Math.max(0, parsed);
+  }
+};
+
+// ============================================================================
+// TEXT PROCESSING (unchanged)
 // ============================================================================
 
 function normalizeText(text) {
@@ -10,19 +262,7 @@ function normalizeText(text) {
     .replace(/[^\u0E00-\u0E7F0-9a-z]/g, '')
     .trim();
 }
-function normalizeToGregorian(dateStr) {
-  if (!dateStr) return null;
-  
-  // Handle "DD/MM/YYYY HH:MM:SS"
-  if (dateStr.includes('/')) {
-    const [datePart] = dateStr.split(' ');
-    const [day, month, year] = datePart.split('/');
-    return `${year}-${month}-${day}`;
-  }
-  
-  // Handle "YYYY-MM-DD"
-  return dateStr.split(' ')[0];
-}
+
 function extractDigits(str) {
   const match = String(str).match(/\d+/g);
   return match ? match.join('') : '';
@@ -85,130 +325,7 @@ function calculateAdvancedSimilarity(str1, str2) {
 }
 
 // ============================================================================
-// DATE & TIME - FIXED: Consistent Gregorian format
-// ============================================================================
-
-/**
- * Get current date in YYYY-MM-DD format (Gregorian)
- * Used for: Date comparisons, Dashboard, filtering
- */
-function getThaiDateString() {
-  const now = new Date();
-  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
-  return bangkokTime.toISOString().split('T')[0]; // Returns: "2026-01-07"
-}
-
-/**
- * Get current datetime in display format
- * Used for: Order timestamps, user-facing displays
- * Returns: "07/01/2026 14:30:00" (Thai format for readability)
- */
-function getThaiDateTimeString() {
-  const now = new Date();
-  const bangkokTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }));
-  
-  const day = String(bangkokTime.getDate()).padStart(2, '0');
-  const month = String(bangkokTime.getMonth() + 1).padStart(2, '0');
-  const year = bangkokTime.getFullYear();
-  const hours = String(bangkokTime.getHours()).padStart(2, '0');
-  const minutes = String(bangkokTime.getMinutes()).padStart(2, '0');
-  const seconds = String(bangkokTime.getSeconds()).padStart(2, '0');
-  
-  return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
-}
-
-/**
- * Extract Gregorian date from Thai datetime string
- * Converts: "07/01/2026 14:30:00" → "2026-01-07"
- * Used for: Date comparisons in reports
- */
-function extractGregorianDate(thaiDateTimeStr) {
-  if (!thaiDateTimeStr) return null;
-  
-  // Handle format: "07/01/2026 14:30:00"
-  if (thaiDateTimeStr.includes('/')) {
-    const datePart = thaiDateTimeStr.split(' ')[0]; // "07/01/2026"
-    const [day, month, year] = datePart.split('/');
-    return `${year}-${month}-${day}`; // "2026-01-07"
-  }
-  
-  // Handle format: "2026-01-07 14:30:00"
-  return thaiDateTimeStr.split(' ')[0];
-}
-
-/**
- * Convert Thai Buddhist year date to Gregorian
- * Converts: "07/01/2569" → "2026-01-07"
- */
-function convertThaiDateToGregorian(thaiDateStr) {
-  const match = thaiDateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (!match) return null;
-  
-  const day = match[1];
-  const month = match[2];
-  const buddhistYear = parseInt(match[3]);
-  
-  // Check if it's already Gregorian (year < 2500)
-  if (buddhistYear < 2500) {
-    return `${buddhistYear}-${month}-${day}`;
-  }
-  
-  // Convert from Buddhist to Gregorian
-  const gregorianYear = buddhistYear - 543;
-  return `${gregorianYear}-${month}-${day}`;
-}
-
-/**
- * Check if two dates are the same day
- */
-function isSameDay(dateStr1, dateStr2) {
-  const date1 = extractGregorianDate(dateStr1) || dateStr1;
-  const date2 = extractGregorianDate(dateStr2) || dateStr2;
-  return date1 === date2;
-}
-
-// ============================================================================
-// VALIDATION
-// ============================================================================
-
-const Validator = {
-  isValidOrderNumber: (orderNo) => {
-    return Number.isInteger(orderNo) && orderNo > 0 && orderNo < 1000000;
-  },
-  
-  isValidQuantity: (quantity) => {
-    return Number.isInteger(quantity) && quantity > 0 && quantity <= 10000;
-  },
-  
-  isValidDate: (dateStr) => {
-    const date = new Date(dateStr);
-    return date instanceof Date && !isNaN(date);
-  },
-  
-  sanitizeText: (text) => {
-    if (!text) return '';
-    return String(text)
-      .trim()
-      .replace(/[<>]/g, '')
-      .substring(0, 500);
-  },
-  
-  sanitizeCustomerName: (name) => {
-    if (!name) return 'ไม่ระบุ';
-    return String(name)
-      .trim()
-      .replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, '')
-      .substring(0, 100);
-  },
-  
-  sanitizeNumber: (num, defaultValue = 0) => {
-    const parsed = parseFloat(num);
-    return isNaN(parsed) ? defaultValue : Math.max(0, parsed);
-  }
-};
-
-// ============================================================================
-// RETRY LOGIC
+// RETRY LOGIC (unchanged)
 // ============================================================================
 
 async function retryWithBackoff(fn, maxRetries = 3, initialDelay = 1000) {
@@ -238,7 +355,7 @@ async function retryWithBackoff(fn, maxRetries = 3, initialDelay = 1000) {
 }
 
 // ============================================================================
-// SKU GENERATION
+// SKU GENERATION (unchanged)
 // ============================================================================
 
 function generateSKU(name, unit) {
@@ -248,19 +365,34 @@ function generateSKU(name, unit) {
   return `${n}-${u}-${rand}`;
 }
 
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
 module.exports = {
+  // Text processing
   normalizeText,
   extractDigits,
   levenshteinDistance,
   longestCommonSubstring,
   similarity,
   calculateAdvancedSimilarity,
+  
+  // ✅ FIX #3: Improved date handling
   getThaiDateString,
   getThaiDateTimeString,
   extractGregorianDate,
   convertThaiDateToGregorian,
+  formatDateForDisplay,
   isSameDay,
+  getDateRange,
+  isDateInRange,
+  parseToDate,
+  
+  // Validation
   Validator,
+  
+  // Utilities
   retryWithBackoff,
   generateSKU
 };

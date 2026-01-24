@@ -1,4 +1,5 @@
-// cacheManager.js - RAG-powered cache with customer matching
+// src/cacheManager.js - FIXED: Memory leak prevention
+
 const { CONFIG } = require('./config');
 const { Logger, PerformanceMonitor } = require('./logger');
 const { normalizeText, generateSKU } = require('./utils');
@@ -74,7 +75,7 @@ async function loadStockCache(forceReload = false) {
 
     lastStockLoadTime = now;
     
-    // Build RAG vector store
+    // ✅ FIX #2: Clear vector store before rebuild to prevent memory leak
     rebuildStockVectorStore();
 
     Logger.success(`✅ STOCK LOADED: ${stockCache.length} items`);
@@ -92,6 +93,11 @@ async function loadStockCache(forceReload = false) {
 }
 
 function rebuildStockVectorStore() {
+  // ✅ FIX #2: CLEAR BEFORE REBUILD - Prevents memory leak
+  Logger.info('🧹 Clearing old vector store data...');
+  stockVectorStore.clear();
+  
+  // Now rebuild with fresh data
   stockVectorStore.rebuild(
     stockCache,
     // Text extractor
@@ -191,7 +197,7 @@ async function loadCustomerCache(forceReload = false) {
 
     lastCustomerLoadTime = now;
 
-    // Build RAG vector store
+    // ✅ FIX #2: Clear vector store before rebuild
     rebuildCustomerVectorStore();
 
     Logger.success(`✅ CUSTOMERS LOADED: ${customerCache.length} customers`);
@@ -209,6 +215,10 @@ async function loadCustomerCache(forceReload = false) {
 }
 
 function rebuildCustomerVectorStore() {
+  // ✅ FIX #2: CLEAR BEFORE REBUILD - Prevents memory leak
+  Logger.info('🧹 Clearing old customer vector store data...');
+  customerVectorStore.clear();
+  
   customerVectorStore.rebuild(
     customerCache,
     // Text extractor
@@ -275,6 +285,26 @@ function getCustomerCache() {
 }
 
 // ============================================================================
+// MEMORY MONITORING (NEW)
+// ============================================================================
+
+function getCacheStats() {
+  return {
+    stock: {
+      items: stockCache.length,
+      vectorSize: stockVectorStore.size(),
+      lastLoaded: new Date(lastStockLoadTime).toISOString()
+    },
+    customer: {
+      items: customerCache.length,
+      vectorSize: customerVectorStore.size(),
+      lastLoaded: new Date(lastCustomerLoadTime).toISOString()
+    },
+    memory: process.memoryUsage()
+  };
+}
+
+// ============================================================================
 // EXPORTS
 // ============================================================================
 
@@ -282,5 +312,6 @@ module.exports = {
   loadStockCache,
   loadCustomerCache,
   getStockCache,
-  getCustomerCache
+  getCustomerCache,
+  getCacheStats // NEW: For monitoring
 };
