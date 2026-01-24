@@ -408,22 +408,19 @@ async function parseOrder(userInput) {
   const stockCache = getStockCache();
   const customerCache = getCustomerCache();
   
+  // ✅ FIX: Declare ALL variables at the top
+  const preProcessed = splitMultipleIntents(userInput);
   const paymentDetection = detectPaymentStatus(userInput);
-
+  const priceHints = extractPriceHints(userInput);
+  
   Logger.info(`🎯 Pre-processed intent: ${JSON.stringify(preProcessed)}`);
   Logger.info(`💰 Payment detection: ${paymentDetection.status} (${paymentDetection.confidence})`);
-  
-  // 1. Pre-process: แยกคำสั่งหลายแบบ
-  const preProcessed = splitMultipleIntents(userInput);
-  
-  // 2. Extract price hints
-  const priceHints = extractPriceHints(userInput);
   Logger.info(`💡 Price hints found: ${JSON.stringify(priceHints)}`);
   
-  // 3. Build smart catalog
+  // Build smart catalog
   const smartCatalog = buildSmartStockList(stockCache, priceHints);
 
-  // 4. Create AI prompt with multi-intent awareness
+  // Create AI prompt with multi-intent awareness
   const prompt = `คุณคือ AI ที่วิเคราะห์คำสั่งซื้อสินค้า
 
 📦 คลังสินค้า (รายการที่มี ⭐ = แนะนำ):
