@@ -325,51 +325,64 @@ function extractPriceHints(text) {
 function buildSmartStockList(stockCache, priceHints) {
   let stockList = '';
   
-  // สร้าง priority score สำหรับแต่ละสินค้า
+  // Score each item
   const scoredItems = stockCache.map((item, idx) => {
     let score = 0;
+    const itemLower = item.item.toLowerCase();
+    const itemKeywords = extractProductKeywords(item.item);
     
-    // ตรวจสอบว่าตรงกับ hint ไหม
+    // Check against hints
     for (const hint of priceHints) {
-      const itemLower = item.item.toLowerCase();
+      // Keyword overlap scoring
+      const keywordOverlap = hint.productKeywords?.filter(k => 
+        itemKeywords.includes(k) || itemLower.includes(k)
+      ).length || 0;
       
-      // ชื่อตรงบางส่วน
-      if (itemLower.includes(hint.keyword) || hint.keyword.includes(itemLower.substring(0, 3))) {
-        score += 10;
+      if (keywordOverlap > 0) {
+        score += keywordOverlap * 15;
         
-        // ราคาตรง = โบนัสเยอะ
-        if (item.price === hint.price) {
-          score += 50;
-        }
-        // ราคาใกล้เคียง ±10%
-        else if (Math.abs(item.price - hint.price) <= hint.price * 0.1) {
+        // Exact name match
+        if (itemLower.includes(hint.keyword) || hint.keyword.includes(itemLower.substring(0, 5))) {
           score += 20;
+        }
+        
+        // Price match bonus
+        if (item.price === hint.price) {
+          score += 100;
+        } else if (Math.abs(item.price - hint.price) <= hint.price * 0.15) {
+          score += 40;
+        }
+        
+        // Quantity hint bonus
+        if (hint.quantity && item.stock >= hint.quantity) {
+          score += 10;
         }
       }
     }
     
-    // โบนัสสินค้ายอดนิยม (stock > 50)
-    if (item.stock > 50) score += 2;
+    // Stock availability bonus
+    if (item.stock > 50) score += 3;
+    if (item.stock > 100) score += 2;
     
     return { item, idx, score };
   });
   
-  // เรียงตาม score
+  // Sort by score
   scoredItems.sort((a, b) => b.score - a.score);
   
-  // แสดงผล: Priority items ก่อน
-  const priorityItems = scoredItems.filter(s => s.score > 15);
+  // Build catalog with priority section
+  const priorityItems = scoredItems.filter(s => s.score >= 20);
   
   if (priorityItems.length > 0) {
-    stockList += '🎯 [PRIORITY MATCHES - สินค้าที่ตรงกับคำสั่ง]:\n';
-    priorityItems.forEach(({ item, idx }) => {
-      stockList += `ID:${idx} | ⭐ ${item.item} | ${item.price}฿ | ${item.stock} ${item.unit}\n`;
+    stockList += '🎯 [PRIORITY MATCHES]:\n';
+    priorityItems.slice(0, 10).forEach(({ item, idx, score }) => {
+      stockList += `ID:${idx} | ⭐${score} | ${item.item} | ${item.price}฿ | ${item.stock} ${item.unit}\n`;
     });
-    stockList += '\n[OTHER ITEMS]:\n';
+    stockList += '\n[ALL ITEMS]:\n';
   }
   
-  // แสดงสินค้าทั้งหมด (เรียงตาม score)
-  scoredItems.forEach(({ item, idx }) => {
+  // Show all items (limited to top 100 for context window)
+  scoredItems.slice(0, 100).forEach(({ item, idx }) => {
     stockList += `ID:${idx} | ${item.item} | ${item.price}฿ | ${item.stock} ${item.unit}\n`;
   });
   
