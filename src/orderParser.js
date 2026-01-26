@@ -1,25 +1,396 @@
-// src/orderParser.js - FIXED: Add missing extractProductKeywords function
+// src/orderParser.js - IMPROVED: Keyword-based structure for voice input
 const { Logger } = require('./logger');
 const { generateWithGroq } = require('./aiServices');
 const { getStockCache, getCustomerCache } = require('./cacheManager');
 const { normalizeText } = require('./utils');
 
 // ============================================================================
-// MISSING FUNCTION - Add this at the top after imports
+// KEYWORD-BASED PARSER - Voice-Optimized Structure
 // ============================================================================
 
 /**
- * Extract product keywords for matching
- * Similar to extractStockKeywords in stockAdjustment.js
+ * Parse with explicit keywords for better voice recognition:
+ * Format: "[ลูกค้า] ชื่อ [สั่ง] สินค้า [ราคา] XX [จำนวน] YY [ส่งโดย] ผู้ส่ง [จ่ายแล้ว]"
+ * 
+ * Examples:
+ * - "ลูกค้า คุณสมชาย สั่ง น้ำแข็งหลอด ราคา 60 จำนวน 2"
+ * - "ลูกค้า ร้านอาหาร สั่ง โค้ก 30 จำนวน 5 ส่งโดย พี่แดง"
+ * - "ลูกค้า คุณนิด สั่ง เบียร์สิงห์ 50 จำนวน 10 จ่ายแล้ว"
  */
+function parseWithKeywords(text) {
+  const lower = text.toLowerCase();
+  const result = {
+    customer: null,
+    items: [],
+    deliveryPerson: null,
+    isPaid: false,
+    confidence: 'low',
+    method: 'keyword'
+  };
+
+  // ========================================================================
+  // 1. EXTRACT CUSTOMER - Keywords: "ลูกค้า", "customer"
+  // ========================================================================
+  
+  const customerPatterns = [
+    /ลูกค้า\s+([^สั่ง]+?)(?=\s*สั่ง|\s*$)/i,
+    /customer\s+([^order]+?)(?=\s*order|\s*สั่ง|\s*$)/i,
+    /^([ก-๙]+)\s+สั่ง/i // Fallback: "ชื่อ สั่ง..."
+  ];
+
+  for (const pattern of customerPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      result.customer = match[1].trim();
+      Logger.info(`✅ Customer found: "${result.customer}"`);
+      break;
+    }
+  }
+
+  // ========================================================================
+  // 2. EXTRACT ITEMS - Keywords: "สั่ง", "order", "เอา"
+  // ========================================================================
+  
+  // Find the section between "สั่ง" and optional keywords like "ส่งโดย", "จ่าย"
+  const orderSection = extractOrderSection(text);
+  
+  if (orderSection) {
+    Logger.info(`📦 Order section: "${orderSection}"`);
+    result.items = parseItemsFromSection(orderSection);
+  }
+
+  // ========================================================================
+  // 3. EXTRACT DELIVERY - Keywords: "ส่งโดย", "ส่ง", "delivery"
+  // ========================================================================
+  
+  const deliveryPatterns = [
+    /ส่งโดย\s+([^\s,]+)/i,
+    /ส่ง\s+([^\s,]+)/i,
+    /delivery\s+([^\s,]+)/i
+  ];
+
+  for (const pattern of deliveryPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      result.deliveryPerson = match[1].trim();
+      Logger.info(`🚚 Delivery: "${result.deliveryPerson}"`);
+      break;
+    }
+  }
+
+  // ========================================================================
+  // 4. EXTRACT PAYMENT - Keywords: "จ่ายแล้ว", "ชำระแล้ว", "paid"
+  // ========================================================================
+  
+  if (/จ่ายแล้ว|ชำระแล้ว|paid|เงินสด/i.test(text)) {
+    result.isPaid = true;
+    Logger.info(`💰 Payment: PAID`);
+  }
+
+  // Calculate confidence
+  result.confidence = calculateKeywordConfidence(result);
+
+  return result;
+}
+
+// ============================================================================
+// HELPER: Extract order section between keywords
+// ============================================================================
+
+function extractOrderSection(text) {
+  // Pattern: Everything between "สั่ง" and ("ส่งโดย" OR "จ่าย" OR end)
+  const patterns = [
+    /สั่ง\s+(.+?)(?=\s*ส่งโดย|\s*ส่ง\s+[ก-๙]|\s*จ่าย|\s*$)/i,
+    /order\s+(.+?)(?=\s*delivery|\s*paid|\s*$)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return match[1].trim();
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// HELPER: Parse items from order section
+// ============================================================================
+
+function parseItemsFromSection(section) {
+  const items = [];
+  
+  // Split by common delimiters: comma, "และ", "กับ"
+  const parts = section.split(/,|และ|กับ|\n/);
+  
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    const item = parseIndividualItem(trimmed);
+    if (item) {
+      items.push(item);
+    }
+  }
+
+  return items;
+}
+
+// ============================================================================
+// HELPER: Parse individual item
+// Format: "สินค้า [ราคา] XX [จำนวน] YY" or "สินค้า XX YY"
+// ============================================================================
+
+function parseIndividualItem(text) {
+  Logger.info(`🔍 Parsing item: "${text}"`);
+  
+  // Pattern 1: "สินค้า ราคา 60 จำนวน 2"
+  let match = text.match(/(.+?)\s+ราคา\s+(\d+)\s+จำนวน\s+(\d+)/i);
+  if (match) {
+    return {
+      productName: match[1].trim(),
+      price: parseInt(match[2]),
+      quantity: parseInt(match[3]),
+      pattern: 'explicit_keywords'
+    };
+  }
+
+  // Pattern 2: "สินค้า 60 2" (price quantity)
+  match = text.match(/(.+?)\s+(\d+)\s+(\d+)/);
+  if (match) {
+    const num1 = parseInt(match[2]);
+    const num2 = parseInt(match[3]);
+    
+    // Logic: larger number is usually price
+    if (num1 > num2 && num1 > 10) {
+      return {
+        productName: match[1].trim(),
+        price: num1,
+        quantity: num2,
+        pattern: 'price_first'
+      };
+    } else if (num2 > num1 && num2 > 10) {
+      return {
+        productName: match[1].trim(),
+        price: num2,
+        quantity: num1,
+        pattern: 'quantity_first'
+      };
+    }
+  }
+
+  // Pattern 3: "สินค้า จำนวน 5" (no price)
+  match = text.match(/(.+?)\s+จำนวน\s+(\d+)/i);
+  if (match) {
+    return {
+      productName: match[1].trim(),
+      price: null,
+      quantity: parseInt(match[2]),
+      pattern: 'quantity_only'
+    };
+  }
+
+  // Pattern 4: Just "สินค้า" (no numbers)
+  if (!/\d/.test(text)) {
+    return {
+      productName: text.trim(),
+      price: null,
+      quantity: 1,
+      pattern: 'name_only'
+    };
+  }
+
+  Logger.warn(`⚠️ Could not parse item: "${text}"`);
+  return null;
+}
+
+// ============================================================================
+// HELPER: Calculate confidence based on keyword matches
+// ============================================================================
+
+function calculateKeywordConfidence(result) {
+  let score = 0;
+
+  if (result.customer && result.customer !== 'ไม่ระบุ') score += 25;
+  if (result.items.length > 0) score += 30;
+  if (result.items.every(i => i.price !== null)) score += 25;
+  if (result.items.every(i => i.quantity > 0)) score += 10;
+  if (result.deliveryPerson) score += 5;
+  if (result.isPaid !== undefined) score += 5;
+
+  if (score >= 80) return 'high';
+  if (score >= 50) return 'medium';
+  return 'low';
+}
+
+// ============================================================================
+// STOCK MATCHING - Improved fuzzy search
+// ============================================================================
+
+function fuzzyMatchStockItem(productName, price, stockCache) {
+  const normalized = normalizeText(productName);
+  const candidates = [];
+
+  // Score each stock item
+  for (let i = 0; i < stockCache.length; i++) {
+    const stock = stockCache[i];
+    const stockNorm = normalizeText(stock.item);
+    let score = 0;
+
+    // Name similarity
+    if (stockNorm.includes(normalized)) score += 50;
+    if (normalized.includes(stockNorm)) score += 40;
+    
+    // Token overlap
+    const productTokens = productName.split(/\s+/).map(t => normalizeText(t));
+    const stockTokens = stock.item.split(/\s+/).map(t => normalizeText(t));
+    const overlap = productTokens.filter(t => stockTokens.includes(t)).length;
+    score += overlap * 15;
+
+    // Price match
+    if (price !== null) {
+      if (stock.price === price) {
+        score += 100; // Exact price match is huge bonus
+      } else if (Math.abs(stock.price - price) <= price * 0.1) {
+        score += 50; // Within 10%
+      }
+    }
+
+    // Stock availability
+    if (stock.stock > 0) score += 5;
+
+    if (score > 0) {
+      candidates.push({ stock, score, index: i });
+    }
+  }
+
+  // Sort by score
+  candidates.sort((a, b) => b.score - a.score);
+
+  if (candidates.length === 0) {
+    Logger.warn(`❌ No match found for: "${productName}"`);
+    return null;
+  }
+
+  // Check if top match is clear winner
+  if (candidates.length >= 2) {
+    const scoreDiff = candidates[0].score - candidates[1].score;
+    if (scoreDiff < 30) {
+      Logger.warn(`⚠️ Ambiguous match for "${productName}": ${candidates[0].stock.item} vs ${candidates[1].stock.item}`);
+      return {
+        ambiguous: true,
+        matches: candidates.slice(0, 5).map(c => c.stock)
+      };
+    }
+  }
+
+  Logger.success(`✅ Matched "${productName}" → ${candidates[0].stock.item} (score: ${candidates[0].score})`);
+  
+  return {
+    ambiguous: false,
+    stock: candidates[0].stock,
+    index: candidates[0].index,
+    score: candidates[0].score
+  };
+}
+
+// ============================================================================
+// MAIN PARSE ORDER - Hybrid approach
+// ============================================================================
+
+async function parseOrder(userInput) {
+  const stockCache = getStockCache();
+  const customerCache = getCustomerCache();
+
+  Logger.info(`🎯 Parsing: "${userInput}"`);
+
+  // Step 1: Try keyword-based parsing first
+  const keywordResult = parseWithKeywords(userInput);
+
+  // Step 2: Map items to stock
+  const mappedItems = [];
+  const ambiguousItems = [];
+
+  for (const item of keywordResult.items) {
+    const matchResult = fuzzyMatchStockItem(
+      item.productName,
+      item.price,
+      stockCache
+    );
+
+    if (!matchResult) {
+      // No match found
+      continue;
+    }
+
+    if (matchResult.ambiguous) {
+      ambiguousItems.push({
+        keyword: item.productName,
+        quantity: item.quantity,
+        possibleMatches: matchResult.matches
+      });
+    } else {
+      mappedItems.push({
+        stockItem: matchResult.stock,
+        quantity: item.quantity,
+        matchConfidence: matchResult.score >= 100 ? 'exact' : 
+                        matchResult.score >= 50 ? 'high' : 'medium'
+      });
+    }
+  }
+
+  // Step 3: Handle disambiguation
+  if (ambiguousItems.length > 0) {
+    return [{
+      intent: 'disambiguation',
+      customer: keywordResult.customer || 'ไม่ระบุ',
+      ambiguousItems: ambiguousItems,
+      confidence: 'low'
+    }];
+  }
+
+  // Step 4: Check if we have valid items
+  if (mappedItems.length === 0) {
+    Logger.warn('⚠️ No items matched');
+    return [{
+      success: false,
+      error: 'ไม่พบสินค้าที่ต้องการสั่ง',
+      suggestion: 'ลองพิมพ์: "ลูกค้า [ชื่อ] สั่ง [สินค้า] ราคา [XX] จำนวน [YY]"'
+    }];
+  }
+
+  // Step 5: Build result
+  const result = {
+    intent: 'order',
+    customer: keywordResult.customer || 'ไม่ระบุ',
+    items: mappedItems,
+    isPaid: keywordResult.isPaid,
+    deliveryPerson: keywordResult.deliveryPerson || '',
+    confidence: keywordResult.confidence,
+    rawInput: userInput,
+    method: 'keyword_based'
+  };
+
+  Logger.success(`✅ Parsed order:
+  Customer: ${result.customer}
+  Items: ${result.items.length}
+  Payment: ${result.isPaid ? 'PAID' : 'UNPAID'}
+  Delivery: ${result.deliveryPerson || 'None'}`);
+
+  return [result];
+}
+
+// ============================================================================
+// FALLBACK: Simple extraction for testing
+// ============================================================================
+
 function extractProductKeywords(productName) {
   const keywords = new Set();
   const normalized = normalizeText(productName);
   
-  // Add full normalized text
   keywords.add(normalized);
   
-  // Tokenize by space
   const tokens = productName.split(/\s+/);
   tokens.forEach(token => {
     const norm = normalizeText(token);
@@ -28,22 +399,14 @@ function extractProductKeywords(productName) {
     }
   });
   
-  // Common product variations (Thai products)
   const variations = {
-    'น้ำแข็ง': ['นําเเข็ง', 'น้ำเเข็ง', 'ice', 'แข็ง', 'นํา'],
-    'หลอด': ['tube', 'ท่อ'],
-    'แผ่น': ['sheet', 'เเผ่น'],
-    'บด': ['crushed', 'บด'],
-    'ถุง': ['bag', 'ถุง', 'กระสอบ'],
-    'โค้ก': ['coke', 'โค', 'coca', 'โคก'],
-    'เป็ปซี่': ['pepsi', 'เป๊ปซี่', 'เปปซี่'],
-    'น้ำดื่ม': ['water', 'น้ำ', 'drinking', 'นํา'],
-    'ลัง': ['box', 'case', 'รัง', 'ลัง', 'crate'],
-    'แพ็ค': ['pack', 'แพค', 'แพ็ค', 'โหล'],
-    'สิงห์': ['singha', 'singh', 'singห์'],
-    'ช้าง': ['chang', 'elephant'],
-    'ลีโอ': ['leo'],
-    'เบียร์': ['beer', 'เบีย']
+    'น้ำแข็ง': ['ice', 'แข็ง'],
+    'หลอด': ['tube'],
+    'โค้ก': ['coke', 'coca'],
+    'เป๊ปซี่': ['pepsi'],
+    'สิงห์': ['singha'],
+    'ช้าง': ['chang'],
+    'ลีโอ': ['leo']
   };
   
   for (const [key, vars] of Object.entries(variations)) {
@@ -56,586 +419,14 @@ function extractProductKeywords(productName) {
 }
 
 // ============================================================================
-// PRE-PROCESS: แยกคำสั่งหลายแบบออกจากกัน
-// ============================================================================
-
-function splitMultipleIntents(text) {
-  const lower = text.toLowerCase();
-  
-  // ✅ FIX: Define paidKeywords at the top
-  const paidKeywords = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว|เงิน)|โอน(?:แล้ว|เงิน)|เงินสด/i;
-  
-  // ============================================================================
-  // INTENT DETECTION FLAGS
-  // ============================================================================
-  
-  const intents = {
-    hasOrder: false,
-    hasPayment: false,
-    hasDelivery: false,
-    hasCredit: false
-  };
-  
-  // Order keywords
-  if (/สั่ง|ซื้อ|เอา|ขอ|จอง/.test(lower)) {
-    intents.hasOrder = true;
-  }
-  
-  // Payment keywords
-  const hasExplicitPaid = /จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว)|โอนแล้ว/i.test(text);
-  const hasExplicitUnpaid = /เครดิต|ค้าง|ยังไม่จ่าย/i.test(text);
-
-  if (hasExplicitPaid) {
-    intents.paymentStatus = 'paid';
-  } else if (hasExplicitUnpaid) {
-    intents.paymentStatus = 'unpaid';
-  } else {
-    intents.paymentStatus = null;
-  }
-  
-  // Delivery keywords
-  if (/ส่ง|จัดส่ง|delivery|ผู้ส่ง/.test(lower)) {
-    intents.hasDelivery = true;
-  }
-  
-  // ============================================================================
-  // ✅ FIX: BETTER PATTERNS - Voice-Optimized
-  // ============================================================================
-  
-  const patterns = [
-    // Pattern 1: "ส่งโดย X" or "โดย X ส่ง" - Extract delivery person FIRST
-    {
-      regex: /ส่ง(?:โดย|ให้)\s+(\S+)|(?:โดย|ให้)\s+(\S+)\s*ส่ง/i,
-      extract: (match, fullText) => {
-        const deliveryPerson = (match[1] || match[2] || '').trim();
-        
-        // Remove delivery part to get clean items
-        const cleanText = fullText
-          .replace(/ส่ง(?:โดย|ให้)\s+\S+/gi, '')
-          .replace(/(?:โดย|ให้)\s+\S+\s*ส่ง/gi, '')
-          .trim();
-        
-        // Now extract customer and items
-        const orderMatch = cleanText.match(/((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+)/i);
-        
-        if (orderMatch) {
-          return {
-            customer: orderMatch[1].trim(),
-            itemsPart: orderMatch[2].trim(),
-            deliveryPerson: deliveryPerson,
-            hasPaid: paidKeywords.test(fullText),
-            hasDelivery: true,
-            confidence: 'high',
-            pattern: 'delivery_extracted'
-          };
-        }
-        
-        // No clear customer - use first word before "สั่ง"
-        const fallbackMatch = cleanText.match(/(\S+)\s*(?:สั่ง|เอา)\s+(.+)/i);
-        if (fallbackMatch) {
-          return {
-            customer: fallbackMatch[1].trim(),
-            itemsPart: fallbackMatch[2].trim(),
-            deliveryPerson: deliveryPerson,
-            hasPaid: paidKeywords.test(fullText),
-            hasDelivery: true,
-            confidence: 'medium',
-            pattern: 'delivery_extracted_fallback'
-          };
-        }
-        
-        return null;
-      }
-    },
-    
-    // Pattern 2: "[Customer] สั่ง [items] จ่ายแล้ว ส่ง[person]"
-    {
-      regex: /((?:คุณ|พี่|น้อง|เจ๊|ร้าน)\s*\S+)\s*(?:สั่ง|เอา)\s+(.+)/i,
-      extract: (match, fullText) => {
-        const customer = match[1].trim();
-        let itemsPart = match[2].trim();
-        
-        // Extract delivery person from items part
-        let deliveryPerson = '';
-        const deliveryMatch = itemsPart.match(/ส่ง(?:โดย|ให้)?\s*(\S+)|(?:โดย|ให้)\s*(\S+)\s*ส่ง/i);
-        
-        if (deliveryMatch) {
-          deliveryPerson = (deliveryMatch[1] || deliveryMatch[2] || '').trim();
-          // Remove delivery info from items
-          itemsPart = itemsPart
-            .replace(/ส่ง(?:โดย|ให้)?\s*\S+/gi, '')
-            .replace(/(?:โดย|ให้)\s*\S+\s*ส่ง/gi, '')
-            .trim();
-        }
-        
-        return {
-          customer,
-          itemsPart,
-          deliveryPerson,
-          hasPaid: paidKeywords.test(fullText),
-          hasDelivery: deliveryPerson !== '',
-          confidence: 'high',
-          pattern: 'customer_first'
-        };
-      }
-    },
-    
-    // Pattern 3: Simple "[word] สั่ง [items]" - Could be customer OR product
-    {
-      regex: /(\S+)\s*(?:สั่ง|เอา)\s+(.+)/i,
-      extract: (match, fullText) => {
-        const firstWord = match[1].trim();
-        let itemsPart = match[2].trim();
-        
-        // Extract delivery
-        let deliveryPerson = '';
-        const deliveryMatch = itemsPart.match(/ส่ง(?:โดย|ให้)?\s*(\S+)|(?:โดย|ให้)\s*(\S+)\s*ส่ง/i);
-        
-        if (deliveryMatch) {
-          deliveryPerson = (deliveryMatch[1] || deliveryMatch[2] || '').trim();
-          itemsPart = itemsPart
-            .replace(/ส่ง(?:โดย|ให้)?\s*\S+/gi, '')
-            .replace(/(?:โดย|ให้)\s*\S+\s*ส่ง/gi, '')
-            .trim();
-        }
-        
-        // ✅ FIX: Check if firstWord is likely a product name
-        const productKeywords = ['น้ำแข็ง', 'โค้ก', 'เป๊ปซี่', 'สิงห์', 'ช้าง', 'น้ำ', 'เบียร์'];
-        const isLikelyProduct = productKeywords.some(kw => firstWord.includes(kw));
-        
-        if (isLikelyProduct) {
-          // "กาแฟ สั่ง น้ำแข็ง" → กาแฟ is PRODUCT, not customer
-          // Put it back into items
-          return {
-            customer: 'ไม่ระบุ',
-            itemsPart: `${firstWord} ${itemsPart}`.trim(),
-            deliveryPerson,
-            hasPaid: paidKeywords.test(fullText),
-            hasDelivery: deliveryPerson !== '',
-            confidence: 'low',
-            pattern: 'product_first_detected'
-          };
-        }
-        
-        return {
-          customer: firstWord,
-          itemsPart,
-          deliveryPerson,
-          hasPaid: paidKeywords.test(fullText),
-          hasDelivery: deliveryPerson !== '',
-          confidence: 'medium',
-          pattern: 'simple_order'
-        };
-      }
-    }
-  ];
-  
-  // ============================================================================
-  // TRY PATTERNS IN ORDER
-  // ============================================================================
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern.regex);
-    if (match) {
-      const extracted = pattern.extract(match, text);
-      
-      // Validate extraction
-      if (extracted && extracted.itemsPart) {
-        Logger.info(`🎯 Pattern matched: ${extracted.pattern}`);
-        Logger.info(`   Customer: ${extracted.customer}`);
-        Logger.info(`   Items: ${extracted.itemsPart}`);
-        Logger.info(`   Payment: ${extracted.hasPaid ? 'PAID' : 'UNPAID'}`);
-        Logger.info(`   Delivery: ${extracted.deliveryPerson || 'None'}`);
-        
-        return {
-          ...extracted,
-          type: 'order',
-          intents: {
-            ...intents,
-            hasOrder: true,
-            hasPayment: extracted.hasPaid !== undefined,
-            hasDelivery: extracted.hasDelivery
-          }
-        };
-      }
-    }
-  }
-  
-  return null;
-}
-
-// ============================================================================
-// PAYMENT STATUS DETECTOR (More Robust)
-// ============================================================================
-
-function detectPaymentStatus(text) {
-  const lower = text.toLowerCase();
-  
-  // Explicit unpaid
-  if (/เครดิต|ค้าง(?:ชำระ)?|ยังไม่จ่าย|เอาไว้ก่อน/.test(lower)) {
-    return { status: 'unpaid', confidence: 'high' };
-  }
-  
-  // Explicit paid
-  if (/จ่าย(?:แล้ว|เงิน)|ชำระ(?:แล้ว|เงิน)|เงินสด|โอน(?:แล้ว|เงิน)/.test(lower)) {
-    return { status: 'paid', confidence: 'high' };
-  }
-  
-  // Ambiguous - check position
-  if (/จ่าย|ชำระ/.test(lower)) {
-    // If "จ่าย" is near end of sentence → likely paid
-    const paymentIndex = text.search(/จ่าย|ชำระ/);
-    const nearEnd = paymentIndex > text.length * 0.6;
-    
-    return { 
-      status: nearEnd ? 'paid' : 'unpaid', 
-      confidence: 'medium' 
-    };
-  }
-  
-  return { status: null, confidence: 'none' };
-}
-
-// ============================================================================
-// DELIVERY PERSON EXTRACTOR
-// ============================================================================
-
-function extractDeliveryPerson(text) {
-  const patterns = [
-    /ส่ง\s*(พี่|คุณ|น้อง)?\s*(\S+)/i,
-    /จัดส่ง\s*(พี่|คุณ|น้อง)?\s*(\S+)/i,
-    /(?:ให้|ใช้)\s*(พี่|คุณ|น้อง)?\s*(\S+)\s*ส่ง/i
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) {
-      return {
-        name: match[0].replace(/ส่ง|จัดส่ง/g, '').trim(),
-        confidence: 'high'
-      };
-    }
-  }
-  
-  return { name: null, confidence: 'none' };
-}
-
-// ============================================================================
-// ENHANCED: ดึง Price Hints ที่แม่นยำขึ้น
-// ============================================================================
-
-function extractPriceHints(text) {
-  const hints = [];
-  
-  // Pattern 1: "ราคา X บาท" หรือ "X บาท"
-  const explicitMatches = text.matchAll(/([ก-๙a-z0-9\.\-\(\)]+)\s+(?:ราคา\s+)?(\d+)\s*(?:บาท|฿)/gi);
-  for (const match of explicitMatches) {
-    const productName = match[1].toLowerCase();
-    hints.push({ 
-      keyword: productName, 
-      price: parseInt(match[2]),
-      confidence: 'high',
-      productKeywords: extractProductKeywords(productName)
-    });
-  }
-
-  // Pattern 2: "[ชื่อสินค้า] [ราคา] [จำนวน]" - ต้องมีเลข 2 ตัว
-  const tripleMatches = text.matchAll(/([ก-๙a-z0-9\s\.\-\(\)]+?)\s+(\d+)\s+(\d+)/gi);
-  for (const match of tripleMatches) {
-    const productName = match[1].trim();
-    const num1 = parseInt(match[2]);
-    const num2 = parseInt(match[3]);
-    
-    // Logic: ถ้า num1 > 10 แล้ว num2 <= 100 → num1 คือราคา
-    if (num1 > 10 && num2 <= 100) {
-      hints.push({ 
-        keyword: productName.toLowerCase(), 
-        price: num1,
-        quantity: num2,
-        confidence: 'medium',
-        productKeywords: extractProductKeywords(productName)
-      });
-    }
-    // ถ้า num2 > num1 มากๆ → num2 น่าจะเป็นราคา
-    else if (num2 > num1 * 3) {
-      hints.push({ 
-        keyword: productName.toLowerCase(), 
-        price: num2,
-        quantity: num1,
-        confidence: 'low',
-        productKeywords: extractProductKeywords(productName)
-      });
-    }
-  }
-
-  return hints;
-}
-
-// ============================================================================
-// IMPROVED: สร้างแค็ตตาล็อกแบบ Weighted
-// ============================================================================
-
-function buildSmartStockList(stockCache, priceHints) {
-  let stockList = '';
-  
-  // Score each item
-  const scoredItems = stockCache.map((item, idx) => {
-    let score = 0;
-    const itemLower = item.item.toLowerCase();
-    const itemKeywords = extractProductKeywords(item.item);
-    
-    // Check against hints
-    for (const hint of priceHints) {
-      // Keyword overlap scoring
-      const keywordOverlap = hint.productKeywords?.filter(k => 
-        itemKeywords.includes(k) || itemLower.includes(k)
-      ).length || 0;
-      
-      if (keywordOverlap > 0) {
-        score += keywordOverlap * 15;
-        
-        // Exact name match
-        if (itemLower.includes(hint.keyword) || hint.keyword.includes(itemLower.substring(0, 5))) {
-          score += 20;
-        }
-        
-        // Price match bonus
-        if (item.price === hint.price) {
-          score += 100;
-        } else if (Math.abs(item.price - hint.price) <= hint.price * 0.15) {
-          score += 40;
-        }
-        
-        // Quantity hint bonus
-        if (hint.quantity && item.stock >= hint.quantity) {
-          score += 10;
-        }
-      }
-    }
-    
-    // Stock availability bonus
-    if (item.stock > 50) score += 3;
-    if (item.stock > 100) score += 2;
-    
-    return { item, idx, score };
-  });
-  
-  // Sort by score
-  scoredItems.sort((a, b) => b.score - a.score);
-  
-  // Build catalog with priority section
-  const priorityItems = scoredItems.filter(s => s.score >= 20);
-  
-  if (priorityItems.length > 0) {
-    stockList += '🎯 [PRIORITY MATCHES]:\n';
-    priorityItems.slice(0, 10).forEach(({ item, idx, score }) => {
-      stockList += `ID:${idx} | ⭐${score} | ${item.item} | ${item.price}฿ | ${item.stock} ${item.unit}\n`;
-    });
-    stockList += '\n[ALL ITEMS]:\n';
-  }
-  
-  // Show all items (limited to top 100 for context window)
-  scoredItems.slice(0, 100).forEach(({ item, idx }) => {
-    stockList += `ID:${idx} | ${item.item} | ${item.price}฿ | ${item.stock} ${item.unit}\n`;
-  });
-  
-  return stockList;
-}
-
-// ============================================================================
-// ENHANCED: Boost Confidence with better logic
-// ============================================================================
-
-function boostConfidence(aiResult, mappedItems, userInput, customerCache, preProcessed) {
-  let confidence = aiResult.confidence || 'low';
-  const boostReasons = [];
-
-  // 1. Exact Price Match
-  const allExactMatch = mappedItems.every(item => item.matchConfidence === 'exact');
-  if (allExactMatch && mappedItems.length > 0) {
-    boostReasons.push('exact_price_match');
-  }
-
-  // 2. Customer Mentioned & Exists
-  if (aiResult.customer && aiResult.customer !== 'ไม่ระบุ') {
-    boostReasons.push('customer_mentioned');
-    
-    const customerExists = customerCache.some(c => 
-      c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
-    );
-    if (customerExists) {
-      boostReasons.push('known_customer');
-    }
-  }
-
-  // 3. Stock Available
-  const allInStock = mappedItems.every(item => item.stockItem.stock >= item.quantity);
-  if (allInStock) {
-    boostReasons.push('stock_available');
-  }
-
-  // 4. Clear Pattern (มีตัวเลขชัดเจน)
-  if (/\d+\s+\d+/.test(userInput)) {
-    boostReasons.push('clear_quantity_pattern');
-  }
-  
-  // 5. Pre-processed มี payment/delivery info
-  if (preProcessed?.hasPaid) {
-    boostReasons.push('payment_confirmed');
-  }
-
-  // Boosting Logic
-  if (confidence === 'medium' && boostReasons.length >= 3) {
-    Logger.info(`🚀 Confidence: medium → high (${boostReasons.join(', ')})`);
-    return 'high';
-  }
-
-  if (confidence === 'low' && boostReasons.length >= 4) {
-    Logger.info(`🚀 Confidence: low → medium (${boostReasons.join(', ')})`);
-    return 'medium';
-  }
-
-  return confidence;
-}
-
-// ============================================================================
-// HELPER: Calculate Match Confidence
-// ============================================================================
-
-function calculateMatchConfidence(stockItem, priceHint) {
-  if (!priceHint) return 'partial';
-  
-  if (stockItem.price === priceHint) {
-    return 'exact';
-  }
-  
-  // Fuzzy: ±10%
-  if (Math.abs(stockItem.price - priceHint) <= (priceHint * 0.1)) {
-    return 'fuzzy';
-  }
-  
-  return 'partial';
-}
-
-// ============================================================================
-// MAIN PARSE ORDER - MULTI-INTENT AWARE
-// ============================================================================
-
-async function parseOrder(userInput) {
-  const stockCache = getStockCache();
-  const customerCache = getCustomerCache();
-  
-  // ✅ FIX: Declare ALL variables at the top
-  const preProcessed = splitMultipleIntents(userInput);
-  const paymentDetection = detectPaymentStatus(userInput);
-  const priceHints = extractPriceHints(userInput);
-  
-  Logger.info(`🎯 Pre-processed intent: ${JSON.stringify(preProcessed)}`);
-  Logger.info(`💰 Payment detection: ${paymentDetection.status} (${paymentDetection.confidence})`);
-  Logger.info(`💡 Price hints found: ${JSON.stringify(priceHints)}`);
-  
-  // Build smart catalog
-  const smartCatalog = buildSmartStockList(stockCache, priceHints);
-
-  // Create AI prompt with multi-intent awareness
-  const prompt = `คุณคือ AI ที่วิเคราะห์คำสั่งซื้อสินค้า
-
-📦 คลังสินค้า (รายการที่มี ⭐ = แนะนำ):
-${smartCatalog}
-
-👥 ลูกค้า: ${customerCache.map(c => c.name).join(', ')}
-
-💬 ข้อความ: "${userInput}"
-
-${preProcessed ? `
-🔍 ตรวจพบ:
-- ลูกค้า: ${preProcessed.customer}
-- สินค้า: ${preProcessed.itemsPart}
-- จ่ายแล้ว: ${preProcessed.hasPaid ? 'ใช่' : 'ไม่'}
-- ส่งแล้ว: ${preProcessed.hasDelivery ? 'ใช่' : 'ไม่'}
-` : ''}
-
-📋 กฎสำคัญ:
-1. ถ้าเห็น "ส่ง" → deliveryPerson ต้องไม่ว่าง (ใส่ชื่อจาก customer)
-2. ถ้าเห็น "จ่าย/ชำระ" → isPaid: true
-3. Pattern "[ชื่อสินค้า] [ราคา] [จำนวน]":
-   - เลขตัวแรก (>10) = ราคา
-   - เลขตัวหลัง (<=100) = จำนวน
-4. เลือกสินค้าที่มี ⭐ ก่อน (ราคาตรง)
-
-ตอบเป็น JSON:
-{
-  "intent": "order",
-  "customer": "ชื่อลูกค้า",
-  "items": [{"stockId": 0, "quantity": 1}],
-  "isPaid": false,
-  "deliveryPerson": "",
-  "confidence": "high|medium|low",
-  "reasoning": "อธิบายเหตุผล"
-}`;
-
-  try {
-    const aiResult = await generateWithGroq(prompt, true);
-    
-    // Map items
-    const mappedItems = (aiResult.items || []).map(i => {
-      const stockItem = stockCache[i.stockId];
-      if (!stockItem) return null;
-      
-      const priceHint = priceHints.find(h => 
-        stockItem.item.toLowerCase().includes(h.keyword)
-      );
-      
-      return {
-        stockItem: stockItem,
-        quantity: i.quantity || 1,
-        matchConfidence: calculateMatchConfidence(stockItem, priceHint?.price)
-      };
-    }).filter(i => i !== null);
-
-    // Boost confidence
-    const boostedConfidence = boostConfidence(
-      aiResult, 
-      mappedItems, 
-      userInput, 
-      customerCache,
-      preProcessed
-    );
-
-    // Merge with pre-processed data
-    const result = {
-      ...aiResult,
-      items: mappedItems,
-      confidence: boostedConfidence,
-      isPaid: preProcessed?.hasPaid || aiResult.isPaid || false,
-      deliveryPerson: preProcessed?.hasDelivery 
-        ? (aiResult.deliveryPerson || preProcessed.customer) 
-        : (aiResult.deliveryPerson || ''),
-      rawInput: userInput
-    };
-    
-    Logger.success(`✅ Parsed: ${result.customer}, ${result.items.length} items, paid=${result.isPaid}, delivery=${result.deliveryPerson}`);
-
-    return [result];
-
-  } catch (error) {
-    Logger.error('parseOrder failed', error);
-    return [{ success: false, error: 'AI Error' }];
-  }
-}
-
-// ============================================================================
 // EXPORTS
 // ============================================================================
 
-module.exports = { 
+module.exports = {
   parseOrder,
-  extractPriceHints,
+  parseWithKeywords,
+  fuzzyMatchStockItem,
   extractProductKeywords,
-  buildSmartStockList,
-  boostConfidence,
-  calculateMatchConfidence,
-  splitMultipleIntents,
-  detectPaymentStatus,
-  extractDeliveryPerson
+  parseItemsFromSection,
+  parseIndividualItem
 };
