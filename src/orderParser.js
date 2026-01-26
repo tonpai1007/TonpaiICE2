@@ -442,7 +442,187 @@ function buildSmartStockList(stockCache, priceHints) {
   return stockList;
 }
 
-// ... rest of the file remains the same ...
+// ============================================================================
+// ENHANCED: Boost Confidence with better logic
+// ============================================================================
+
+function boostConfidence(aiResult, mappedItems, userInput, customerCache, preProcessed) {
+  let confidence = aiResult.confidence || 'low';
+  const boostReasons = [];
+
+  // 1. Exact Price Match
+  const allExactMatch = mappedItems.every(item => item.matchConfidence === 'exact');
+  if (allExactMatch && mappedItems.length > 0) {
+    boostReasons.push('exact_price_match');
+  }
+
+  // 2. Customer Mentioned & Exists
+  if (aiResult.customer && aiResult.customer !== 'ไม่ระบุ') {
+    boostReasons.push('customer_mentioned');
+    
+    const customerExists = customerCache.some(c => 
+      c.name.toLowerCase().includes(aiResult.customer?.toLowerCase())
+    );
+    if (customerExists) {
+      boostReasons.push('known_customer');
+    }
+  }
+
+  // 3. Stock Available
+  const allInStock = mappedItems.every(item => item.stockItem.stock >= item.quantity);
+  if (allInStock) {
+    boostReasons.push('stock_available');
+  }
+
+  // 4. Clear Pattern (มีตัวเลขชัดเจน)
+  if (/\d+\s+\d+/.test(userInput)) {
+    boostReasons.push('clear_quantity_pattern');
+  }
+  
+  // 5. Pre-processed มี payment/delivery info
+  if (preProcessed?.hasPaid) {
+    boostReasons.push('payment_confirmed');
+  }
+
+  // Boosting Logic
+  if (confidence === 'medium' && boostReasons.length >= 3) {
+    Logger.info(`🚀 Confidence: medium → high (${boostReasons.join(', ')})`);
+    return 'high';
+  }
+
+  if (confidence === 'low' && boostReasons.length >= 4) {
+    Logger.info(`🚀 Confidence: low → medium (${boostReasons.join(', ')})`);
+    return 'medium';
+  }
+
+  return confidence;
+}
+
+// ============================================================================
+// HELPER: Calculate Match Confidence
+// ============================================================================
+
+function calculateMatchConfidence(stockItem, priceHint) {
+  if (!priceHint) return 'partial';
+  
+  if (stockItem.price === priceHint) {
+    return 'exact';
+  }
+  
+  // Fuzzy: ±10%
+  if (Math.abs(stockItem.price - priceHint) <= (priceHint * 0.1)) {
+    return 'fuzzy';
+  }
+  
+  return 'partial';
+}
+
+// ============================================================================
+// MAIN PARSE ORDER - MULTI-INTENT AWARE
+// ============================================================================
+
+async function parseOrder(userInput) {
+  const stockCache = getStockCache();
+  const customerCache = getCustomerCache();
+  
+  // ✅ FIX: Declare ALL variables at the top
+  const preProcessed = splitMultipleIntents(userInput);
+  const paymentDetection = detectPaymentStatus(userInput);
+  const priceHints = extractPriceHints(userInput);
+  
+  Logger.info(`🎯 Pre-processed intent: ${JSON.stringify(preProcessed)}`);
+  Logger.info(`💰 Payment detection: ${paymentDetection.status} (${paymentDetection.confidence})`);
+  Logger.info(`💡 Price hints found: ${JSON.stringify(priceHints)}`);
+  
+  // Build smart catalog
+  const smartCatalog = buildSmartStockList(stockCache, priceHints);
+
+  // Create AI prompt with multi-intent awareness
+  const prompt = `คุณคือ AI ที่วิเคราะห์คำสั่งซื้อสินค้า
+
+📦 คลังสินค้า (รายการที่มี ⭐ = แนะนำ):
+${smartCatalog}
+
+👥 ลูกค้า: ${customerCache.map(c => c.name).join(', ')}
+
+💬 ข้อความ: "${userInput}"
+
+${preProcessed ? `
+🔍 ตรวจพบ:
+- ลูกค้า: ${preProcessed.customer}
+- สินค้า: ${preProcessed.itemsPart}
+- จ่ายแล้ว: ${preProcessed.hasPaid ? 'ใช่' : 'ไม่'}
+- ส่งแล้ว: ${preProcessed.hasDelivery ? 'ใช่' : 'ไม่'}
+` : ''}
+
+📋 กฎสำคัญ:
+1. ถ้าเห็น "ส่ง" → deliveryPerson ต้องไม่ว่าง (ใส่ชื่อจาก customer)
+2. ถ้าเห็น "จ่าย/ชำระ" → isPaid: true
+3. Pattern "[ชื่อสินค้า] [ราคา] [จำนวน]":
+   - เลขตัวแรก (>10) = ราคา
+   - เลขตัวหลัง (<=100) = จำนวน
+4. เลือกสินค้าที่มี ⭐ ก่อน (ราคาตรง)
+
+ตอบเป็น JSON:
+{
+  "intent": "order",
+  "customer": "ชื่อลูกค้า",
+  "items": [{"stockId": 0, "quantity": 1}],
+  "isPaid": false,
+  "deliveryPerson": "",
+  "confidence": "high|medium|low",
+  "reasoning": "อธิบายเหตุผล"
+}`;
+
+  try {
+    const aiResult = await generateWithGroq(prompt, true);
+    
+    // Map items
+    const mappedItems = (aiResult.items || []).map(i => {
+      const stockItem = stockCache[i.stockId];
+      if (!stockItem) return null;
+      
+      const priceHint = priceHints.find(h => 
+        stockItem.item.toLowerCase().includes(h.keyword)
+      );
+      
+      return {
+        stockItem: stockItem,
+        quantity: i.quantity || 1,
+        matchConfidence: calculateMatchConfidence(stockItem, priceHint?.price)
+      };
+    }).filter(i => i !== null);
+
+    // Boost confidence
+    const boostedConfidence = boostConfidence(
+      aiResult, 
+      mappedItems, 
+      userInput, 
+      customerCache,
+      preProcessed
+    );
+
+    // Merge with pre-processed data
+    const result = {
+      ...aiResult,
+      items: mappedItems,
+      confidence: boostedConfidence,
+      isPaid: preProcessed?.hasPaid || aiResult.isPaid || false,
+      deliveryPerson: preProcessed?.hasDelivery 
+        ? (aiResult.deliveryPerson || preProcessed.customer) 
+        : (aiResult.deliveryPerson || ''),
+      rawInput: userInput
+    };
+    
+    Logger.success(`✅ Parsed: ${result.customer}, ${result.items.length} items, paid=${result.isPaid}, delivery=${result.deliveryPerson}`);
+
+    return [result];
+
+  } catch (error) {
+    Logger.error('parseOrder failed', error);
+    return [{ success: false, error: 'AI Error' }];
+  }
+}
 
 // ============================================================================
 // EXPORTS
@@ -451,8 +631,10 @@ function buildSmartStockList(stockCache, priceHints) {
 module.exports = { 
   parseOrder,
   extractPriceHints,
-  extractProductKeywords,  // ✅ Export the new function
+  extractProductKeywords,
   buildSmartStockList,
+  boostConfidence,
+  calculateMatchConfidence,
   splitMultipleIntents,
   detectPaymentStatus,
   extractDeliveryPerson
