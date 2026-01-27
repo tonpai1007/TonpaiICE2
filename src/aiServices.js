@@ -18,7 +18,100 @@ let isInitialized = false;
 // ============================================================================
 // LAZY LOAD OPENAI
 // ============================================================================
+const { Logger } = require('./logger');
 
+// ============================================================================
+// AI RATE LIMITER
+// ============================================================================
+
+class AIRateLimiter {
+  constructor(options = {}) {
+    this.maxRequestsPerMinute = options.maxPerMinute || 30; // Groq free tier: 30/min
+    this.maxRequestsPerDay = options.maxPerDay || 14400; // Groq free tier: 14400/day
+    this.requests = [];
+    this.dailyRequests = [];
+    this.startOfDay = this.getTodayStart();
+  }
+
+  getTodayStart() {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    return now.getTime();
+  }
+
+  async checkLimit() {
+    const now = Date.now();
+    
+    // Check if new day
+    if (now - this.startOfDay > 24 * 60 * 60 * 1000) {
+      this.dailyRequests = [];
+      this.startOfDay = this.getTodayStart();
+    }
+    
+    // Clean old requests (older than 1 minute)
+    const oneMinuteAgo = now - 60 * 1000;
+    this.requests = this.requests.filter(t => t > oneMinuteAgo);
+    
+    // Check per-minute limit
+    if (this.requests.length >= this.maxRequestsPerMinute) {
+      const oldestRequest = this.requests[0];
+      const waitTime = 60000 - (now - oldestRequest);
+      
+      Logger.warn(`⚠️ AI rate limit: ${this.requests.length}/${this.maxRequestsPerMinute} per minute`);
+      Logger.warn(`⏳ Waiting ${Math.ceil(waitTime / 1000)}s...`);
+      
+      await new Promise(resolve => setTimeout(resolve, waitTime + 100));
+      return this.checkLimit(); // Retry
+    }
+    
+    // Check daily limit
+    if (this.dailyRequests.length >= this.maxRequestsPerDay) {
+      Logger.error(`🚨 DAILY AI LIMIT REACHED: ${this.dailyRequests.length}/${this.maxRequestsPerDay}`);
+      throw new Error('Daily AI quota exceeded. Please try again tomorrow.');
+    }
+    
+    // Record request
+    this.requests.push(now);
+    this.dailyRequests.push(now);
+    
+    return {
+      allowed: true,
+      remainingMinute: this.maxRequestsPerMinute - this.requests.length,
+      remainingDay: this.maxRequestsPerDay - this.dailyRequests.length
+    };
+  }
+
+  getStats() {
+    const now = Date.now();
+    const oneMinuteAgo = now - 60 * 1000;
+    const recentRequests = this.requests.filter(t => t > oneMinuteAgo).length;
+    
+    return {
+      requestsLastMinute: recentRequests,
+      requestsToday: this.dailyRequests.length,
+      remainingMinute: this.maxRequestsPerMinute - recentRequests,
+      remainingDay: this.maxRequestsPerDay - this.dailyRequests.length,
+      utilizationMinute: `${((recentRequests / this.maxRequestsPerMinute) * 100).toFixed(1)}%`,
+      utilizationDay: `${((this.dailyRequests.length / this.maxRequestsPerDay) * 100).toFixed(1)}%`
+    };
+  }
+
+  reset() {
+    this.requests = [];
+    this.dailyRequests = [];
+    this.startOfDay = this.getTodayStart();
+    Logger.info('🔄 AI rate limiter reset');
+  }
+}
+
+// Singleton instance
+const aiRateLimiter = new AIRateLimiter({
+  maxPerMinute: 30,  // Groq free tier
+  maxPerDay: 14400   // Groq free tier
+});
+// ============================================================================
+// LAZY LOAD OPENAI
+// ============================================================================
 function loadOpenAI() {
   if (OpenAI) return OpenAI;
   
@@ -479,5 +572,7 @@ module.exports = {
   getGroq,
   getProviderInfo,
   isAudioSupported,
-  checkAIHealth
+  checkAIHealth,
+  AIRateLimiter,
+  aiRateLimiter
 };

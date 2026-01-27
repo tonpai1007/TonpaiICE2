@@ -1,4 +1,4 @@
-// smartOrderLearning.js - UPDATED: With Debugging Mode
+// smartOrderLearning.js - FIXED: Read from correct columns
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
 const { normalizeText } = require('./utils');
@@ -12,7 +12,7 @@ class SmartOrderLearner {
   constructor() {
     this.customerPatterns = new Map();
     this.lastLoaded = 0;
-    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes - refresh from Sheets
+    this.CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
     this.predictionCache = new Map();
     this.cacheMaxAge = 5 * 60 * 1000; 
   }
@@ -20,7 +20,6 @@ class SmartOrderLearner {
   async loadOrderHistory() {
     const now = Date.now();
     
-    // ถ้าเพิ่งเปิดบอท (size == 0) ให้โหลดใหม่เสมอ ไม่ต้องเช็คเวลา
     if (this.customerPatterns.size > 0 && (now - this.lastLoaded) < this.CACHE_DURATION) {
       return; 
     }
@@ -28,102 +27,109 @@ class SmartOrderLearner {
     try {
       Logger.info('🧠 Loading order history from Sheets...');
       
-      // อ่านข้อมูลจาก Sheet 'คำสั่งซื้อ' คอลัมน์ A ถึง I
+      // ✅ FIX: Read correct columns A-I from คำสั่งซื้อ
       const orderRows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
       
       if (!orderRows || orderRows.length <= 1) {
-        Logger.warn('⚠️ ไม่พบประวัติการสั่งซื้อใน Google Sheet (Sheet อาจจะว่างเปล่า)');
+        Logger.warn('⚠️ No order history found in Google Sheet');
         return;
       }
 
-      Logger.info(`📄 พบข้อมูลดิบ ${orderRows.length - 1} แถว กำลังวิเคราะห์...`);
+      Logger.info(`📄 Found ${orderRows.length - 1} orders, analyzing...`);
 
-      // เอา 100 ออเดอร์ล่าสุด
-      const recentOrders = orderRows.slice(1).slice(-100);
+      // Take last 200 orders for learning
+      const recentOrders = orderRows.slice(1).slice(-200);
       let newLearningCount = 0;
-      let errorCount = 0;
+      let processedOrders = 0;
 
-      // Debug: แสดงตัวอย่างแถวแรกที่อ่าน เพื่อเช็คคอลัมน์
-      if (recentOrders.length > 0) {
-        const sample = recentOrders[0];
-        Logger.debug(`👀 ตัวอย่างข้อมูลแถวแรก:`);
-        Logger.debug(`   - ลูกค้า (Col C): "${sample[2]}"`);
-        Logger.debug(`   - รายการ (Col H): "${sample[7]}"`); // ต้องเป็น JSON เท่านั้น
-      }
-
-     for (const [index, order] of recentOrders.entries()) {
-        const customer = (order[2] || '').trim(); // Column C: ชื่อลูกค้า
-        const itemName = (order[3] || '').trim(); // Column D: ชื่อสินค้า
-        const quantity = parseInt(order[4]) || 1; // Column E: จำนวน
+      for (const order of recentOrders) {
+        // ✅ FIX: Read from correct columns
+        const orderNo = order[0];           // Column A: Order number
+        const timestamp = order[1];         // Column B: Date/time
+        const customer = (order[2] || '').trim();  // Column C: Customer
+        const itemName = (order[3] || '').trim();  // Column D: Product name
+        const quantity = parseInt(order[4]) || 1;  // Column E: Quantity
+        const paymentStatus = order[7] || '';      // Column H: Payment status
         
-        if (!customer || customer === 'ไม่ระบุ' || !itemName) continue;
+        // Skip invalid rows
+        if (!customer || customer === 'ไม่ระบุ' || !itemName || !orderNo) {
+          continue;
+        }
 
         try {
-          // แทนที่จะใช้ JSON.parse เราสร้าง Array ขึ้นมาเองเลยจากข้อมูลในแถวนั้น
-          const lineItems = [{ item: itemName, quantity: quantity }];
-          
+          // Initialize customer pattern if new
           if (!this.customerPatterns.has(customer)) {
             this.customerPatterns.set(customer, {
               customer: customer,
               normalizedName: normalizeText(customer),
               orders: [],
               commonItems: new Map(),
-              totalOrders: 0
+              totalOrders: 0,
+              totalSpent: 0,
+              isPaidCustomer: false
             });
             newLearningCount++;
           }
 
           const pattern = this.customerPatterns.get(customer);
           pattern.totalOrders++;
+          
+          // Track if customer pays on time
+          if (paymentStatus === 'จ่ายแล้ว') {
+            pattern.isPaidCustomer = true;
+          }
 
-          // บันทึกรายการสินค้าลงความจำ
-          const key = normalizeText(itemName);
-          if (!pattern.commonItems.has(key)) {
-            pattern.commonItems.set(key, {
+          // ✅ FIX: Build item data from single row (not JSON array)
+          const itemKey = normalizeText(itemName);
+          
+          if (!pattern.commonItems.has(itemKey)) {
+            pattern.commonItems.set(itemKey, {
               name: itemName,
               count: 0,
-              quantities: []
+              quantities: [],
+              avgQuantity: 0
             });
           }
           
-          const itemData = pattern.commonItems.get(key);
+          const itemData = pattern.commonItems.get(itemKey);
           itemData.count++;
           itemData.quantities.push(quantity);
+          
+          // Calculate running average
+          itemData.avgQuantity = Math.round(
+            itemData.quantities.reduce((a, b) => a + b, 0) / itemData.quantities.length
+          );
 
-          // บันทึกประวัติออเดอร์
+          // Store order history (keep last 20 per customer)
           pattern.orders.push({
-            items: lineItems,
-            timestamp: order[1] // Column B: วันที่
+            orderNo: orderNo,
+            items: [{ item: itemName, quantity: quantity }],
+            timestamp: timestamp
           });
           
-          if (pattern.orders.length > 20) pattern.orders.shift();
-
-        }catch (parseError) {
-          // ถ้าอ่านไม่ได้ จะแจ้งเตือนแค่ 3 ครั้งแรก เพื่อไม่ให้รกหน้าจอ
-          errorCount++;
-          if (errorCount <= 3) {
-            Logger.warn(`⚠️ อ่านแถวที่ ${index + 1} ไม่ได้: "${lineItemsJson.substring(0, 50)}..." (ไม่ใช่ JSON)`);
+          if (pattern.orders.length > 20) {
+            pattern.orders.shift();
           }
+          
+          processedOrders++;
+          
+        } catch (parseError) {
+          Logger.warn(`⚠️ Failed to process order #${orderNo}: ${parseError.message}`);
         }
       }
 
       this.lastLoaded = now;
       
-      if (newLearningCount > 0) {
-        Logger.success(`✅ เรียนรู้พฤติกรรมลูกค้าใหม่แล้ว ${newLearningCount} คน`);
-      } else if (errorCount > 0) {
-        Logger.warn(`⚠️ มี ${errorCount} แถวที่อ่านไม่ออก (รูปแบบข้อมูลอาจไม่ตรงกับเวอร์ชันนี้)`);
-      }
-      
-      Logger.success(`📊 สรุปความจำ: ${this.customerPatterns.size} ลูกค้า, ${this.getTotalPatterns()} รูปแบบสินค้า`);
+      Logger.success(`✅ Smart Learning Complete:`);
+      Logger.success(`   • ${newLearningCount} new customers learned`);
+      Logger.success(`   • ${processedOrders} orders processed`);
+      Logger.success(`   • ${this.customerPatterns.size} total customers in memory`);
+      Logger.success(`   • ${this.getTotalPatterns()} unique product patterns`);
 
     } catch (error) {
       Logger.error('❌ Failed to load order history', error);
     }
   }
-
-  // ... (ส่วนที่เหลือเหมือนเดิม ไม่ต้องแก้) ...
-  // เพื่อความชัวร์ ก๊อปปี้ส่วนล่างนี้ไปแปะต่อได้เลยครับ
 
   // ============================================================================
   // SMART MATCHING
@@ -185,6 +191,12 @@ class SmartOrderLearner {
       timestamp: Date.now()
     });
     
+    // Limit cache size
+    if (this.predictionCache.size > 100) {
+      const firstKey = this.predictionCache.keys().next().value;
+      this.predictionCache.delete(firstKey);
+    }
+    
     return result;
   }
 
@@ -192,7 +204,11 @@ class SmartOrderLearner {
     const customerPattern = this.findCustomerByName(customerName);
     
     if (!customerPattern) {
-      return { success: false, reason: 'customer_not_found', confidence: 0 };
+      return { 
+        success: false, 
+        reason: 'customer_not_found', 
+        confidence: 'none' 
+      };
     }
 
     // No items parsed - suggest common items
@@ -206,7 +222,7 @@ class SmartOrderLearner {
           reason: 'common_items_suggested',
           customer: customerPattern.customer,
           suggestedItems: suggestions,
-          message: `${customerPattern.customer} มักสั่ง: ${suggestions.map(s => s.name).join(', ')}`
+          message: `${customerPattern.customer} มักสั่ง: ${suggestions.map(s => `${s.name} (${s.avgQuantity})`).join(', ')}`
         };
       }
     }
@@ -223,16 +239,12 @@ class SmartOrderLearner {
         if (historical) {
           matchCount++;
           
-          const avgQty = Math.round(
-            historical.quantities.reduce((a, b) => a + b, 0) / historical.quantities.length
-          );
-          
           enhancedItems.push({
             ...item,
             historical: true,
             orderedBefore: historical.count,
-            avgQuantity: avgQty,
-            suggestedQuantity: item.quantity || avgQty
+            avgQuantity: historical.avgQuantity,
+            suggestedQuantity: item.quantity || historical.avgQuantity
           });
         } else {
           enhancedItems.push({
@@ -256,23 +268,26 @@ class SmartOrderLearner {
         items: enhancedItems,
         matchRate: matchRate,
         totalOrders: customerPattern.totalOrders,
+        isPaidCustomer: customerPattern.isPaidCustomer,
         message: `${customerPattern.customer} เคยสั่ง ${matchCount}/${parsedItems.length} รายการนี้ (${customerPattern.totalOrders} ครั้ง)`
       };
     }
 
-    return { success: false, reason: 'no_pattern_match', confidence: 'low' };
+    return { 
+      success: false, 
+      reason: 'no_pattern_match', 
+      confidence: 'low' 
+    };
   }
 
-  getMostCommonItems(customerPattern, limit = 3) {
+  getMostCommonItems(customerPattern, limit = 5) {
     const items = Array.from(customerPattern.commonItems.values())
       .sort((a, b) => b.count - a.count)
       .slice(0, limit)
       .map(item => ({
         name: item.name,
         count: item.count,
-        avgQuantity: Math.round(
-          item.quantities.reduce((a, b) => a + b, 0) / item.quantities.length
-        )
+        avgQuantity: item.avgQuantity
       }));
 
     return items;
@@ -287,7 +302,28 @@ class SmartOrderLearner {
     return {
       customersLearned: this.customerPatterns.size,
       totalPatterns: this.getTotalPatterns(),
-      lastLoaded: this.lastLoaded
+      totalOrders: Array.from(this.customerPatterns.values())
+        .reduce((sum, p) => sum + p.totalOrders, 0),
+      lastLoaded: new Date(this.lastLoaded).toISOString()
+    };
+  }
+
+  // ✅ NEW: Get customer insights
+  getCustomerInsights(customerName) {
+    const pattern = this.findCustomerByName(customerName);
+    
+    if (!pattern) {
+      return null;
+    }
+
+    const topItems = this.getMostCommonItems(pattern, 3);
+    
+    return {
+      customer: pattern.customer,
+      totalOrders: pattern.totalOrders,
+      topItems: topItems,
+      isPaidCustomer: pattern.isPaidCustomer,
+      uniqueProducts: pattern.commonItems.size
     };
   }
 }
