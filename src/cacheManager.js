@@ -128,6 +128,7 @@ function rebuildStockVectorStore() {
   Logger.success(`🔍 Stock Vector Store: ${stockVectorStore.size()} items indexed`);
 }
 
+const { extractProductKeywords } = require('./productMatcher');
 
 // ============================================================================
 // CUSTOMER CACHE - Uses 'ลูกค้า' sheet
