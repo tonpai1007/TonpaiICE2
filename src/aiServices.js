@@ -1,7 +1,7 @@
-// aiServices.js - FIXED: All issues resolved
+// aiServices.js - FINAL FIX: Proper audio format detection and handling
 const { CONFIG } = require('./config');
 const { Logger } = require('./logger');
-const { Blob } = require('buffer'); // ✅ For audio file handling
+const { Blob } = require('buffer');
 
 // ============================================================================
 // CONFIGURATION
@@ -109,10 +109,6 @@ function initializeGroq() {
   }
 }
 
-// ============================================================================
-// OLLAMA SETUP - ✅ FIXED: Now properly defined
-// ============================================================================
-
 function initializeOllama() {
   Logger.success('✅ Ollama initialized (local mode)');
   Logger.info(`   Base URL: ${OLLAMA_BASE_URL}`);
@@ -121,10 +117,6 @@ function initializeOllama() {
   
   return { ollama: 'local' };
 }
-
-// ============================================================================
-// OPENROUTER SETUP
-// ============================================================================
 
 function initializeOpenRouter() {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -194,10 +186,6 @@ async function generateWithGroq(prompt, jsonMode = false) {
   }
 }
 
-// ============================================================================
-// GROQ IMPLEMENTATION
-// ============================================================================
-
 async function generateGroq(prompt, jsonMode) {
   if (!groqClient) {
     throw new Error('Groq client is null - initialization may have failed');
@@ -208,8 +196,6 @@ async function generateGroq(prompt, jsonMode) {
   }
 
   try {
-    Logger.debug(`📤 Groq request (${jsonMode ? 'JSON' : 'text'})`);
-    
     const requestOptions = {
       model: 'llama-3.3-70b-versatile',
       messages: [{ role: 'user', content: prompt }],
@@ -233,8 +219,6 @@ async function generateGroq(prompt, jsonMode) {
       throw new Error('Groq returned empty content');
     }
     
-    Logger.debug(`📥 Groq response (${content.length} chars)`);
-    
     if (jsonMode) {
       try {
         return JSON.parse(content);
@@ -251,10 +235,6 @@ async function generateGroq(prompt, jsonMode) {
     throw error;
   }
 }
-
-// ============================================================================
-// OPENROUTER IMPLEMENTATION
-// ============================================================================
 
 async function generateOpenRouter(prompt, jsonMode) {
   if (!groqClient) {
@@ -294,6 +274,54 @@ async function generateOpenRouter(prompt, jsonMode) {
 }
 
 // ============================================================================
+// AUDIO FORMAT DETECTION
+// ============================================================================
+
+function detectAudioFormat(buffer) {
+  if (!buffer || buffer.length < 12) {
+    return 'unknown';
+  }
+  
+  // Check magic numbers (file signatures)
+  const header = buffer.slice(0, 12);
+  
+  // M4A (MP4 audio)
+  if (header.slice(4, 8).toString() === 'ftyp') {
+    return 'm4a';
+  }
+  
+  // MP3
+  if (header[0] === 0xFF && (header[1] & 0xE0) === 0xE0) {
+    return 'mp3';
+  }
+  
+  // WAV
+  if (header.slice(0, 4).toString() === 'RIFF' && 
+      header.slice(8, 12).toString() === 'WAVE') {
+    return 'wav';
+  }
+  
+  // OGG
+  if (header.slice(0, 4).toString() === 'OggS') {
+    return 'ogg';
+  }
+  
+  // FLAC
+  if (header.slice(0, 4).toString() === 'fLaC') {
+    return 'flac';
+  }
+  
+  // WebM
+  if (header[0] === 0x1A && header[1] === 0x45 && 
+      header[2] === 0xDF && header[3] === 0xA3) {
+    return 'webm';
+  }
+  
+  Logger.warn(`Unknown audio format. Header: ${header.slice(0, 8).toString('hex')}`);
+  return 'unknown';
+}
+
+// ============================================================================
 // AUDIO TRANSCRIPTION
 // ============================================================================
 
@@ -318,7 +346,7 @@ async function transcribeAudio(audioBuffer) {
 }
 
 // ============================================================================
-// GROQ WHISPER - ✅ FIXED: Proper File object for Node.js
+// GROQ WHISPER - ✅ FINAL FIX: Auto-detect format
 // ============================================================================
 
 async function transcribeWithGroqWhisper(audioBuffer) {
@@ -329,16 +357,41 @@ async function transcribeWithGroqWhisper(audioBuffer) {
   Logger.info('🎤 Using Groq Whisper...');
   
   try {
-    // ✅ FIX: Create proper file object for Node.js
-    const audioBlob = new Blob([audioBuffer], { type: 'audio/m4a' });
+    // ✅ STEP 1: Detect actual audio format
+    const detectedFormat = detectAudioFormat(audioBuffer);
+    Logger.info(`🔍 Detected audio format: ${detectedFormat}`);
     
-    // Add file properties that OpenAI SDK expects
+    // ✅ STEP 2: Map to MIME type
+    const formatMap = {
+      'm4a': 'audio/mp4',
+      'mp3': 'audio/mpeg',
+      'mp4': 'audio/mp4',
+      'wav': 'audio/wav',
+      'webm': 'audio/webm',
+      'ogg': 'audio/ogg',
+      'flac': 'audio/flac',
+      'opus': 'audio/opus'
+    };
+    
+    const mimeType = formatMap[detectedFormat] || 'audio/mp4';
+    const fileExt = detectedFormat !== 'unknown' ? detectedFormat : 'm4a';
+    
+    Logger.info(`📄 Using MIME type: ${mimeType}, extension: ${fileExt}`);
+    
+    // ✅ STEP 3: Create proper blob with correct MIME type
+    const audioBlob = new Blob([audioBuffer], { type: mimeType });
+    
+    // ✅ STEP 4: Create File-like object
     const audioFile = Object.assign(audioBlob, {
-      name: 'audio.m4a',
+      name: `audio.${fileExt}`,
       lastModified: Date.now(),
-      webkitRelativePath: ''
+      webkitRelativePath: '',
+      size: audioBuffer.length
     });
     
+    Logger.debug(`📤 Sending to Groq: ${audioFile.name} (${mimeType})`);
+    
+    // ✅ STEP 5: Call Groq API
     const transcription = await groqClient.audio.transcriptions.create({
       file: audioFile,
       model: 'whisper-large-v3',
@@ -347,7 +400,7 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       response_format: 'text'
     });
 
-    // Handle both string and object responses
+    // ✅ STEP 6: Extract text
     const text = typeof transcription === 'string' 
       ? transcription.trim() 
       : transcription.text?.trim();
@@ -356,15 +409,26 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       throw new Error('Empty transcription');
     }
     
-    Logger.success(`✅ Transcribed: "${text}"`);
+    Logger.success(`✅ Transcribed (${text.length} chars): "${text}"`);
     return { success: true, text };
     
   } catch (error) {
     Logger.error('Groq Whisper failed:', error.message);
     
-    // Better error messages
+    // ✅ Better error handling
+    if (error.message?.includes('400')) {
+      // Log the actual error for debugging
+      Logger.error('API Error Details:', {
+        status: error.status,
+        message: error.message,
+        code: error.code
+      });
+      
+      throw new Error('Audio format not supported by Groq. Try recording again.');
+    }
+    
     if (error.message?.includes('file')) {
-      throw new Error('Audio file format not supported');
+      throw new Error('Audio file format issue');
     }
     
     throw error;
