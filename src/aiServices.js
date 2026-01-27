@@ -357,11 +357,10 @@ async function transcribeWithGroqWhisper(audioBuffer) {
   Logger.info('🎤 Using Groq Whisper...');
   
   try {
-    // ✅ STEP 1: Detect actual audio format
+    // Detect format
     const detectedFormat = detectAudioFormat(audioBuffer);
     Logger.info(`🔍 Detected audio format: ${detectedFormat}`);
     
-    // ✅ STEP 2: Map to MIME type
     const formatMap = {
       'm4a': 'audio/mp4',
       'mp3': 'audio/mpeg',
@@ -369,8 +368,7 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       'wav': 'audio/wav',
       'webm': 'audio/webm',
       'ogg': 'audio/ogg',
-      'flac': 'audio/flac',
-      'opus': 'audio/opus'
+      'flac': 'audio/flac'
     };
     
     const mimeType = formatMap[detectedFormat] || 'audio/mp4';
@@ -378,29 +376,26 @@ async function transcribeWithGroqWhisper(audioBuffer) {
     
     Logger.info(`📄 Using MIME type: ${mimeType}, extension: ${fileExt}`);
     
-    // ✅ STEP 3: Create proper blob with correct MIME type
-    const audioBlob = new Blob([audioBuffer], { type: mimeType });
+    // ✅ FIX: Create File object correctly - DON'T use Object.assign on Blob
+    const file = new File(
+      [audioBuffer], 
+      `audio.${fileExt}`,
+      { 
+        type: mimeType,
+        lastModified: Date.now()
+      }
+    );
     
-    // ✅ STEP 4: Create File-like object
-    const audioFile = Object.assign(audioBlob, {
-      name: `audio.${fileExt}`,
-      lastModified: Date.now(),
-      webkitRelativePath: '',
-      size: audioBuffer.length
-    });
+    Logger.debug(`📤 Sending to Groq: ${file.name} (${mimeType})`);
     
-    Logger.debug(`📤 Sending to Groq: ${audioFile.name} (${mimeType})`);
-    
-    // ✅ STEP 5: Call Groq API
     const transcription = await groqClient.audio.transcriptions.create({
-      file: audioFile,
+      file: file,
       model: 'whisper-large-v3',
       language: 'th',
       temperature: 0.0,
       response_format: 'text'
     });
 
-    // ✅ STEP 6: Extract text
     const text = typeof transcription === 'string' 
       ? transcription.trim() 
       : transcription.text?.trim();
@@ -409,32 +404,19 @@ async function transcribeWithGroqWhisper(audioBuffer) {
       throw new Error('Empty transcription');
     }
     
-    Logger.success(`✅ Transcribed (${text.length} chars): "${text}"`);
+    Logger.success(`✅ Transcribed: "${text}"`);
     return { success: true, text };
     
   } catch (error) {
     Logger.error('Groq Whisper failed:', error.message);
     
-    // ✅ Better error handling
     if (error.message?.includes('400')) {
-      // Log the actual error for debugging
-      Logger.error('API Error Details:', {
-        status: error.status,
-        message: error.message,
-        code: error.code
-      });
-      
-      throw new Error('Audio format not supported by Groq. Try recording again.');
-    }
-    
-    if (error.message?.includes('file')) {
-      throw new Error('Audio file format issue');
+      Logger.error('Groq rejected the audio format');
     }
     
     throw error;
   }
 }
-
 // ============================================================================
 // UTILITIES
 // ============================================================================
