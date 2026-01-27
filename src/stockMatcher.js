@@ -45,37 +45,7 @@ const { Logger } = require('./logger');
   // EXTRACT KEYWORDS (with Thai support)
   // ========================================================================
   
-  extractKeywords(text) {
-    const keywords = new Set();
-    const normalized = normalizeText(text);
-    
-    // Add full normalized text
-    keywords.add(normalized);
-    
-    // Add 2-character prefixes (for Thai)
-    for (let i = 0; i <= normalized.length - 2; i++) {
-      keywords.add(normalized.substring(i, i + 2));
-    }
-    
-    // Add 3-character prefixes
-    for (let i = 0; i <= normalized.length - 3; i++) {
-      keywords.add(normalized.substring(i, i + 3));
-    }
-    
-    // Add tokens (space-separated)
-    const tokens = text.split(/\s+/);
-    tokens.forEach(token => {
-      const norm = normalizeText(token);
-      if (norm.length >= 2) {
-        keywords.add(norm);
-      }
-    });
-    
-    // Product-specific variations
-    this.addVariations(normalized, keywords);
-    
-    return Array.from(keywords);
-  }
+ 
 
   // ========================================================================
   // PRODUCT VARIATIONS (extensible)

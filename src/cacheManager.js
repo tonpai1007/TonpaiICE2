@@ -128,38 +128,6 @@ function rebuildStockVectorStore() {
   Logger.success(`🔍 Stock Vector Store: ${stockVectorStore.size()} items indexed`);
 }
 
-function extractStockKeywords(name) {
-  const normalized = normalizeText(name);
-  const keywords = new Set([normalized]);
-  
-  // Add word tokens
-  const tokens = name.split(/\s+/);
-  tokens.forEach(t => {
-    const norm = normalizeText(t);
-    if (norm.length >= 2) keywords.add(norm);
-  });
-  
-  // Common variations for Thai products
-  const commonVariations = {
-    'น้ำแข็ง': ['น้ำ', 'แข็ง', 'ice'],
-    'เบียร์': ['เบีย', 'beer'],
-    'โค้ก': ['โคก', 'coke', 'coca'],
-    'น้ำดื่ม': ['น้ำ', 'ดื่ม', 'water'],
-    'น้ำอัดลม': ['น้ำ', 'อัดลม', 'soda'],
-    'น้ำส้ม': ['น้ำ', 'ส้ม', 'orange'],
-    'กาแฟ': ['coffee'],
-    'ชา': ['tea']
-  };
-  
-  for (const [key, variations] of Object.entries(commonVariations)) {
-    if (normalized.includes(normalizeText(key))) {
-      keywords.add(normalizeText(key));
-      variations.forEach(v => keywords.add(normalizeText(v)));
-    }
-  }
-  
-  return Array.from(keywords);
-}
 
 // ============================================================================
 // CUSTOMER CACHE - Uses 'ลูกค้า' sheet
