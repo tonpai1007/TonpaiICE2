@@ -112,7 +112,7 @@ const performanceMonitor = new PerformanceMonitor();
 // ============================================================================
 
 module.exports = {
-  Logger,  // ✅ EXPORT THE INSTANCE
+
   SimpleLogger,
   PerformanceMonitor: performanceMonitor
 };
