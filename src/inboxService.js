@@ -33,6 +33,7 @@ async function saveToInbox(userId, userInput) {
 // ============================================================================
 
 async function cancelOrder(orderNo) {
+ const lockKeys = [];
   try {
     Logger.info(`🔄 Cancelling order #${orderNo}...`);
 
@@ -83,6 +84,7 @@ async function cancelOrder(orderNo) {
           break;
         }
       }
+      
     }
 
     // Mark as cancelled
@@ -105,11 +107,17 @@ async function cancelOrder(orderNo) {
       stockRestored
     };
 
-  } catch (error) {
-    Logger.error('cancelOrder failed', error);
-    return { success: false, error: error.message };
-  }
+    } finally {
+      // ✅ Always release locks
+      lockKeys.forEach(key => stockLock.releaseLock(key));
+      Logger.error('cancelOrder failed', error);
+      return { success: false, error: error.message };
+    }
+  
 }
+
+
+
 
 // ============================================================================
 // GENERATE INBOX SUMMARY - Simple transcript view

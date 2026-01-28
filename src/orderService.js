@@ -109,7 +109,24 @@ class StockTransactionLock {
     };
   }
 }
+class PaymentLock {
+  constructor() {
+    this.processing = new Set();
+  }
 
+  async lock(orderNo) {
+    if (this.processing.has(orderNo)) {
+      throw new Error('Payment update already in progress');
+    }
+    this.processing.add(orderNo);
+  }
+
+  unlock(orderNo) {
+    this.processing.delete(orderNo);
+  }
+}
+
+const paymentLock = new PaymentLock();
 const stockLock = new StockTransactionLock();
 
 // ============================================================================
@@ -381,8 +398,11 @@ async function createOrderTransaction(orderData) {
 
 async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล้ว') {
   try {
+    await paymentLock.lock(orderNo);
     const rows = await getSheetData(CONFIG.SHEET_ID, 'คำสั่งซื้อ!A:I');
     const orderRows = [];
+    const currentStatus = rows.find(r => r[0] == orderNo)?.[7];
+
     let customer = '';
     let totalAmount = 0;
     
@@ -409,13 +429,14 @@ async function updateOrderPaymentStatus(orderNo, newStatus = 'จ่ายแล
     if (newStatus === 'จ่ายแล้ว') {
       await markCreditAsPaid(orderNo);
     }
-
+    paymentLock.unlock(orderNo);
     return { success: true, orderNo, customer, totalAmount, newStatus };
     
   } catch (error) {
     Logger.error('updateOrderPaymentStatus failed', error);
     return { success: false, error: error.message };
   }
+  
 }
 
 async function getLastOrderNumber() {
