@@ -1,4 +1,4 @@
-// src/cacheManager.js - FIXED: Memory leak prevention
+// src/cacheManager.js - FIXED: Proper imports
 
 const { CONFIG } = require('./config');
 const { Logger, PerformanceMonitor } = require('./logger');
@@ -16,7 +16,75 @@ let lastStockLoadTime = 0;
 let lastCustomerLoadTime = 0;
 
 // ============================================================================
-// STOCK CACHE - Uses 'สต็อก' sheet
+// EXTRACT KEYWORDS - SHARED FUNCTION
+// ============================================================================
+
+function extractStockKeywords(itemName) {
+  const keywords = new Set();
+  const normalized = normalizeText(itemName);
+  
+  keywords.add(normalized);
+  
+  // Tokenize
+  const tokens = itemName.split(/\s+/);
+  tokens.forEach(token => {
+    const norm = normalizeText(token);
+    if (norm.length >= 2) {
+      keywords.add(norm);
+    }
+  });
+  
+  // Common product variations
+  const variations = {
+    'น้ำแข็ง': ['น้ำ', 'แข็ง', 'ice'],
+    'โค้ก': ['โคก', 'coke', 'coca'],
+    'เป็ปซี่': ['pepsi', 'เปปซี่'],
+    'สิงห์': ['singha', 'singh'],
+    'ช้าง': ['chang', 'elephant'],
+    'ลีโอ': ['leo'],
+    'น้ำดื่ม': ['water', 'น้ำ'],
+    'ลัง': ['box', 'case', 'crate'],
+    'ขวด': ['bottle'],
+    'ถุง': ['bag']
+  };
+  
+  for (const [key, vars] of Object.entries(variations)) {
+    if (normalized.includes(normalizeText(key))) {
+      vars.forEach(v => keywords.add(normalizeText(v)));
+    }
+  }
+  
+  return Array.from(keywords);
+}
+
+function extractCustomerKeywords(name) {
+  const keywords = new Set();
+  
+  // Common Thai prefixes
+  const prefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ป้า', 'ลุง', 'อา', 'ร้าน'];
+  
+  prefixes.forEach(prefix => {
+    if (name.includes(prefix)) {
+      const withoutPrefix = name.replace(prefix, '').trim();
+      if (withoutPrefix) {
+        keywords.add(normalizeText(withoutPrefix));
+      }
+    }
+  });
+  
+  // Location keywords
+  const locations = ['ตลาด', 'หน้าปาก', 'ซอย', 'ข้าง', 'หลัง'];
+  locations.forEach(loc => {
+    if (name.includes(loc)) {
+      keywords.add(normalizeText(loc));
+    }
+  });
+  
+  return Array.from(keywords);
+}
+
+// ============================================================================
+// STOCK CACHE
 // ============================================================================
 
 async function loadStockCache(forceReload = false) {
@@ -75,7 +143,7 @@ async function loadStockCache(forceReload = false) {
 
     lastStockLoadTime = now;
     
-    // ✅ FIX #2: Clear vector store before rebuild to prevent memory leak
+    // Rebuild vector store
     rebuildStockVectorStore();
 
     Logger.success(`✅ STOCK LOADED: ${stockCache.length} items`);
@@ -93,11 +161,9 @@ async function loadStockCache(forceReload = false) {
 }
 
 function rebuildStockVectorStore() {
-  // ✅ FIX #2: CLEAR BEFORE REBUILD - Prevents memory leak
   Logger.info('🧹 Clearing old vector store data...');
   stockVectorStore.clear();
   
-  // Now rebuild with fresh data
   stockVectorStore.rebuild(
     stockCache,
     // Text extractor
@@ -128,10 +194,8 @@ function rebuildStockVectorStore() {
   Logger.success(`🔍 Stock Vector Store: ${stockVectorStore.size()} items indexed`);
 }
 
-const { extractProductKeywords } = require('./productMatcher');
-
 // ============================================================================
-// CUSTOMER CACHE - Uses 'ลูกค้า' sheet
+// CUSTOMER CACHE
 // ============================================================================
 
 async function loadCustomerCache(forceReload = false) {
@@ -166,7 +230,7 @@ async function loadCustomerCache(forceReload = false) {
 
     lastCustomerLoadTime = now;
 
-    // ✅ FIX #2: Clear vector store before rebuild
+    // Rebuild vector store
     rebuildCustomerVectorStore();
 
     Logger.success(`✅ CUSTOMERS LOADED: ${customerCache.length} customers`);
@@ -184,7 +248,6 @@ async function loadCustomerCache(forceReload = false) {
 }
 
 function rebuildCustomerVectorStore() {
-  // ✅ FIX #2: CLEAR BEFORE REBUILD - Prevents memory leak
   Logger.info('🧹 Clearing old customer vector store data...');
   customerVectorStore.clear();
   
@@ -215,32 +278,6 @@ function rebuildCustomerVectorStore() {
   Logger.success(`🔍 Customer Vector Store: ${customerVectorStore.size()} customers indexed`);
 }
 
-function extractCustomerKeywords(name) {
-  const keywords = new Set();
-  
-  // Common Thai prefixes
-  const prefixes = ['คุณ', 'พี่', 'น้อง', 'เจ๊', 'ป้า', 'ลุง', 'อา', 'ร้าน'];
-  
-  prefixes.forEach(prefix => {
-    if (name.includes(prefix)) {
-      const withoutPrefix = name.replace(prefix, '').trim();
-      if (withoutPrefix) {
-        keywords.add(normalizeText(withoutPrefix));
-      }
-    }
-  });
-  
-  // Location keywords
-  const locations = ['ตลาด', 'หน้าปาก', 'ซอย', 'ข้าง', 'หลัง'];
-  locations.forEach(loc => {
-    if (name.includes(loc)) {
-      keywords.add(normalizeText(loc));
-    }
-  });
-  
-  return Array.from(keywords);
-}
-
 // ============================================================================
 // CACHE GETTERS
 // ============================================================================
@@ -254,7 +291,7 @@ function getCustomerCache() {
 }
 
 // ============================================================================
-// MEMORY MONITORING (NEW)
+// MEMORY MONITORING
 // ============================================================================
 
 function getCacheStats() {
@@ -282,5 +319,7 @@ module.exports = {
   loadCustomerCache,
   getStockCache,
   getCustomerCache,
-  getCacheStats // NEW: For monitoring
+  getCacheStats,
+  extractStockKeywords,    // ✅ Export for use in other modules
+  extractCustomerKeywords  // ✅ Export for use in other modules
 };

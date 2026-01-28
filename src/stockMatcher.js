@@ -3,6 +3,7 @@
 const { normalizeText } = require('./utils');
 const { Logger } = require('./logger');
 const { extractProductKeywords } = require('./productMatcher');
+const { extractStockKeywords } = require('./cacheManager');
 // ============================================================================
 // PERFORMANCE-OPTIMIZED STOCK MATCHER
 // ============================================================================
