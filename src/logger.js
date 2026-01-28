@@ -104,8 +104,7 @@ class PerformanceMonitor {
 // ============================================================================
 // SINGLETON INSTANCES - FIX: Export Logger instance
 // ============================================================================
-
-const Logger = new SimpleLogger();  // ✅ CREATE INSTANCE
+// ✅ CREATE INSTANCE
 const performanceMonitor = new PerformanceMonitor();
 
 // ============================================================================
