@@ -1,12 +1,11 @@
-// logger.js - Simple console logger (no external dependencies)
+// src/logger.js - FIXED: Proper exports
 
 // ============================================================================
-// SIMPLE LOGGER - Works everywhere
+// SIMPLE LOGGER
 // ============================================================================
 
 class SimpleLogger {
   constructor() {
-    // ✅ FIX: Don't import config here - use environment variable directly
     this.level = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
     this.levels = {
       debug: 0,
@@ -102,17 +101,18 @@ class PerformanceMonitor {
 }
 
 // ============================================================================
-// SINGLETON INSTANCES - FIX: Export Logger instance
+// SINGLETON INSTANCES - ✅ FIXED
 // ============================================================================
-// ✅ CREATE INSTANCE
+
+const Logger = new SimpleLogger();
 const performanceMonitor = new PerformanceMonitor();
 
 // ============================================================================
-// EXPORTS
+// EXPORTS - ✅ FIXED
 // ============================================================================
 
 module.exports = {
-
-  SimpleLogger,
-  PerformanceMonitor: performanceMonitor
+  Logger,                    // ✅ Export instance
+  SimpleLogger,              // Export class
+  PerformanceMonitor: performanceMonitor  // Export instance
 };

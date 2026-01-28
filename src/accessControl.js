@@ -13,31 +13,21 @@ const ROLES = {
 };
 
 const PERMISSIONS = {
-  // Order management
   PLACE_ORDER: 'place_order',
   VIEW_ORDERS: 'view_orders',
   CANCEL_ORDER: 'cancel_order',
-  
-  // Stock management
   VIEW_STOCK: 'view_stock',
   ADD_STOCK: 'add_stock',
   UPDATE_STOCK: 'update_stock',
-  
-  // Payment management
   UPDATE_PAYMENT: 'update_payment',
   VIEW_PAYMENT_HISTORY: 'view_payment_history',
-  
-  // System management
   REFRESH_CACHE: 'refresh_cache',
   VIEW_DASHBOARD: 'view_dashboard',
   MANAGE_USERS: 'manage_users',
-  
-  // Delivery management
   UPDATE_DELIVERY: 'update_delivery',
   VIEW_DELIVERY_STATUS: 'view_delivery_status'
 };
 
-// Define what each role can do
 const ROLE_PERMISSIONS = {
   [ROLES.ADMIN]: [
     PERMISSIONS.PLACE_ORDER,
@@ -69,10 +59,16 @@ class UserStore {
   constructor() {
     this.users = new Map();
     this.accessLog = [];
-    this.initializeDefaultUsers();
   }
 
+  // ✅ FIXED: Delayed initialization
   initializeDefaultUsers() {
+    // ✅ Check if CONFIG is available
+    if (!CONFIG || !CONFIG.ADMIN_USER_IDS) {
+      Logger.warn('⚠️ CONFIG not ready yet - will initialize admins later');
+      return;
+    }
+
     const adminIds = CONFIG.ADMIN_USER_IDS || [];
     
     if (adminIds.length === 0) {
@@ -156,7 +152,6 @@ class UserStore {
 
     this.accessLog.push(logEntry);
 
-    // Keep only last 1000 entries
     if (this.accessLog.length > 1000) {
       this.accessLog.shift();
     }
@@ -184,18 +179,19 @@ class UserStore {
 class AccessControl {
   constructor() {
     this.userStore = new UserStore();
+    // ✅ FIXED: Initialize after a delay to ensure CONFIG is loaded
+    setImmediate(() => {
+      this.userStore.initializeDefaultUsers();
+    });
   }
 
-  // Check if user has a specific permission
   hasPermission(userId, permission) {
     const role = this.userStore.getUserRole(userId);
     const permissions = ROLE_PERMISSIONS[role] || [];
     return permissions.includes(permission);
   }
 
-  // Check if user can perform an action (alias for hasPermission)
   canPerformAction(userId, action) {
-    // Auto-register new users as regular users
     if (!this.userStore.getUser(userId)) {
       this.userStore.addUser(userId, ROLES.USER);
     }
@@ -203,52 +199,42 @@ class AccessControl {
     return this.hasPermission(userId, action);
   }
 
-  // Check if user is admin
   isAdmin(userId) {
     return this.userStore.getUserRole(userId) === ROLES.ADMIN;
   }
 
-  // Check if user is registered
   isRegistered(userId) {
     return this.userStore.getUser(userId) !== undefined;
   }
 
-  // Get user role
   getUserRole(userId) {
     return this.userStore.getUserRole(userId);
   }
 
-  // Add a new user
   addUser(userId, role = ROLES.USER, name = null) {
     return this.userStore.addUser(userId, role, name);
   }
 
-  // Update user role
   updateUserRole(userId, newRole) {
     return this.userStore.updateUserRole(userId, newRole);
   }
 
-  // Remove user
   removeUser(userId) {
     return this.userStore.removeUser(userId);
   }
 
-  // Get all users
   getAllUsers() {
     return this.userStore.getAllUsers();
   }
 
-  // Log access attempt
   logAccess(userId, action, granted, details = '') {
     this.userStore.logAccess(userId, action, granted, details);
   }
 
-  // Get access log
   getAccessLog(userId = null, limit = 100) {
     return this.userStore.getAccessLog(userId, limit);
   }
 
-  // Get access denied message
   getAccessDeniedMessage(action) {
     const messages = {
       [PERMISSIONS.PLACE_ORDER]: '🔒 ระบบปิดการรับคำสั่งซื้อชั่วคราว\nกรุณาติดต่อแอดมิน',
@@ -265,7 +251,6 @@ class AccessControl {
     return messages[action] || '🔒 คุณไม่มีสิทธิ์เข้าถึงฟังก์ชันนี้';
   }
 
-  // Generate user info text
   getUserInfoText(userId) {
     const user = this.userStore.getUser(userId);
     
@@ -317,7 +302,6 @@ class AccessControl {
     return info;
   }
 
-  // Generate system stats
   getSystemStats() {
     const users = this.userStore.getAllUsers();
     const adminCount = users.filter(u => u.role === ROLES.ADMIN).length;
